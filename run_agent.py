@@ -4072,10 +4072,17 @@ class AIAgent:
             stream_callback: Optional callback invoked with each text delta during streaming.
 
         Returns:
-            str: Final assistant response
+            str: Final assistant response (empty string when run_conversation
+            returned without a final response — e.g. interrupted / failed /
+            partial). The conversation_loop has many return paths that build
+            the result dict WITHOUT a 'final_response' key, or with the value
+            explicitly set to None. Crashing chat() with KeyError on those
+            paths makes downstream callers (subscription wrappers, scripted
+            harnesses) silent-exit rc=1 without any traceback, masking the
+            underlying interrupt/failure reason.
         """
         result = self.run_conversation(message, stream_callback=stream_callback)
-        return result["final_response"]
+        return result.get("final_response") or ""
 
     def _run_codex_app_server_turn(
         self,
