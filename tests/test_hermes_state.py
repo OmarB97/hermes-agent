@@ -266,6 +266,40 @@ class TestSessionLifecycle:
         assert session is not None
         assert session["pending_prompt_tokens"] == 5000
 
+    def test_set_compression_count_writes_value(self, db):
+        """Each context-compression event bumps the count; downstream
+        dashboards render 'epoch N after compression' on the chip."""
+        db.create_session(session_id="s1", source="cli")
+        db.set_compression_count("s1", 1)
+        assert db.get_session("s1")["compression_count"] == 1
+        db.set_compression_count("s1", 3)
+        assert db.get_session("s1")["compression_count"] == 3
+
+    def test_set_compression_count_zero_resets(self, db):
+        """Explicit 0 clears the count — useful for /new session
+        boundaries that conceptually reset the compression history."""
+        db.create_session(session_id="s1", source="cli")
+        db.set_compression_count("s1", 2)
+        db.set_compression_count("s1", 0)
+        assert db.get_session("s1")["compression_count"] == 0
+
+    def test_set_compression_count_creates_session_row_if_missing(self, db):
+        """Same INSERT-OR-IGNORE pattern as the other lazy setters —
+        a setter called before create_session must not silently
+        affect 0 rows."""
+        db.set_compression_count("s_lazy_cc", 4)
+        session = db.get_session("s_lazy_cc")
+        assert session is not None
+        assert session["compression_count"] == 4
+
+    def test_existing_db_reconciles_compression_count_column(self, db):
+        """Declarative reconciliation auto-ADDs the new column on
+        databases created before this change."""
+        db.create_session(session_id="s1", source="cli")
+        session = db.get_session("s1")
+        assert "compression_count" in session.keys()
+        assert session["compression_count"] == 0
+
     def test_parent_session(self, db):
         db.create_session(session_id="parent", source="cli")
         db.create_session(session_id="child", source="cli", parent_session_id="parent")
