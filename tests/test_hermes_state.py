@@ -129,6 +129,74 @@ class TestSessionLifecycle:
         session = db.get_session("s1")
         assert session["model"] == "anthropic/claude-opus-4.6"
 
+    def test_last_prompt_tokens_is_set_not_incremented(self, db):
+        """``last_prompt_tokens`` is the most-recent prompt size — it
+        MUST be set on every update, never accumulated. Otherwise a
+        100-turn session would report a prompt size of N * per_turn."""
+        db.create_session(session_id="s1", source="cli")
+        db.update_token_counts(
+            "s1", input_tokens=100, output_tokens=50,
+            last_prompt_tokens=8000, last_completion_tokens=200,
+        )
+        db.update_token_counts(
+            "s1", input_tokens=100, output_tokens=50,
+            last_prompt_tokens=12000, last_completion_tokens=300,
+        )
+        session = db.get_session("s1")
+        # Cumulative counters DO accumulate.
+        assert session["input_tokens"] == 200
+        assert session["output_tokens"] == 100
+        # last_* fields snapshot the LATEST call only.
+        assert session["last_prompt_tokens"] == 12000
+        assert session["last_completion_tokens"] == 300
+
+    def test_last_prompt_tokens_omitted_keeps_previous_value(self, db):
+        """Passing ``last_prompt_tokens=None`` (the default) must
+        leave the existing snapshot untouched — needed for cost-only
+        updates that don't carry a fresh prompt size."""
+        db.create_session(session_id="s1", source="cli")
+        db.update_token_counts(
+            "s1", input_tokens=100, output_tokens=50,
+            last_prompt_tokens=8000, last_completion_tokens=200,
+        )
+        # Subsequent update without last_* — must not zero them out.
+        db.update_token_counts(
+            "s1", input_tokens=100, output_tokens=50,
+        )
+        session = db.get_session("s1")
+        assert session["last_prompt_tokens"] == 8000
+        assert session["last_completion_tokens"] == 200
+
+    def test_last_prompt_tokens_in_absolute_mode(self, db):
+        """The gateway path uses ``absolute=True``. ``last_prompt_tokens``
+        must still be SET (not accumulated) in that branch too."""
+        db.create_session(session_id="s1", source="gateway")
+        db.update_token_counts(
+            "s1", input_tokens=500, output_tokens=200,
+            last_prompt_tokens=15000, last_completion_tokens=400,
+            absolute=True,
+        )
+        db.update_token_counts(
+            "s1", input_tokens=700, output_tokens=350,
+            last_prompt_tokens=22000, last_completion_tokens=500,
+            absolute=True,
+        )
+        session = db.get_session("s1")
+        assert session["input_tokens"] == 700  # absolute
+        assert session["last_prompt_tokens"] == 22000  # set, not accumulated
+        assert session["last_completion_tokens"] == 500
+
+    def test_existing_db_reconciles_last_prompt_tokens_columns(self, db):
+        """The declarative reconciliation must auto-ADD the new
+        columns on databases created before this change. Verifies
+        the columns exist and default to 0."""
+        db.create_session(session_id="s1", source="cli")
+        session = db.get_session("s1")
+        assert "last_prompt_tokens" in session.keys()
+        assert "last_completion_tokens" in session.keys()
+        assert session["last_prompt_tokens"] == 0
+        assert session["last_completion_tokens"] == 0
+
     def test_parent_session(self, db):
         db.create_session(session_id="parent", source="cli")
         db.create_session(session_id="child", source="cli", parent_session_id="parent")

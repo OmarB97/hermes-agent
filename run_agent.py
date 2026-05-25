@@ -13251,6 +13251,16 @@ class AIAgent:
                                     if cost_result.status == "included" else None,
                                     model=self.model,
                                     api_call_count=1,
+                                    # Snapshot the LATEST call's prompt/completion
+                                    # sizes — the cumulative counters above mix
+                                    # all calls together, but downstream
+                                    # dashboards need the most-recent prompt
+                                    # size to show current context-window usage.
+                                    # ``prompt_tokens`` is the full input
+                                    # (including cached prefixes), so it IS the
+                                    # context-window size at this moment.
+                                    last_prompt_tokens=prompt_tokens,
+                                    last_completion_tokens=completion_tokens,
                                 )
                             except Exception as e:
                                 # Log token persistence failures so they're
