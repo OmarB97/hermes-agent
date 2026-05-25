@@ -205,6 +205,14 @@ CREATE TABLE IF NOT EXISTS sessions (
     cache_read_tokens INTEGER DEFAULT 0,
     cache_write_tokens INTEGER DEFAULT 0,
     reasoning_tokens INTEGER DEFAULT 0,
+    -- Size of the LATEST API call's prompt (full input including cached
+    -- prefixes) and completion. Unlike the cumulative counters above,
+    -- these are SET on every update — they represent the current
+    -- context-window snapshot, not lifetime totals. Lets downstream
+    -- dashboards display "current context size" without having to
+    -- compute it from cumulative deltas + a cache model.
+    last_prompt_tokens INTEGER DEFAULT 0,
+    last_completion_tokens INTEGER DEFAULT 0,
     billing_provider TEXT,
     billing_base_url TEXT,
     billing_mode TEXT,
@@ -768,16 +776,29 @@ class SessionDB:
         billing_base_url: Optional[str] = None,
         billing_mode: Optional[str] = None,
         api_call_count: int = 0,
+        last_prompt_tokens: Optional[int] = None,
+        last_completion_tokens: Optional[int] = None,
         absolute: bool = False,
     ) -> None:
         """Update token counters and backfill model if not already set.
 
-        When *absolute* is False (default), values are **incremented** — use
-        this for per-API-call deltas (CLI path).
+        When *absolute* is False (default), the cumulative counters
+        (input_tokens, output_tokens, cache_*_tokens, reasoning_tokens,
+        cost, api_call_count) are **incremented** — use this for
+        per-API-call deltas (CLI path).
 
-        When *absolute* is True, values are **set directly** — use this when
-        the caller already holds cumulative totals (gateway path, where the
-        cached agent accumulates across messages).
+        When *absolute* is True, those values are **set directly** —
+        use this when the caller already holds cumulative totals
+        (gateway path, where the cached agent accumulates across
+        messages).
+
+        ``last_prompt_tokens`` / ``last_completion_tokens`` are ALWAYS
+        set when not None, regardless of *absolute*. They snapshot the
+        most-recent API call's prompt/completion sizes (i.e. the
+        current context-window size), which is what downstream
+        dashboards need to display "context burn" without rebuilding
+        it from cumulative deltas + a cache model. Pass None to leave
+        the existing snapshot untouched (e.g. for a cost-only update).
         """
         # Ensure the session row exists so the UPDATE doesn't silently affect
         # 0 rows.  Under concurrent load (cron + kanban + delegate_task) the
@@ -803,7 +824,9 @@ class SessionDB:
                    billing_base_url = COALESCE(billing_base_url, ?),
                    billing_mode = COALESCE(billing_mode, ?),
                    model = COALESCE(model, ?),
-                   api_call_count = ?
+                   api_call_count = ?,
+                   last_prompt_tokens = COALESCE(?, last_prompt_tokens),
+                   last_completion_tokens = COALESCE(?, last_completion_tokens)
                    WHERE id = ?"""
         else:
             sql = """UPDATE sessions SET
@@ -824,7 +847,9 @@ class SessionDB:
                    billing_base_url = COALESCE(billing_base_url, ?),
                    billing_mode = COALESCE(billing_mode, ?),
                    model = COALESCE(model, ?),
-                   api_call_count = COALESCE(api_call_count, 0) + ?
+                   api_call_count = COALESCE(api_call_count, 0) + ?,
+                   last_prompt_tokens = COALESCE(?, last_prompt_tokens),
+                   last_completion_tokens = COALESCE(?, last_completion_tokens)
                    WHERE id = ?"""
         params = (
             input_tokens,
@@ -843,6 +868,8 @@ class SessionDB:
             billing_mode,
             model,
             api_call_count,
+            last_prompt_tokens,
+            last_completion_tokens,
             session_id,
         )
         def _do(conn):
