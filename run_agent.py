@@ -10495,6 +10495,19 @@ class AIAgent:
                 f"accuracy may degrade. Consider /new to start fresh.",
                 force=True,
             )
+        # Persist compression count to state.db so downstream dashboards
+        # can render "epoch N after compression" on the context chip
+        # — without this, the chip's epoch field stays at 0 even after
+        # a session has had multiple compressions, and the operator
+        # has no signal that cumulative counters span multiple
+        # compressed segments. Best-effort; never block the agent loop.
+        if self._session_db and self.session_id:
+            try:
+                self._session_db.set_compression_count(
+                    self.session_id, _cc,
+                )
+            except Exception:
+                pass
 
         # Update token estimate after compaction so pressure calculations
         # use the post-compression count, not the stale pre-compression one.

@@ -221,6 +221,13 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- during the in-flight gap between request-send and response-
     -- commit (which can be minutes for long contexts on slow models).
     pending_prompt_tokens INTEGER DEFAULT 0,
+    -- Number of times context compression has fired for this session.
+    -- Each compression drops older messages + injects a summary, so
+    -- the model's current context is meaningfully different from a
+    -- pre-compression snapshot. Lets downstream dashboards label
+    -- "epoch N after compression" so the operator can tell why
+    -- cumulative metrics don't equal current context size.
+    compression_count INTEGER DEFAULT 0,
     billing_provider TEXT,
     billing_base_url TEXT,
     billing_mode TEXT,
@@ -763,6 +770,26 @@ class SessionDB:
             conn.execute(
                 "UPDATE sessions SET system_prompt = ? WHERE id = ?",
                 (system_prompt, session_id),
+            )
+        self._execute_write(_do)
+
+    def set_compression_count(
+        self, session_id: str, count: int
+    ) -> None:
+        """Snapshot the session's compression-fire count.
+
+        Called from run_agent after each context-compression event
+        with ``self.context_compressor.compression_count``. Downstream
+        dashboards read this to render "epoch N after compression"
+        on the context chip so the operator can tell that the
+        committed-token counters span multiple compressed segments,
+        not one continuous context.
+        """
+        self._insert_session_row(session_id, "unknown")
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET compression_count = ? WHERE id = ?",
+                (int(count) if count else 0, session_id),
             )
         self._execute_write(_do)
 
