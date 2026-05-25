@@ -12653,6 +12653,24 @@ class AIAgent:
                     except Exception:
                         pass
 
+                    # Snapshot the pre-flight prompt-size estimate to
+                    # state.db so downstream dashboards can show
+                    # in-flight context burn during the gap between
+                    # request-send and response-commit (which can be
+                    # minutes for long contexts on slow models).
+                    # ``update_token_counts`` on the success path
+                    # clears this field back to 0; any non-zero value
+                    # on a live session row means "a request is in
+                    # flight right now". Best-effort — pending is a
+                    # display hint, not load-bearing.
+                    if self._session_db and self.session_id:
+                        try:
+                            self._session_db.set_pending_prompt_tokens(
+                                self.session_id, approx_tokens,
+                            )
+                        except Exception:
+                            pass
+
                     if env_var_enabled("HERMES_DUMP_REQUESTS"):
                         self._dump_api_request_debug(api_kwargs, reason="preflight")
 
@@ -13329,6 +13347,20 @@ class AIAgent:
                         thinking_spinner = None
                     if self.thinking_callback:
                         self.thinking_callback("")
+
+                    # Clear the pre-flight pending estimate — the call
+                    # we set it for is dead. Without this, downstream
+                    # dashboards would keep showing the in-flight chip
+                    # for a request that no longer exists. The next
+                    # retry's pre-call write resets it cleanly. Best-
+                    # effort; pending is a display hint, not load-bearing.
+                    if self._session_db and self.session_id:
+                        try:
+                            self._session_db.set_pending_prompt_tokens(
+                                self.session_id, 0,
+                            )
+                        except Exception:
+                            pass
 
                     # -----------------------------------------------------------
                     # UnicodeEncodeError recovery.  Two common causes:

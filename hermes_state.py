@@ -213,6 +213,14 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- compute it from cumulative deltas + a cache model.
     last_prompt_tokens INTEGER DEFAULT 0,
     last_completion_tokens INTEGER DEFAULT 0,
+    -- Pre-flight estimate of the IN-FLIGHT API call's prompt size.
+    -- Set via set_pending_prompt_tokens() right before the request is
+    -- sent (from estimate_messages_tokens_rough), cleared back to 0
+    -- by update_token_counts() after the call succeeds. Lets the
+    -- dashboard surface "model is processing N tokens right now"
+    -- during the in-flight gap between request-send and response-
+    -- commit (which can be minutes for long contexts on slow models).
+    pending_prompt_tokens INTEGER DEFAULT 0,
     billing_provider TEXT,
     billing_base_url TEXT,
     billing_mode TEXT,
@@ -758,6 +766,28 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    def set_pending_prompt_tokens(
+        self, session_id: str, tokens: int
+    ) -> None:
+        """Snapshot the in-flight API call's pre-flight prompt-size estimate.
+
+        Called right before sending the request (with the rough
+        token estimate from ``estimate_messages_tokens_rough``) so
+        downstream dashboards can show the model's currently-processing
+        context size during the in-flight gap. ``update_token_counts``
+        clears this field back to 0 once the call commits, so a
+        non-zero value on a live row means "a request is in flight
+        right now". Pass ``tokens=0`` explicitly to clear (e.g. from
+        a failure path).
+        """
+        self._insert_session_row(session_id, "unknown")
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET pending_prompt_tokens = ? WHERE id = ?",
+                (int(tokens) if tokens else 0, session_id),
+            )
+        self._execute_write(_do)
+
     def update_token_counts(
         self,
         session_id: str,
@@ -826,7 +856,8 @@ class SessionDB:
                    model = COALESCE(model, ?),
                    api_call_count = ?,
                    last_prompt_tokens = COALESCE(?, last_prompt_tokens),
-                   last_completion_tokens = COALESCE(?, last_completion_tokens)
+                   last_completion_tokens = COALESCE(?, last_completion_tokens),
+                   pending_prompt_tokens = 0
                    WHERE id = ?"""
         else:
             sql = """UPDATE sessions SET
@@ -849,7 +880,8 @@ class SessionDB:
                    model = COALESCE(model, ?),
                    api_call_count = COALESCE(api_call_count, 0) + ?,
                    last_prompt_tokens = COALESCE(?, last_prompt_tokens),
-                   last_completion_tokens = COALESCE(?, last_completion_tokens)
+                   last_completion_tokens = COALESCE(?, last_completion_tokens),
+                   pending_prompt_tokens = 0
                    WHERE id = ?"""
         params = (
             input_tokens,
