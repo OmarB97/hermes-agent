@@ -194,8 +194,77 @@ class TestSessionLifecycle:
         session = db.get_session("s1")
         assert "last_prompt_tokens" in session.keys()
         assert "last_completion_tokens" in session.keys()
+        assert "pending_prompt_tokens" in session.keys()
         assert session["last_prompt_tokens"] == 0
         assert session["last_completion_tokens"] == 0
+        assert session["pending_prompt_tokens"] == 0
+
+    def test_set_pending_prompt_tokens_writes_value(self, db):
+        """The pre-flight estimate gets written via the dedicated
+        setter so the dashboard can see in-flight burn during the
+        gap between request-send and response-commit."""
+        db.create_session(session_id="s1", source="cli")
+        db.set_pending_prompt_tokens("s1", 12000)
+        session = db.get_session("s1")
+        assert session["pending_prompt_tokens"] == 12000
+
+    def test_pending_prompt_tokens_cleared_on_token_count_commit(self, db):
+        """Once the API call commits via update_token_counts, the
+        pending field must reset to 0 — otherwise the dashboard
+        would keep showing the in-flight chip for a request that
+        already finished."""
+        db.create_session(session_id="s1", source="cli")
+        db.set_pending_prompt_tokens("s1", 12000)
+        # Sanity check the pending write.
+        assert db.get_session("s1")["pending_prompt_tokens"] == 12000
+        # Commit the call.
+        db.update_token_counts(
+            "s1", input_tokens=10000, output_tokens=500,
+            last_prompt_tokens=12345, last_completion_tokens=500,
+        )
+        # update_token_counts clears pending regardless of caller params.
+        session = db.get_session("s1")
+        assert session["pending_prompt_tokens"] == 0
+        assert session["last_prompt_tokens"] == 12345
+        assert session["last_completion_tokens"] == 500
+
+    def test_pending_prompt_tokens_cleared_in_absolute_mode_too(self, db):
+        """Gateway path uses absolute=True. Pending must clear there too."""
+        db.create_session(session_id="s1", source="gateway")
+        db.set_pending_prompt_tokens("s1", 15000)
+        db.update_token_counts(
+            "s1", input_tokens=20000, output_tokens=1000,
+            last_prompt_tokens=15000, last_completion_tokens=500,
+            absolute=True,
+        )
+        assert db.get_session("s1")["pending_prompt_tokens"] == 0
+
+    def test_set_pending_prompt_tokens_zero_clears(self, db):
+        """Failure paths call set_pending_prompt_tokens(session, 0)
+        to clear the in-flight estimate when a call errors out
+        before it can commit through update_token_counts."""
+        db.create_session(session_id="s1", source="cli")
+        db.set_pending_prompt_tokens("s1", 12000)
+        db.set_pending_prompt_tokens("s1", 0)
+        assert db.get_session("s1")["pending_prompt_tokens"] == 0
+
+    def test_set_pending_prompt_tokens_overwrites_previous_value(self, db):
+        """Consecutive set calls (e.g. retries with different
+        message lists) overwrite the previous pending value."""
+        db.create_session(session_id="s1", source="cli")
+        db.set_pending_prompt_tokens("s1", 8000)
+        db.set_pending_prompt_tokens("s1", 15000)
+        assert db.get_session("s1")["pending_prompt_tokens"] == 15000
+
+    def test_set_pending_prompt_tokens_creates_session_row_if_missing(self, db):
+        """The setter must INSERT OR IGNORE the row so it doesn't
+        silently affect 0 rows when create_session() lost the race
+        under concurrent load."""
+        # No create_session call — directly set pending.
+        db.set_pending_prompt_tokens("s_lazy", 5000)
+        session = db.get_session("s_lazy")
+        assert session is not None
+        assert session["pending_prompt_tokens"] == 5000
 
     def test_parent_session(self, db):
         db.create_session(session_id="parent", source="cli")
