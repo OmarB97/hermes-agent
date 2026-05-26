@@ -1,0 +1,124 @@
+# Daily sync of `main` from upstream (NousResearch/hermes-agent).
+#
+# Fork divergence is a slow-rotting problem: every feature merged onto the
+# fork while upstream moves widens the gap; by the time a critical upstream
+# fix is needed the merge surface is too large to resolve in one sitting.
+# This workflow keeps the gap permanently small — it runs once a day,
+# fast-forwards / clean-merges what it can, and opens a PR for operator
+# review when an actual conflict needs human resolution.
+#
+# When this workflow self-merges:
+#   - upstream/main is strictly ahead of fork main (fast-forwardable), or
+#   - the merge has zero conflicts.
+# When it opens a PR instead:
+#   - the merge conflicts on at least one file. The PR carries the conflict
+#     markers; the operator resolves and merges manually.
+#
+# Manual trigger via `workflow_dispatch` is useful right after merging a
+# feature PR onto fork — sync before drift compounds.
+
+name: Sync from upstream
+
+on:
+  schedule:
+    # 09:00 UTC daily (just after typical US-East morning, so a fresh sync
+    # PR is waiting when the operator starts the day if one's needed).
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote and fetch
+        run: |
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch upstream main --tags
+
+      - name: Compute divergence
+        id: status
+        run: |
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "uptodate=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Fork is already current with upstream/main"
+          else
+            BEHIND=$(git rev-list HEAD..upstream/main --count)
+            AHEAD=$(git rev-list upstream/main..HEAD --count)
+            echo "uptodate=false" >> "$GITHUB_OUTPUT"
+            echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+            echo "ahead=$AHEAD" >> "$GITHUB_OUTPUT"
+            echo "📊 Fork is $BEHIND behind, $AHEAD ahead of upstream/main"
+          fi
+
+      - name: Attempt clean merge
+        id: merge
+        if: steps.status.outputs.uptodate == 'false'
+        run: |
+          if git merge --no-edit \
+              -m "sync: merge upstream/main into fork main (${{ steps.status.outputs.behind }} commits)" \
+              upstream/main; then
+            echo "result=clean" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+            git merge --abort
+          fi
+
+      - name: Push clean merge to main
+        if: steps.merge.outputs.result == 'clean'
+        run: |
+          git push origin HEAD:main
+          echo "✅ Merged ${{ steps.status.outputs.behind }} upstream commits cleanly"
+
+      - name: Open sync PR for conflict resolution
+        if: steps.merge.outputs.result == 'conflict'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DATE=$(date -u +%Y%m%d)
+          BRANCH="sync/upstream-${DATE}"
+          # Idempotent: if today's sync PR already exists, leave it for the
+          # operator and skip. Two scheduled runs in a day shouldn't open
+          # two PRs against the same conflict surface.
+          EXISTING=$(gh pr list --head "$BRANCH" --state open --json number -q 'length')
+          if [ "$EXISTING" != "0" ]; then
+            echo "ℹ️  PR for ${BRANCH} already open; skipping"
+            exit 0
+          fi
+          git checkout -b "$BRANCH"
+          # Re-attempt the merge so the conflict markers are visible in the
+          # branch; `|| true` swallows the non-zero exit so we can commit
+          # the conflicted state for the operator to resolve in the PR.
+          git merge upstream/main || true
+          git add -A
+          git commit -m "WIP: sync upstream/main into fork main (conflicts to resolve)" || true
+          git push origin "$BRANCH"
+          gh pr create \
+            --title "[sync] ${DATE}: ${{ steps.status.outputs.behind }} upstream commits to merge (conflicts)" \
+            --body "Daily auto-sync from \`NousResearch/hermes-agent:main\` hit conflicts.
+
+**Status:** ${{ steps.status.outputs.behind }} commits behind upstream, ${{ steps.status.outputs.ahead }} ahead.
+
+**To resolve:**
+1. \`gh pr checkout\` this PR locally
+2. Resolve conflict markers (likely in hermes_state.py, run_agent.py, tests/)
+3. Run the test suite
+4. Push the resolution; merge.
+
+Once merged the daily workflow resumes; the next sync should be clean." \
+            --head "$BRANCH" \
+            --base main
