@@ -133,6 +133,21 @@ def build_top_level_parser():
             "under model.provider — use `hermes setup` or edit the file to change it."
         ),
     )
+    _inherited_flag(
+        parser,
+        "--no-fallback",
+        dest="no_fallback",
+        action="store_true",
+        default=False,
+        help=(
+            "Disable the fallback-provider chain from config.yaml for this invocation. "
+            "When the primary provider fails (rate limit, billing, non-retryable error), "
+            "the agent will surface the failure immediately instead of cascading through "
+            "fallback_providers. Also settable via HERMES_NO_FALLBACK=1. "
+            "Useful when dispatching to a specific provider intentionally (e.g. a local "
+            "model) and a cascade to a paid cloud fallback would defeat the purpose."
+        ),
+    )
     parser.add_argument(
         "-t",
         "--toolsets",
@@ -267,6 +282,17 @@ def build_top_level_parser():
         # `--provider` flag.
         default=None,
         help="Inference provider (default: auto). Built-in or a user-defined name from `providers:` in config.yaml.",
+    )
+    _inherited_flag(
+        chat_parser,
+        "--no-fallback",
+        dest="no_fallback",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help=(
+            "Disable the fallback-provider chain from config.yaml for this invocation. "
+            "Mirrors the top-level `--no-fallback` flag; see its help for details."
+        ),
     )
     chat_parser.add_argument(
         "-v",

@@ -894,6 +894,17 @@ def init_agent(
         agent._fallback_chain = []
     agent._fallback_index = 0
     agent._fallback_activated = getattr(agent, "_fallback_activated", False)
+    # --no-fallback (HERMES_NO_FALLBACK=1): disable the fallback-provider
+    # chain for this invocation. Honoured by ``try_activate_fallback``,
+    # which short-circuits returning False so the original primary-provider
+    # error surfaces immediately instead of cascading. Default is OFF so
+    # existing callers preserve current fallback behaviour.
+    agent._no_fallback = os.environ.get("HERMES_NO_FALLBACK", "").strip() == "1"
+    if agent._no_fallback:
+        # Drop the chain entirely so dedup/iteration logic short-circuits
+        # immediately, and skip the "Fallback chain (N providers)" banner
+        # below since no fallback will be attempted.
+        agent._fallback_chain = []
     # Legacy attribute kept for backward compat (tests, external callers)
     agent._fallback_model = agent._fallback_chain[0] if agent._fallback_chain else None
     if agent._fallback_chain and not agent.quiet_mode:
@@ -903,6 +914,8 @@ def init_agent(
         else:
             print(f"🔄 Fallback chain ({len(agent._fallback_chain)} providers): " +
                   " → ".join(f"{f['model']} ({f['provider']})" for f in agent._fallback_chain))
+    elif agent._no_fallback and not agent.quiet_mode:
+        print("🚫 Fallback chain disabled (--no-fallback / HERMES_NO_FALLBACK=1)")
 
     # Get available tools with filtering
     agent.tools = _ra().get_tool_definitions(

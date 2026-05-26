@@ -1756,6 +1756,16 @@ def cmd_chat(args):
     if getattr(args, "ignore_rules", False):
         os.environ["HERMES_IGNORE_RULES"] = "1"
 
+    # --no-fallback: disable the fallback-provider chain for this invocation.
+    # Read by ``agent.agent_init.init_agent`` which clears ``_fallback_chain``
+    # and sets ``agent._no_fallback = True``; ``try_activate_fallback`` then
+    # short-circuits with a clear "primary failed; --no-fallback is set" status
+    # instead of cascading through fallback_providers. Useful when the caller
+    # wants a specific provider (e.g. a local model) and a cascade to a paid
+    # cloud fallback would defeat the purpose.
+    if getattr(args, "no_fallback", False):
+        os.environ["HERMES_NO_FALLBACK"] = "1"
+
     # --source: tag session source for filtering (e.g. 'tool' for third-party integrations)
     if getattr(args, "source", None):
         os.environ["HERMES_SESSION_SOURCE"] = args.source

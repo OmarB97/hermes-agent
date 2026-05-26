@@ -892,6 +892,23 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    # --no-fallback / HERMES_NO_FALLBACK=1: short-circuit before any
+    # cooldown or chain-iteration logic.  Surfaces the primary-provider
+    # failure immediately so callers (e.g. a launcher dispatching to a
+    # specific local model) don't cascade into a paid cloud fallback that
+    # would defeat the purpose of pinning the provider.
+    if getattr(agent, "_no_fallback", False):
+        try:
+            _current_provider = (getattr(agent, "provider", "") or "").strip() or "primary"
+            agent._emit_status(
+                f"🚫 {_current_provider} failed; --no-fallback is set — "
+                "skipping fallback chain."
+            )
+        except Exception:
+            # Status emission is best-effort; never let it block the
+            # short-circuit.
+            pass
+        return False
     if reason in {FailoverReason.rate_limit, FailoverReason.billing}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
