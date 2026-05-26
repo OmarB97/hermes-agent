@@ -2533,6 +2533,22 @@ class AIAgent:
                 parent_session_id=self._parent_session_id,
             )
             self._session_db_created = True
+            # Snapshot the model's context-window cap (in tokens) once
+            # so downstream dashboards have an authoritative cap when
+            # their static model-metadata tables and live HTTP probes
+            # can't answer for an unrecognized backend. Best-effort —
+            # display hint, not load-bearing.
+            try:
+                _ctx_len = int(getattr(
+                    getattr(self, "context_compressor", None),
+                    "context_length", 0,
+                ) or 0)
+                if _ctx_len > 0:
+                    self._session_db.set_context_length(
+                        self.session_id, _ctx_len,
+                    )
+            except Exception:
+                pass
         except Exception as e:
             # Transient failure (e.g. SQLite lock). Keep _session_db alive —
             # _session_db_created stays False so next run_conversation() retries.

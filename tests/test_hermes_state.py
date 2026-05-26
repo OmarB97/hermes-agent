@@ -300,6 +300,34 @@ class TestSessionLifecycle:
         assert "compression_count" in session.keys()
         assert session["compression_count"] == 0
 
+    def test_set_context_length_writes_value(self, db):
+        """Session-init snapshot of the model's context-window cap."""
+        db.create_session(session_id="s1", source="cli")
+        db.set_context_length("s1", 262_144)
+        assert db.get_session("s1")["context_length"] == 262_144
+
+    def test_set_context_length_zero_clears(self, db):
+        """Zero is a valid value (caller signals 'unknown')."""
+        db.create_session(session_id="s1", source="cli")
+        db.set_context_length("s1", 131_072)
+        db.set_context_length("s1", 0)
+        assert db.get_session("s1")["context_length"] == 0
+
+    def test_set_context_length_creates_session_row_if_missing(self, db):
+        """Lazy-setter INSERT-OR-IGNORE pattern matches the other
+        post-#1/#2/#3 setters."""
+        db.set_context_length("s_lazy_ctxlen", 65_536)
+        session = db.get_session("s_lazy_ctxlen")
+        assert session is not None
+        assert session["context_length"] == 65_536
+
+    def test_existing_db_reconciles_context_length_column(self, db):
+        """Declarative reconciliation auto-ADDs the column on existing DBs."""
+        db.create_session(session_id="s1", source="cli")
+        session = db.get_session("s1")
+        assert "context_length" in session.keys()
+        assert session["context_length"] == 0
+
     def test_parent_session(self, db):
         db.create_session(session_id="parent", source="cli")
         db.create_session(session_id="child", source="cli", parent_session_id="parent")

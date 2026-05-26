@@ -221,6 +221,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- during the in-flight gap between request-send and response-
     -- commit (which can be minutes for long contexts on slow models).
     pending_prompt_tokens INTEGER DEFAULT 0,
+    -- Definitive context-window cap (in tokens) for the model loaded
+    -- in this session. Written by run_agent on session init from
+    -- ``context_compressor.context_length`` so downstream dashboards
+    -- have an authoritative cap even when no model-metadata table
+    -- and no live HTTP probe can answer for an unrecognized model.
+    context_length INTEGER DEFAULT 0,
     -- Number of times context compression has fired for this session.
     -- Each compression drops older messages + injects a summary, so
     -- the model's current context is meaningfully different from a
@@ -770,6 +776,27 @@ class SessionDB:
             conn.execute(
                 "UPDATE sessions SET system_prompt = ? WHERE id = ?",
                 (system_prompt, session_id),
+            )
+        self._execute_write(_do)
+
+    def set_context_length(
+        self, session_id: str, length: int
+    ) -> None:
+        """Snapshot the session's model context-window cap (tokens).
+
+        Called once per session by run_agent right after
+        ``create_session`` succeeds, with the live value of
+        ``context_compressor.context_length``. Constant for the
+        lifetime of the session (the model's window doesn't shrink
+        mid-session). Downstream dashboards read this as the
+        authoritative cap when their model-metadata tables and live
+        probes can't answer for an unrecognized backend.
+        """
+        self._insert_session_row(session_id, "unknown")
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET context_length = ? WHERE id = ?",
+                (int(length) if length else 0, session_id),
             )
         self._execute_write(_do)
 
