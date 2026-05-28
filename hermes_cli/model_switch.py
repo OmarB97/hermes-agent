@@ -992,10 +992,15 @@ def switch_model(
                 entry_slug = f"custom:{entry_name}" if entry_name else ""
                 entry_url = entry.get("base_url", "")
                 normalized_target = normalize_provider(target_provider) if target_provider else ""
+                # Strip "custom:" prefix for suffix comparison — normalise
+                # always lowercases so "Custom:OpenRouter" becomes
+                # "custom:openrouter" while entry_name is just "openrouter".
+                target_suffix = target_provider.split(":", 1)[-1].lower() if target_provider else ""
                 if (
                     entry_slug == target_provider
                     or entry_name == target_provider
                     or entry_name == normalized_target
+                    or entry_name.lower() == target_suffix
                     or entry_url == base_url
                 ):
                     # Check if the requested model matches the entry's model
