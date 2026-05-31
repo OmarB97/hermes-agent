@@ -158,6 +158,27 @@ def _dflash_local_stale_timeout(api_payload: Any, model: Any) -> float | None:
     return timeout
 
 
+def _dflash_local_first_chunk_timeout(api_payload: Any, model: Any) -> float | None:
+    """Return the dflash no-first-chunk cutoff for local streaming calls.
+
+    This is intentionally separate from the post-first-chunk stale timeout.
+    Long contexts can justify longer gaps between chunks after generation has
+    started, but the 2026-05-31 dflash failure mode was an accepted local
+    request that never emitted its first stream chunk and kept decoding after
+    the client disconnected.
+    """
+    if not _is_dflash_like_model(model):
+        return None
+
+    timeout = _env_float(
+        "HERMES_DFLASH_FIRST_CHUNK_TIMEOUT",
+        _env_float("HERMES_DFLASH_TTFB_TIMEOUT", 75.0),
+    )
+    if timeout <= 0:
+        return float("inf")
+    return timeout
+
+
 def resolve_stream_stale_timeout(agent, api_kwargs: dict) -> float:
     """Resolve the no-chunk timeout for streaming chat completions."""
     _cfg_stale = get_provider_stale_timeout(agent.provider, agent.model)
@@ -1741,6 +1762,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # poll loop uses this to detect stale connections that keep receiving
     # SSE keep-alive pings but no actual data.
     last_chunk_time = {"t": time.time()}
+    first_chunk_seen = {"yes": False}
 
     def _fire_first_delta():
         if not first_delta_fired["done"] and on_first_delta:
@@ -1800,6 +1822,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # Reset stale-stream timer so the detector measures from this
         # attempt's start, not a previous attempt's last chunk.
         last_chunk_time["t"] = time.time()
+        first_chunk_seen["yes"] = False
         agent._touch_activity("waiting for provider response (streaming)")
         # Initialize per-attempt stream diagnostics so the retry block can
         # reach for them after the stream dies.  Lives on
@@ -1835,6 +1858,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         reasoning_parts: list = []
         usage_obj = None
         for chunk in stream:
+            first_chunk_seen["yes"] = True
             last_chunk_time["t"] = time.time()
             agent._touch_activity("receiving stream response")
 
@@ -2049,6 +2073,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
         # Reset stale-stream timer for this attempt
         last_chunk_time["t"] = time.time()
+        first_chunk_seen["yes"] = False
         # Per-attempt diagnostic dict for the retry block to consume.
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
@@ -2065,6 +2090,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             except Exception:
                 pass
             for event in stream:
+                first_chunk_seen["yes"] = True
                 # Update stale-stream timer on every event so the
                 # outer poll loop knows data is flowing.  Without
                 # this, the detector kills healthy long-running
@@ -2367,6 +2393,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             _close_request_client_once("stream_request_complete")
 
     _stream_stale_timeout = resolve_stream_stale_timeout(agent, api_kwargs)
+    _dflash_first_chunk_timeout = None
+    if agent.base_url and is_local_endpoint(agent.base_url):
+        _dflash_first_chunk_timeout = _dflash_local_first_chunk_timeout(
+            api_kwargs,
+            api_kwargs.get("model") or agent.model,
+        )
 
     t = threading.Thread(target=_call, daemon=True)
     t.start()
@@ -2390,6 +2422,51 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             agent._touch_activity(
                 f"waiting for stream response ({_waiting_secs}s, no chunks yet)"
             )
+
+        # Local dflash has a distinct no-first-chunk failure mode: the HTTP
+        # request is accepted but the server never emits the first SSE chunk.
+        # Do not inherit the larger long-context stale timeout for this phase;
+        # once any chunk arrives, the normal stale detector below takes over.
+        if _dflash_first_chunk_timeout is not None and not first_chunk_seen["yes"]:
+            _first_elapsed = time.time() - last_chunk_time["t"]
+            if _first_elapsed > _dflash_first_chunk_timeout:
+                _est_ctx = estimate_request_context_tokens(api_kwargs)
+                logger.warning(
+                    "Local dflash stream produced no first chunk for %.0fs "
+                    "(threshold %.0fs). model=%s context=~%s tokens. "
+                    "Killing connection.",
+                    _first_elapsed,
+                    _dflash_first_chunk_timeout,
+                    api_kwargs.get("model", "unknown"),
+                    f"{_est_ctx:,}",
+                )
+                agent._buffer_status(
+                    f"⚠️ No first stream chunk from local dflash for "
+                    f"{int(_first_elapsed)}s "
+                    f"(context: ~{_est_ctx:,} tokens). Reconnecting..."
+                )
+                try:
+                    _close_request_client_once("dflash_first_chunk_kill")
+                except Exception:
+                    pass
+                try:
+                    agent._replace_primary_openai_client(
+                        reason="dflash_first_chunk_pool_cleanup"
+                    )
+                except Exception:
+                    pass
+                t.join(timeout=_env_float("HERMES_STREAM_ABORT_JOIN_TIMEOUT", 2.0))
+                if result["error"] is None and result["response"] is None:
+                    result["error"] = TimeoutError(
+                        f"Local dflash stream produced no first chunk after "
+                        f"{int(_first_elapsed)}s "
+                        f"(threshold: {int(_dflash_first_chunk_timeout)}s)"
+                    )
+                    break
+                last_chunk_time["t"] = time.time()
+                agent._touch_activity(
+                    f"local dflash first-chunk timeout after {int(_first_elapsed)}s"
+                )
 
         # Detect stale streams: connections kept alive by SSE pings
         # but delivering no real chunks.  Kill the client so the

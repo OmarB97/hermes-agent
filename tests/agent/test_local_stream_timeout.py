@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from agent.model_metadata import is_local_endpoint
 from agent.chat_completion_helpers import (
+    _dflash_local_first_chunk_timeout,
     _dflash_local_stale_timeout,
     resolve_stream_stale_timeout,
 )
@@ -114,6 +115,22 @@ class TestLocalDflashStaleTimeout:
         )
 
         assert timeout == 75.0
+
+    def test_dflash_first_chunk_timeout_does_not_scale_with_context(self, monkeypatch):
+        monkeypatch.delenv("HERMES_DFLASH_FIRST_CHUNK_TIMEOUT", raising=False)
+        monkeypatch.delenv("HERMES_DFLASH_TTFB_TIMEOUT", raising=False)
+
+        timeout = _dflash_local_first_chunk_timeout(
+            self._payload_for_estimated_tokens(66_000),
+            "dflash",
+        )
+
+        assert timeout == 75.0
+
+    def test_dflash_first_chunk_timeout_has_independent_env(self, monkeypatch):
+        monkeypatch.setenv("HERMES_DFLASH_FIRST_CHUNK_TIMEOUT", "45")
+
+        assert _dflash_local_first_chunk_timeout({"messages": []}, "dflash") == 45.0
 
     def test_generic_local_stream_stale_timeout_still_disables_by_default(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
