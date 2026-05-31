@@ -46,8 +46,36 @@ def test_mixed_explanation_action_preamble_over_default_limit_is_a_stall() -> No
         "command's validation section and the _validate_subagent_dispatch_record "
         "function:"
     )
+
     assert len(content) > 400
     assert looks_like_stall(content, "stop", False, 400)
+
+
+def test_long_diagnostic_ending_with_action_promise_is_a_stall() -> None:
+    content = (
+        "The crash pattern is clear: when the context fills up and llama.cpp "
+        "tries to allocate a new tensor for the KV cache, it runs out of GPU "
+        "memory. The first allocation succeeds, but the subsequent data "
+        "allocation fails and leaves the tensor in an inconsistent state. "
+        * 4
+    )
+    content += "Let me look at the exact crash mechanism more carefully:"
+
+    assert len(content) > 400
+    assert looks_like_stall(content, "stop", False, 400)
+
+
+def test_long_diagnostic_with_completion_text_is_not_a_stall() -> None:
+    content = (
+        "The crash pattern is clear: when the context fills up and llama.cpp "
+        "tries to allocate a new tensor for the KV cache, it runs out of GPU "
+        "memory. "
+        * 5
+    )
+    content += "In summary, the task is complete."
+
+    assert len(content) > 400
+    assert not looks_like_stall(content, "stop", False, 400)
 
 
 def test_completion_text_is_not_a_stall() -> None:

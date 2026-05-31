@@ -59,6 +59,7 @@ _COMPLETION_RE = re.compile(
 )
 _NATURAL_END_CHARS = '.!?:)"\']}。！？：）】」』》^'
 _MIN_INCOMPLETE_FINAL_CHARS = 80
+_ACTION_TAIL_CHARS = 500
 _STALL_RETRY_NUDGE = (
     "Your previous assistant response ended after describing the next action, "
     "but it did not include the required tool call. Continue the same task now "
@@ -159,6 +160,22 @@ def _has_natural_response_ending(content: str) -> bool:
     if last in _NATURAL_END_CHARS:
         return True
     return ord(last) >= 0x1F300
+
+
+def _ends_with_action_promise(content: str) -> bool:
+    """True when the visible tail promises immediate work but stops there.
+
+    The generic stall heuristic is intentionally length-capped because long
+    prose is often a real answer. Explicit tail promises are different: a long
+    diagnostic can still end with "Let me check that:" and no tool call, which
+    is the exact dflash premature-stop shape this module exists to recover.
+    """
+    tail = (content or "").strip()[-_ACTION_TAIL_CHARS:]
+    if not tail:
+        return False
+    if not _ACTION_RE.search(tail):
+        return False
+    return tail.rstrip().endswith(":")
 
 
 def _safe_preview(value: Any, max_chars: int = 240) -> str:
@@ -294,16 +311,11 @@ def looks_like_stall(content: str, finish_reason: str, has_tool_calls: bool,
         return False
     if _COMPLETION_RE.search(c):
         return False  # model said it's done => respect it
-    has_action_preamble = bool(_ACTION_RE.search(c))
-    long_but_open_action = (
-        len(c) > max_chars
-        and len(c) <= max(max_chars * 2, 800)
-        and has_action_preamble
-        and c.endswith(":")
-    )
-    if len(c) > max_chars and not long_but_open_action:
+    if _ends_with_action_promise(c):
+        return True
+    if len(c) > max_chars:
         return False  # long => almost certainly a real answer
-    if has_action_preamble:
+    if _ACTION_RE.search(c):
         return True   # announced an action, no tool call => stall
     # Short prose that doesn't declare completion and isn't an obvious answer:
     # a trailing colon strongly implies "about to do something".
