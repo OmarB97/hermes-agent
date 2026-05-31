@@ -8,7 +8,8 @@ answer and stops mid-task. Higher-precision weights (the stock Q6 lane on the
 same host) continue to a real tool call on the identical prompt.
 
 This module detects that stall signature on a no-tool-call turn and retries
-the SAME turn once against a higher-quality model lane. If the retry produces
+the turn against a higher-quality model lane, with a small recovery nudge that
+asks the model to emit the tool call it just promised. If the retry produces
 tool_calls, the loop adopts that response and continues; otherwise the caller
 should fail the turn as partial rather than persist the planning-only text as
 a final assistant message.
@@ -21,11 +22,18 @@ Env:
   HERMES_STALL_RETRY_MAX_PER_TURN  max retries per user turn (default 5)
   HERMES_STALL_RETRY_MAX_CHARS  max content length to still count as a stall
                                 (default 400; real final answers are longer)
+  HERMES_STALL_RETRY_NUDGE  true/false; add a retry-only continuation nudge
+                            (default true)
+  HERMES_STALL_RETRY_TELEMETRY  true/false; append local NDJSON telemetry
+                                (default true)
 """
 from __future__ import annotations
 
+import json
 import os
 import re
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Mapping
 
 # Action-preamble signature: the turn announced an action but produced no tool
@@ -47,6 +55,12 @@ _COMPLETION_RE = re.compile(
 )
 _NATURAL_END_CHARS = '.!?:)"\']}。！？：）】」』》^'
 _MIN_INCOMPLETE_FINAL_CHARS = 80
+_STALL_RETRY_NUDGE = (
+    "Your previous assistant response ended after describing the next action, "
+    "but it did not include the required tool call. Continue the same task now "
+    "by making the tool call immediately. Do not summarize or apologize; call "
+    "the tool that performs the action you just announced."
+)
 
 
 def _as_positive_int(value: Any, default: int) -> int:
@@ -55,6 +69,22 @@ def _as_positive_int(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed > 0 else default
+
+
+def _as_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on", "enabled"}:
+            return True
+        if lowered in {"0", "false", "no", "off", "disabled"}:
+            return False
+    return default
 
 
 def _stall_retry_config(agent: Any | None = None) -> Mapping[str, Any]:
@@ -101,6 +131,20 @@ def get_stall_retry_max_per_turn(agent: Any | None = None) -> int:
         return 5
 
 
+def get_stall_retry_nudge_enabled(agent: Any | None = None) -> bool:
+    env_value = os.environ.get("HERMES_STALL_RETRY_NUDGE")
+    if env_value is not None:
+        return _as_bool(env_value, True)
+    return _as_bool(_stall_retry_config(agent).get("nudge"), True)
+
+
+def get_stall_retry_telemetry_enabled(agent: Any | None = None) -> bool:
+    env_value = os.environ.get("HERMES_STALL_RETRY_TELEMETRY")
+    if env_value is not None:
+        return _as_bool(env_value, True)
+    return _as_bool(_stall_retry_config(agent).get("telemetry"), True)
+
+
 def _has_natural_response_ending(content: str) -> bool:
     stripped = (content or "").rstrip()
     if not stripped:
@@ -111,6 +155,122 @@ def _has_natural_response_ending(content: str) -> bool:
     if last in _NATURAL_END_CHARS:
         return True
     return ord(last) >= 0x1F300
+
+
+def _safe_preview(value: Any, max_chars: int = 240) -> str:
+    text = value if isinstance(value, str) else str(value or "")
+    text = re.sub(r"^<think>.*?</think>\s*", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
+
+
+def _jsonable(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Mapping):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    return str(value)
+
+
+def _stall_retry_log_path(agent: Any | None = None) -> Path:
+    cfg_path = _stall_retry_config(agent).get("telemetry_path")
+    if cfg_path:
+        return Path(str(cfg_path)).expanduser()
+    try:
+        from hermes_constants import get_hermes_home
+
+        home = Path(get_hermes_home())
+    except Exception:
+        home = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
+    return home / "logs" / "stall-retry.ndjson"
+
+
+def record_stall_retry_event(agent: Any, event: str, **fields: Any) -> None:
+    """Record local, bounded stall-retry telemetry."""
+    entry: dict[str, Any] = {
+        "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "event": str(event),
+        "session_id": str(getattr(agent, "session_id", "") or ""),
+        "model": str(getattr(agent, "model", "") or ""),
+        "provider": str(getattr(agent, "provider", "") or ""),
+    }
+    content = fields.pop("content", None)
+    if content is not None:
+        text = content if isinstance(content, str) else str(content)
+        entry["content_chars"] = len(text)
+        entry["content_preview"] = _safe_preview(text)
+    entry.update({str(k): _jsonable(v) for k, v in fields.items()})
+
+    events = getattr(agent, "_stall_retry_events", None)
+    if not isinstance(events, list):
+        events = []
+        try:
+            setattr(agent, "_stall_retry_events", events)
+        except Exception:
+            pass
+    events.append(entry)
+
+    if not get_stall_retry_telemetry_enabled(agent):
+        return
+    try:
+        path = _stall_retry_log_path(agent)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception:
+        return
+
+
+def stall_retry_summary(agent: Any) -> dict[str, Any] | None:
+    events = getattr(agent, "_stall_retry_events", None)
+    if not isinstance(events, list) or not events:
+        return None
+    counts = {
+        "detected": 0,
+        "attempted": 0,
+        "recovered": 0,
+        "failed": 0,
+        "limit_exhausted": 0,
+        "exceptions": 0,
+    }
+    for item in events:
+        kind = item.get("event") if isinstance(item, Mapping) else None
+        if kind == "detected":
+            counts["detected"] += 1
+        elif kind == "attempt":
+            counts["attempted"] += 1
+        elif kind == "recovered":
+            counts["recovered"] += 1
+        elif kind in {"failed_no_tool_call", "api_none", "skipped_same_model"}:
+            counts["failed"] += 1
+        elif kind == "limit_exhausted":
+            counts["limit_exhausted"] += 1
+        elif kind == "exception":
+            counts["exceptions"] += 1
+    summary: dict[str, Any] = dict(counts)
+    summary["events"] = len(events)
+    if get_stall_retry_telemetry_enabled(agent):
+        summary["log_path"] = str(_stall_retry_log_path(agent))
+    return summary
+
+
+def _retry_messages_with_nudge(
+    agent: Any,
+    api_messages: list[dict[str, Any]],
+    stalled_content: str,
+) -> list[dict[str, Any]]:
+    if not get_stall_retry_nudge_enabled(agent):
+        return api_messages
+    retry_messages = [msg.copy() if isinstance(msg, dict) else msg for msg in api_messages]
+    visible = (stalled_content or "").strip()
+    if visible:
+        retry_messages.append({"role": "assistant", "content": visible})
+    retry_messages.append({"role": "user", "content": _STALL_RETRY_NUDGE})
+    return retry_messages
 
 
 def looks_like_stall(content: str, finish_reason: str, has_tool_calls: bool,
@@ -125,7 +285,9 @@ def looks_like_stall(content: str, finish_reason: str, has_tool_calls: bool,
     # Strip a leading <think>...</think> block if present; judge the visible tail.
     c = re.sub(r"^<think>.*?</think>\s*", "", c, flags=re.IGNORECASE | re.DOTALL).strip()
     if not c:
-        return True  # empty visible turn mid-task => stall
+        # Truly empty responses have their own recovery path in the
+        # conversation loop. Do not let stall retry preempt that machinery.
+        return False
     if len(c) > max_chars:
         return False  # long => almost certainly a real answer
     if _COMPLETION_RE.search(c):
@@ -146,10 +308,18 @@ def looks_like_stall(content: str, finish_reason: str, has_tool_calls: bool,
     return False
 
 
-def retry_on_stall(agent, api_messages, finish_reason):
+def retry_on_stall(
+    agent,
+    api_messages,
+    finish_reason,
+    stalled_content: str = "",
+    retry_index: int | None = None,
+):
     """If the just-finished no-tool-call turn looks like a stall and a retry
-    lane is configured, re-issue the SAME turn against that lane (same provider
-    / client / endpoint — only the model name changes) ONCE.
+    lane is configured, re-issue the turn against that lane (same provider /
+    client / endpoint — only the model name changes). A retry-only nudge is
+    appended by default so the fallback model is told to continue with a tool
+    call instead of repeating the action preamble.
 
     Returns the normalized assistant_message from the retry IF it produced tool
     calls (caller should adopt it + its finish_reason='tool_calls'), else None.
@@ -161,13 +331,21 @@ def retry_on_stall(agent, api_messages, finish_reason):
         return None
 
     try:
+        retry_messages = _retry_messages_with_nudge(agent, api_messages, stalled_content)
         # Build kwargs exactly as the normal turn would, then override only the
         # model name. Safe when the retry lane is served by the SAME provider/
         # endpoint as agent.model (e.g. taro serves both dflash and the Q6 lane),
         # so no client rebuild is needed.
-        api_kwargs = agent._build_api_kwargs(api_messages)
+        api_kwargs = agent._build_api_kwargs(retry_messages)
         orig_model = api_kwargs.get("model")
         if retry_model == orig_model:
+            record_stall_retry_event(
+                agent,
+                "skipped_same_model",
+                retry_model=retry_model,
+                finish_reason=finish_reason,
+                retry_index=retry_index,
+            )
             return None  # nothing to gain retrying the same model
         api_kwargs = dict(api_kwargs)
         api_kwargs["model"] = retry_model
@@ -184,8 +362,24 @@ def retry_on_stall(agent, api_messages, finish_reason):
         except Exception:
             pass
 
+        record_stall_retry_event(
+            agent,
+            "attempt",
+            retry_model=retry_model,
+            original_model=orig_model,
+            finish_reason=finish_reason,
+            retry_index=retry_index,
+            nudge=get_stall_retry_nudge_enabled(agent),
+            content=stalled_content,
+        )
         response = agent._interruptible_api_call(api_kwargs)
         if response is None:
+            record_stall_retry_event(
+                agent,
+                "api_none",
+                retry_model=retry_model,
+                retry_index=retry_index,
+            )
             return None
         transport = agent._get_transport()
         normalize_kwargs = {}
@@ -193,8 +387,31 @@ def retry_on_stall(agent, api_messages, finish_reason):
             normalize_kwargs["strip_tool_prefix"] = getattr(agent, "_is_anthropic_oauth", False)
         normalized = transport.normalize_response(response, **normalize_kwargs)
         if getattr(normalized, "tool_calls", None):
+            record_stall_retry_event(
+                agent,
+                "recovered",
+                retry_model=retry_model,
+                retry_index=retry_index,
+                tool_call_count=len(getattr(normalized, "tool_calls", []) or []),
+                content=getattr(normalized, "content", "") or "",
+            )
             return normalized
+        record_stall_retry_event(
+            agent,
+            "failed_no_tool_call",
+            retry_model=retry_model,
+            retry_index=retry_index,
+            content=getattr(normalized, "content", "") or "",
+        )
         return None
-    except Exception:
+    except Exception as exc:
+        record_stall_retry_event(
+            agent,
+            "exception",
+            retry_model=retry_model,
+            retry_index=retry_index,
+            error_type=type(exc).__name__,
+            error=str(exc)[:300],
+        )
         # Any error => silently fall back to the original response.
         return None

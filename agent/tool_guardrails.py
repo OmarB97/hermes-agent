@@ -266,7 +266,12 @@ class ToolCallGuardrailController:
                 self._clear_low_information_state(tool_name)
                 return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
             redirected_count = redirect.count + 1
-            action = "halt" if redirected_count >= self.config.low_information_halt_after else "redirect"
+            action = (
+                "halt"
+                if self.config.hard_stop_enabled
+                and redirected_count >= self.config.low_information_halt_after
+                else "redirect"
+            )
             code = (
                 "low_information_tool_halt"
                 if action == "halt"
@@ -534,7 +539,10 @@ def _tool_failure_recovery_hint(tool_name: str, count: int) -> str:
         return common + (
             "For terminal failures, run a small diagnostic such as `pwd && ls -la` "
             "in the same tool, then try an absolute path, a simpler command, a different "
-            "working directory, or a different tool such as read_file/write_file/patch."
+            "working directory, or a different tool such as read_file/write_file/patch. "
+            "If a git commit or PR helper fails, verify the commit/PR state before "
+            "claiming it landed; for MeshBoard CLI Python failures, try the repo's "
+            "known Python such as python3.11 instead of repeating filtered probes."
         )
     return common + (
         "Try different arguments, a narrower query/path, an absolute path when relevant, "

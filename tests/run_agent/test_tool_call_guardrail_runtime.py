@@ -386,6 +386,52 @@ def test_low_information_search_streak_redirects_same_tool_without_halting():
     assert any("low_information_strategy_warning" in content for content in tool_contents)
 
 
+def test_low_information_terminal_redirects_without_controlled_halt_by_default():
+    agent = _make_agent("terminal", max_iterations=10)
+    responses = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(
+                    "terminal",
+                    json.dumps(
+                        {
+                            "command": (
+                                "cd ~/Workspaces/Projects/meshboard && "
+                                f"meshctl task list 2>&1 | grep 'open-{i}' | head -20"
+                            )
+                        }
+                    ),
+                    f"c-terminal-{i}",
+                )
+            ],
+        )
+        for i in range(1, 8)
+    ]
+    responses.append(_mock_response(content="done", finish_reason="stop", tool_calls=None))
+    agent.client.chat.completions.create.side_effect = responses
+
+    with (
+        patch(
+            "run_agent.handle_function_call",
+            return_value=json.dumps({"exit_code": 0, "stdout": "", "stderr": ""}),
+        ) as mock_hfc,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("find a MeshBoard task")
+
+    assert mock_hfc.call_count == 4
+    assert result["turn_exit_reason"].startswith("text_response")
+    assert result["final_response"] == "done"
+    assert "guardrail" not in result
+    tool_contents = [m["content"] for m in result["messages"] if m.get("role") == "tool"]
+    assert any("low_information_tool_redirect" in content for content in tool_contents)
+    assert not any("low_information_tool_halt" in content for content in tool_contents)
+
+
 def test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_halt_without_top_level_error():
     agent = _make_agent("web_search", max_iterations=10, config=_hard_stop_config())
     same_args = {"query": "same"}

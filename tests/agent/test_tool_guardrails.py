@@ -199,6 +199,8 @@ def test_same_tool_varying_args_warns_by_default_without_halting():
     assert "keep using tools" in second.message
     assert "diagnose before retrying" in second.message
     assert "different tool" in second.message
+    assert "verify the commit/PR state" in second.message
+    assert "python3.11" in second.message
     assert controller.halt_decision is None
 
 
@@ -362,6 +364,57 @@ def test_terminal_filter_redirect_allows_broad_diagnostic_to_reset():
         "terminal",
         {"command": 'git diff main --name-only | grep -v "docs" | head -20'},
     ).action == "allow"
+
+
+def test_terminal_filter_redirect_does_not_halt_by_default():
+    controller = ToolCallGuardrailController()
+    empty_success = json.dumps({"exit_code": 0, "stdout": "", "stderr": ""})
+    for i in range(4):
+        controller.after_call(
+            "terminal",
+            {"command": f'git diff main --name-only | grep "path-{i}" | head -20'},
+            empty_success,
+            failed=False,
+        )
+
+    last = None
+    for i in range(10):
+        last = controller.before_call(
+            "terminal",
+            {"command": f'git diff main --name-only | grep "again-{i}" | head -20'},
+        )
+
+    assert last is not None
+    assert last.action == "redirect"
+    assert last.code == "low_information_tool_redirect"
+    assert not last.should_halt
+    assert controller.halt_decision is None
+
+
+def test_terminal_filter_redirect_can_halt_when_hard_stop_is_enabled():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True)
+    )
+    empty_success = json.dumps({"exit_code": 0, "stdout": "", "stderr": ""})
+    for i in range(4):
+        controller.after_call(
+            "terminal",
+            {"command": f'git diff main --name-only | grep "path-{i}" | head -20'},
+            empty_success,
+            failed=False,
+        )
+
+    last = None
+    for i in range(2):
+        last = controller.before_call(
+            "terminal",
+            {"command": f'git diff main --name-only | grep "again-{i}" | head -20'},
+        )
+
+    assert last is not None
+    assert last.action == "halt"
+    assert last.code == "low_information_tool_halt"
+    assert controller.halt_decision == last
 
 
 def test_mutating_or_unknown_tools_are_not_blocked_for_repeated_identical_success_output_by_default():
