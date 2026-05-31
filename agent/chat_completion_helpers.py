@@ -142,6 +142,8 @@ def _dflash_local_stale_timeout(api_payload: Any, model: Any) -> float | None:
         _env_float("HERMES_DFLASH_STREAM_STALE_TIMEOUT", 75.0),
     )
     if timeout <= 0:
+        # Preserve the stale-timeout convention that non-positive env values
+        # explicitly disable the watchdog, even for dflash.
         return float("inf")
 
     est_tokens = estimate_request_context_tokens(api_payload)

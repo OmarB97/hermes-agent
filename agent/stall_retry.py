@@ -37,7 +37,9 @@ from pathlib import Path
 from typing import Any, Mapping
 
 # Action-preamble signature: the turn announced an action but produced no tool
-# call. These end mid-thought, typically with a colon, or open with intent.
+# call. These English phrases match the observed dflash stall corpus; broader
+# language-agnostic fallbacks below still catch trailing-colon and incomplete
+# final fragments without pretending this regex is multilingual.
 _ACTION_RE = re.compile(
     r"(let me\b|let's\b|i'?ll\b|i will\b|i'?m going to\b|i am going to\b|"
     r"now i\b|first,?\s+i\b|next,?\s+i\b|i need to\b|i should\b|"
@@ -45,7 +47,8 @@ _ACTION_RE = re.compile(
     re.IGNORECASE,
 )
 # Genuine completion signature: the model declared it is done / nothing to do.
-# These must NOT be retried (they are correct no-tool-call turns).
+# These English phrases must NOT be retried (they are correct no-tool-call
+# turns); other languages still rely on the neutral structural checks below.
 _COMPLETION_RE = re.compile(
     r"(\bdone\b|\bcomplete(d)?\b|nothing to (do|save|change|report|fix)|"
     r"no changes?\b|no action\b|already (complete|done|finished)|\bfinished\b|"
