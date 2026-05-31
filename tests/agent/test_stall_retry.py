@@ -88,6 +88,15 @@ def test_completion_text_is_not_a_stall() -> None:
     )
 
 
+def test_completion_then_action_promise_is_still_a_stall() -> None:
+    assert looks_like_stall(
+        "Onboarding complete. Now let me read the STATUS.md to find a task I can pick up.",
+        "stop",
+        False,
+        400,
+    )
+
+
 def test_incomplete_final_fragment_without_action_preamble_is_a_stall() -> None:
     assert looks_like_stall(
         (
@@ -306,6 +315,74 @@ def test_retry_on_stall_uses_agent_config_when_env_is_absent(monkeypatch) -> Non
     result = retry_on_stall(agent, [{"role": "user", "content": "go"}], "stop")
 
     assert result is normalized
+    assert captured["kwargs"]["model"] == "qwen3.6-27b-256k"
+    assert captured["kwargs"]["stream"] is False
+
+
+def test_retry_on_stall_uses_configured_retry_provider(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    tool_call = SimpleNamespace(
+        function=SimpleNamespace(name="terminal", arguments='{"cmd":"pwd"}')
+    )
+    normalized = SimpleNamespace(
+        content="",
+        tool_calls=[tool_call],
+        finish_reason="tool_calls",
+    )
+
+    class FakeCompletions:
+        def create(self, **kwargs: object) -> object:
+            captured["kwargs"] = dict(kwargs)
+            return normalized
+
+    fake_client = SimpleNamespace(
+        api_key="retry-key",
+        base_url="http://taro:8080/v1",
+        chat=SimpleNamespace(completions=FakeCompletions()),
+    )
+
+    def fake_resolve_provider_client(**kwargs: object) -> tuple[object, str]:
+        captured["resolve_kwargs"] = dict(kwargs)
+        return fake_client, "qwen3.6-27b-256k"
+
+    agent = SimpleNamespace(
+        api_mode="openai",
+        _is_anthropic_oauth=False,
+        base_url="http://taro:8080/v1",
+        log_prefix="",
+        _stall_retry_config={
+            "model": "qwen3.6-27b-256k",
+            "provider": "taro",
+            "api_key_env": "HERMES_RETRY_TEST_KEY",
+        },
+        _build_api_kwargs=lambda messages: {
+            "model": "dflash",
+            "messages": messages,
+            "stream": True,
+        },
+        _interruptible_api_call=lambda _kwargs: (_ for _ in ()).throw(
+            AssertionError("same-client retry should not be used")
+        ),
+        _get_transport=lambda: SimpleNamespace(
+            normalize_response=lambda response, **_kwargs: response
+        ),
+        _vprint=lambda *_args, **_kwargs: None,
+    )
+
+    monkeypatch.delenv("HERMES_STALL_RETRY_MODEL", raising=False)
+    monkeypatch.setenv("HERMES_RETRY_TEST_KEY", "retry-key")
+    monkeypatch.setenv("HERMES_STALL_RETRY_TELEMETRY", "0")
+    monkeypatch.setattr(
+        "agent.auxiliary_client.resolve_provider_client",
+        lambda provider, **kwargs: fake_resolve_provider_client(provider=provider, **kwargs),
+    )
+
+    result = retry_on_stall(agent, [{"role": "user", "content": "go"}], "stop")
+
+    assert result is normalized
+    assert captured["resolve_kwargs"]["provider"] == "taro"
+    assert captured["resolve_kwargs"]["model"] == "qwen3.6-27b-256k"
+    assert captured["resolve_kwargs"]["explicit_api_key"] == "retry-key"
     assert captured["kwargs"]["model"] == "qwen3.6-27b-256k"
     assert captured["kwargs"]["stream"] is False
 

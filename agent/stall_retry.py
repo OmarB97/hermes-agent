@@ -19,6 +19,8 @@ Entirely opt-in: does nothing unless ``HERMES_STALL_RETRY_MODEL`` is set
 
 Env:
   HERMES_STALL_RETRY_MODEL  retry lane/model name (required to enable)
+  HERMES_STALL_RETRY_PROVIDER  optional provider override for the retry lane
+  HERMES_STALL_RETRY_BASE_URL  optional OpenAI-compatible retry endpoint
   HERMES_STALL_RETRY_MAX_PER_TURN  max retries per user turn (default 5)
   HERMES_STALL_RETRY_MAX_CHARS  max content length to still count as a stall
                                 (default 400; longer open action preambles
@@ -121,6 +123,24 @@ def get_stall_retry_model(agent: Any | None = None) -> str:
     return str(cfg_model or "").strip()
 
 
+def get_stall_retry_provider(agent: Any | None = None) -> str:
+    """Return an optional provider override for the retry lane."""
+    env_provider = os.environ.get("HERMES_STALL_RETRY_PROVIDER", "").strip()
+    if env_provider:
+        return env_provider
+    cfg_provider = _stall_retry_config(agent).get("provider")
+    return str(cfg_provider or "").strip()
+
+
+def get_stall_retry_base_url(agent: Any | None = None) -> str:
+    """Return an optional base URL override for the retry lane."""
+    env_base_url = os.environ.get("HERMES_STALL_RETRY_BASE_URL", "").strip()
+    if env_base_url:
+        return env_base_url
+    cfg_base_url = _stall_retry_config(agent).get("base_url")
+    return str(cfg_base_url or "").strip()
+
+
 def get_stall_retry_max_chars(agent: Any | None = None) -> int:
     env_value = os.environ.get("HERMES_STALL_RETRY_MAX_CHARS")
     if env_value is not None:
@@ -166,6 +186,24 @@ def _has_natural_response_ending(content: str) -> bool:
     if last in _NATURAL_END_CHARS:
         return True
     return ord(last) >= 0x1F300
+
+
+def _action_after_completion(content: str) -> bool:
+    """True when a response says some step is complete, then promises work.
+
+    The dflash phone failure hit this exact shape:
+    "Onboarding complete. Now let me read the STATUS.md ..."
+
+    The earlier completion word is not a final answer when a later clause is
+    still announcing the next tool step.
+    """
+    action_matches = list(_ACTION_RE.finditer(content or ""))
+    if not action_matches:
+        return False
+    completion_matches = list(_COMPLETION_RE.finditer(content or ""))
+    if not completion_matches:
+        return False
+    return action_matches[-1].start() > completion_matches[-1].end()
 
 
 def _ends_with_action_promise(content: str) -> bool:
@@ -301,6 +339,111 @@ def _retry_messages_with_nudge(
     return retry_messages
 
 
+def _load_env_value(name: str) -> str:
+    env_name = str(name or "").strip()
+    if not env_name:
+        return ""
+    value = os.environ.get(env_name, "").strip()
+    if value:
+        return value
+    try:
+        from hermes_cli.env_loader import load_hermes_dotenv
+        from hermes_constants import get_hermes_home
+
+        load_hermes_dotenv(hermes_home=get_hermes_home())
+    except Exception:
+        pass
+    return os.environ.get(env_name, "").strip()
+
+
+def _base_url_keys(value: Any) -> set[str]:
+    raw = str(value or "").strip().lower().rstrip("/")
+    if not raw:
+        return set()
+    keys = {raw}
+    if raw.endswith("/v1"):
+        keys.add(raw[:-3].rstrip("/"))
+    else:
+        keys.add(f"{raw}/v1")
+    return keys
+
+
+def _custom_provider_entry(agent: Any | None, provider: str, base_url: str) -> Mapping[str, Any]:
+    try:
+        from hermes_cli.config import get_compatible_custom_providers, load_config
+
+        entries = get_compatible_custom_providers(load_config())
+    except Exception:
+        entries = getattr(agent, "_custom_providers", []) if agent is not None else []
+    if not isinstance(entries, list):
+        return {}
+
+    provider_name = str(provider or "").strip().lower()
+    target_keys = _base_url_keys(base_url or getattr(agent, "base_url", ""))
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        entry_name = str(entry.get("name") or "").strip().lower()
+        if provider_name and entry_name == provider_name:
+            return entry
+        entry_keys = _base_url_keys(entry.get("base_url"))
+        if target_keys and entry_keys and target_keys.intersection(entry_keys):
+            return entry
+    return {}
+
+
+def _configured_retry_api_key(agent: Any, provider: str, base_url: str) -> str:
+    cfg = _stall_retry_config(agent)
+    explicit = str(cfg.get("api_key") or "").strip()
+    if explicit:
+        return explicit
+    key_env = str(cfg.get("key_env") or cfg.get("api_key_env") or "").strip()
+    if key_env:
+        return _load_env_value(key_env)
+
+    entry = _custom_provider_entry(agent, provider, base_url)
+    explicit = str(entry.get("api_key") or "").strip()
+    if explicit:
+        return explicit
+    key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
+    return _load_env_value(key_env) if key_env else ""
+
+
+def _retry_api_call(agent: Any, api_kwargs: dict[str, Any], retry_model: str) -> Any:
+    """Execute the retry request, optionally through a configured provider.
+
+    The original implementation reused the active client and only changed the
+    model name. That is fine when both models are served anonymously by the
+    same endpoint, but it breaks when the retry lane is a named custom provider
+    whose auth lives in ``key_env``. Resolve that provider explicitly when the
+    retry config names one or supplies endpoint/auth details.
+    """
+    retry_provider = get_stall_retry_provider(agent)
+    retry_base_url = get_stall_retry_base_url(agent)
+    retry_api_key = _configured_retry_api_key(agent, retry_provider, retry_base_url)
+    if not retry_base_url and retry_api_key:
+        retry_base_url = str(getattr(agent, "base_url", "") or "").strip()
+
+    if retry_provider or retry_base_url or retry_api_key:
+        from agent.auxiliary_client import resolve_provider_client
+
+        provider = retry_provider or str(getattr(agent, "provider", "") or "custom")
+        client, resolved_model = resolve_provider_client(
+            provider,
+            model=retry_model,
+            raw_codex=True,
+            explicit_base_url=retry_base_url or None,
+            explicit_api_key=retry_api_key or None,
+        )
+        if client is None:
+            raise RuntimeError(f"Could not resolve stall retry provider {provider!r}")
+        retry_kwargs = dict(api_kwargs)
+        retry_kwargs["model"] = resolved_model or retry_model
+        return client.chat.completions.create(**retry_kwargs)
+
+    return agent._interruptible_api_call(api_kwargs)
+
+
 def looks_like_stall(content: str, finish_reason: str, has_tool_calls: bool,
                      max_chars: int) -> bool:
     """True when a no-tool-call turn looks like a premature agentic stall
@@ -316,6 +459,8 @@ def looks_like_stall(content: str, finish_reason: str, has_tool_calls: bool,
         # Truly empty responses have their own recovery path in the
         # conversation loop. Do not let stall retry preempt that machinery.
         return False
+    if _action_after_completion(c):
+        return True
     if _COMPLETION_RE.search(c):
         return False  # model said it's done => respect it
     if _ends_with_action_promise(c):
@@ -410,7 +555,7 @@ def retry_on_stall(
             nudge=get_stall_retry_nudge_enabled(agent),
             content=stalled_content,
         )
-        response = agent._interruptible_api_call(api_kwargs)
+        response = _retry_api_call(agent, api_kwargs, retry_model)
         if response is None:
             record_stall_retry_event(
                 agent,
