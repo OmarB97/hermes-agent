@@ -397,7 +397,7 @@ export function StatusRule({
       : status || 'ready'
 
     const firstLine = fitCompactText(
-      ['-', primaryStatus, compactModelLabel(model, modelReasoningEffort, modelFast), compactCtxLabel]
+      [`- ${primaryStatus}`, compactModelLabel(model, modelReasoningEffort, modelFast), compactCtxLabel]
         .filter(Boolean)
         .join(' | '),
       width

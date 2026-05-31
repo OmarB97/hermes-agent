@@ -712,6 +712,40 @@ def test_get_usage_uses_rough_context_when_provider_usage_is_missing():
     assert usage["context_estimated"] is True
 
 
+def test_get_usage_estimates_initial_context_from_system_and_tools(monkeypatch):
+    from agent import model_metadata
+
+    captured = {}
+
+    def fake_estimate(messages, system_prompt="", tools=None):
+        captured["messages"] = messages
+        captured["system_prompt"] = system_prompt
+        captured["tools"] = tools
+        return 12000
+
+    monkeypatch.setattr(model_metadata, "estimate_request_tokens_rough", fake_estimate)
+
+    tools = [{"function": {"name": "read_file", "parameters": {}}}]
+    agent = types.SimpleNamespace(
+        _cached_system_prompt="system",
+        context_compressor=types.SimpleNamespace(
+            compression_count=0,
+            context_length=262000,
+            last_prompt_tokens=0,
+        ),
+        model="dflash",
+        tools=tools,
+    )
+
+    usage = server._get_usage(agent)
+
+    assert captured == {"messages": [], "system_prompt": "system", "tools": tools}
+    assert usage["context_used"] == 12000
+    assert usage["context_percent"] == 5
+    assert usage["context_estimated"] is True
+    assert agent._last_usage_context_estimate == 12000
+
+
 def test_resolve_model_uses_inference_model_env(monkeypatch):
     monkeypatch.delenv("HERMES_MODEL", raising=False)
     monkeypatch.setenv("HERMES_INFERENCE_MODEL", " anthropic/claude-sonnet-4.6\n")

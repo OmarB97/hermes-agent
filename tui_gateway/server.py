@@ -401,6 +401,40 @@ def _usage_for_sid(sid: str) -> dict | None:
         return None
 
 
+def _rough_context_estimate(agent) -> int:
+    for attr in ("_last_request_context_tokens", "_last_request_tokens_estimate"):
+        try:
+            value = int(getattr(agent, attr, 0) or 0)
+        except Exception:
+            value = 0
+        if value > 0:
+            return value
+
+    try:
+        cached = int(getattr(agent, "_last_usage_context_estimate", 0) or 0)
+    except Exception:
+        cached = 0
+    if cached > 0:
+        return cached
+
+    try:
+        from agent.model_metadata import estimate_request_tokens_rough
+
+        estimate = estimate_request_tokens_rough(
+            [],
+            system_prompt=getattr(agent, "_cached_system_prompt", "") or "",
+            tools=getattr(agent, "tools", None) or None,
+        )
+    except Exception:
+        estimate = 0
+    if estimate > 0:
+        try:
+            agent._last_usage_context_estimate = estimate
+        except Exception:
+            pass
+    return estimate
+
+
 def _status_update(sid: str, kind: str, text: str | None = None):
     body = (text if text is not None else kind).strip()
     if not body:
@@ -1342,11 +1376,7 @@ def _sync_session_key_after_compress(
 
 def _get_usage(agent) -> dict:
     g = lambda k, fb=None: getattr(agent, k, 0) or (getattr(agent, fb, 0) if fb else 0)
-    rough_context = int(
-        getattr(agent, "_last_request_context_tokens", 0)
-        or getattr(agent, "_last_request_tokens_estimate", 0)
-        or 0
-    )
+    rough_context = _rough_context_estimate(agent)
     usage = {
         "model": getattr(agent, "model", "") or "",
         "input": g("session_input_tokens", "session_prompt_tokens"),
