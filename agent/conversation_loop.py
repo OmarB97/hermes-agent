@@ -3644,6 +3644,7 @@ def run_conversation(
                 EMPTY_AFTER_TOOL_RETRY_NUDGE,
                 get_stall_retry_max_chars,
                 get_stall_retry_model,
+                has_recent_tool_result,
                 looks_like_incomplete_final_fragment,
                 looks_like_stall,
                 record_stall_retry_event,
@@ -3664,10 +3665,7 @@ def run_conversation(
                 and not agent._strip_think_blocks(
                     assistant_message.content or ""
                 ).strip()
-                and any(
-                    isinstance(m, dict) and m.get("role") == "tool"
-                    for m in messages[-5:]
-                )
+                and has_recent_tool_result(messages)
             )
             if (
                 retry_model
