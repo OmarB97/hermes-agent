@@ -104,6 +104,39 @@ def test_persist_session_strips_marked_terminal_empty_sentinel():
     assert all(not msg.get("_empty_terminal_sentinel") for msg in messages)
 
 
+def test_persist_session_strips_trailing_malformed_final_recovery_scaffolding():
+    agent = _agent_with_stubbed_persistence()
+    messages = [
+        {"role": "user", "content": "run the task"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call_1", "type": "function",
+                            "function": {"name": "x", "arguments": "{}"}}],
+        },
+        {"role": "tool", "content": "{}", "tool_call_id": "call_1"},
+        {
+            "role": "assistant",
+            "content": "[malformed final response omitted]",
+            "_malformed_final_recovery_synthetic": True,
+        },
+        {
+            "role": "user",
+            "content": "The previous final response was malformed.",
+            "_malformed_final_recovery_synthetic": True,
+        },
+    ]
+
+    AIAgent._persist_session(agent, messages, conversation_history=[])
+
+    assert messages == [{"role": "user", "content": "run the task"}]
+    assert agent.flushed_session_db_messages[-1] == messages
+    assert all(
+        not msg.get("_malformed_final_recovery_synthetic")
+        for msg in messages
+    )
+
+
 def test_persist_session_rewrites_db_when_empty_cleanup_rewinds_flushed_tail():
     agent = _agent_with_stubbed_persistence()
     agent._session_db = _RewriteTrackingDB()
