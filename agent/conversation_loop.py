@@ -3644,6 +3644,7 @@ def run_conversation(
                 EMPTY_AFTER_TOOL_RETRY_NUDGE,
                 get_stall_retry_max_chars,
                 get_stall_retry_model,
+                looks_like_incomplete_final_fragment,
                 looks_like_stall,
                 record_stall_retry_event,
                 retry_on_stall,
@@ -3740,6 +3741,12 @@ def run_conversation(
                 max_chars = get_stall_retry_max_chars(agent)
                 try:
                     stalled_content = assistant_message.content or ""
+                    _retry_accepts_content = looks_like_incomplete_final_fragment(
+                        stalled_content,
+                        finish_reason,
+                        False,
+                        max_chars,
+                    )
                     if looks_like_stall(
                         stalled_content,
                         finish_reason,
@@ -3800,11 +3807,18 @@ def run_conversation(
                             finish_reason,
                             stalled_content=stalled_content,
                             retry_index=_stall_retry_count,
+                            accept_content=_retry_accepts_content,
                         )
-                        if retried is not None and getattr(retried, "tool_calls", None):
+                        if retried is not None and (
+                            getattr(retried, "tool_calls", None) or _retry_accepts_content
+                        ):
                             assistant_message = retried
-                            finish_reason = getattr(retried, "finish_reason", None) or "tool_calls"
-                            if finish_reason != "tool_calls":
+                            finish_reason = getattr(retried, "finish_reason", None) or (
+                                "tool_calls"
+                                if getattr(retried, "tool_calls", None)
+                                else "stop"
+                            )
+                            if getattr(retried, "tool_calls", None) and finish_reason != "tool_calls":
                                 finish_reason = "tool_calls"
                         else:
                             _turn_exit_reason = "stall_retry_failed_no_tool_call"
