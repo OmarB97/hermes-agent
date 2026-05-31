@@ -6,6 +6,7 @@ from agent.tool_guardrails import (
     ToolCallGuardrailConfig,
     ToolCallGuardrailController,
     ToolCallSignature,
+    _terminal_probe_family,
     canonical_tool_args,
     classify_tool_failure,
 )
@@ -489,6 +490,41 @@ def test_terminal_filter_redirect_allows_broad_diagnostic_to_reset():
         "terminal",
         {"command": 'git diff main --name-only | grep -v "docs" | head -20'},
     ).action == "allow"
+
+
+def test_terminal_probe_family_detects_find_xargs_grep_but_not_xargs_mutation():
+    assert _terminal_probe_family(
+        {"command": 'find tools -type f -name "*.py" | xargs grep -n "dispatch"'}
+    ) == "filter_probe"
+    assert _terminal_probe_family(
+        {"command": 'find tools -type f -print0 | xargs -0 rg -n "dispatch"'}
+    ) == "filter_probe"
+    assert _terminal_probe_family(
+        {"command": 'find tools -type f -name "*.tmp" | xargs rm'}
+    ) is None
+
+
+def test_terminal_filtered_empty_probe_streak_includes_find_xargs_grep_chains():
+    controller = ToolCallGuardrailController()
+    empty_success = json.dumps({"exit_code": 0, "stdout": "", "stderr": ""})
+    commands = [
+        'find tools -type f -name "*.py" | xargs grep -n "dispatch"',
+        'find tools -type f -name "*.py" | xargs grep -n "dispatch_history"',
+        'find tools -type f -print0 | xargs -0 grep -n "route history"',
+        'find tools -type f -print0 | xargs -0 rg -n "dispatch history"',
+    ]
+
+    for command in commands:
+        assert controller.before_call("terminal", {"command": command}).action == "allow"
+        controller.after_call("terminal", {"command": command}, empty_success, failed=False)
+
+    redirected = controller.before_call(
+        "terminal",
+        {"command": 'find tools -type f -name "*.py" | xargs grep -n "again"'},
+    )
+
+    assert redirected.action == "redirect"
+    assert redirected.code == "low_information_tool_redirect"
 
 
 def test_terminal_filter_redirect_does_not_halt_by_default():

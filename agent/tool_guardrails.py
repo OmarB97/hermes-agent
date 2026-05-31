@@ -952,7 +952,7 @@ def _terminal_probe_family(args: Mapping[str, Any]) -> str | None:
     if not isinstance(command, str):
         return None
     command = _normalize_terminal_command(command)
-    if not command or _has_mutating_shell_signal(command):
+    if not command or _has_risky_shell_signal(command):
         return None
     if _is_filtered_terminal_probe(command):
         return "filter_probe"
@@ -971,15 +971,29 @@ def _normalize_terminal_command(command: str) -> str:
     return command.strip()
 
 
-def _has_mutating_shell_signal(command: str) -> bool:
+def _has_risky_shell_signal(command: str) -> bool:
+    """Return True for commands too side-effect-prone to classify as probes.
+
+    Interpreter and package-manager commands are intentionally treated as risky:
+    a simple ``python -c "print(1)"`` may be observational, but arbitrary code
+    execution is not safe enough for this read-only low-information classifier.
+    """
     lowered = command.lower()
-    mutating_command_re = (
+    risky_command_re = (
         r"(^|[;&|]\s*)"
         r"(rm|mv|cp|mkdir|touch|chmod|chown|"
         r"git\s+(add|commit|push|checkout|switch|reset|clean|worktree\s+add)|"
         r"python\d?|python3|node|npm|pnpm|yarn|uv|pip|sed\s+-i|perl\s+-i)\b"
     )
-    if re.search(mutating_command_re, lowered):
+    if re.search(risky_command_re, lowered):
+        return True
+    if re.search(
+        r"\bxargs(?:\s+-[^\s]+)*\s+"
+        r"(rm|mv|cp|mkdir|touch|chmod|chown|"
+        r"git\s+(add|commit|push|checkout|switch|reset|clean|worktree\s+add)|"
+        r"python\d?|python3|node|npm|pnpm|yarn|uv|pip|sed\s+-i|perl\s+-i)\b",
+        lowered,
+    ):
         return True
     if re.search(r"(^|[^0-9])>>?", command) and "/dev/null" not in command:
         return True
@@ -991,6 +1005,8 @@ def _has_mutating_shell_signal(command: str) -> bool:
 def _is_filtered_terminal_probe(command: str) -> bool:
     lowered = command.lower()
     if re.search(r"\|\s*(grep|head|tail|wc|sort|uniq)\b", lowered):
+        return True
+    if re.search(r"\|\s*xargs(?:\s+-[^\s]+)*\s+(grep|rg)\b", lowered):
         return True
     if re.search(r"\bgrep\s+-r\b|\brg\s+.*\|\s*head\b", lowered):
         return True
