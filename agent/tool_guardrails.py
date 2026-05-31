@@ -303,6 +303,25 @@ class ToolCallGuardrailController:
             same_count = self._same_tool_failure_counts.get(tool_name, 0) + 1
             self._same_tool_failure_counts[tool_name] = same_count
 
+            tool_block = _tool_reported_loop_block(tool_name, result)
+            if tool_block:
+                decision = ToolGuardrailDecision(
+                    action="halt",
+                    code="tool_reported_loop_block",
+                    message=(
+                        f"Stopped {tool_name}: the tool reported a repeated-call "
+                        f"loop block after {tool_block['count']} attempts. "
+                        "Use the information already returned, narrow the query, "
+                        "or switch to a different tool path instead of retrying "
+                        "the same call."
+                    ),
+                    tool_name=tool_name,
+                    count=tool_block["count"],
+                    signature=signature,
+                )
+                self._halt_decision = decision
+                return decision
+
             if self.config.hard_stop_enabled and same_count >= self.config.same_tool_failure_halt_after:
                 decision = ToolGuardrailDecision(
                     action="halt",
@@ -443,6 +462,37 @@ def _result_hash(result: str | None) -> str:
     else:
         canonical = result or ""
     return _sha256(canonical)
+
+
+def _tool_reported_loop_block(tool_name: str, result: str | None) -> dict[str, int] | None:
+    """Return metadata when a tool already enforced a repeated-call block.
+
+    File/search tools emit explicit ``BLOCKED:`` JSON errors after a model
+    repeats the exact same read/search enough times. Those are stronger than
+    ordinary tool failures: the tool has already proven the next identical call
+    cannot make progress, so the agent loop should halt even when the broader
+    guardrail hard-stop mode is left at its conservative default.
+    """
+    parsed = safe_json_loads(result or "")
+    if not isinstance(parsed, dict):
+        return None
+
+    error = parsed.get("error")
+    if not isinstance(error, str) or not error.startswith("BLOCKED:"):
+        return None
+
+    count = parsed.get("already_searched", parsed.get("already_read"))
+    if not isinstance(count, int) or count < 1:
+        return None
+
+    if (
+        tool_name in {"search_files", "read_file", "mcp_filesystem_read_file"}
+        or "exact search" in error
+        or "exact file region" in error
+        or "exact region" in error
+    ):
+        return {"count": count}
+    return None
 
 
 def _as_bool(value: Any, default: bool) -> bool:
