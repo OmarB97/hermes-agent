@@ -35,6 +35,21 @@ def test_followup_action_preamble_after_successful_retry_is_a_stall() -> None:
     )
 
 
+def test_mixed_explanation_action_preamble_over_default_limit_is_a_stall() -> None:
+    content = (
+        "Now I have a clear picture. The task is to add a pre-dispatch "
+        "executable-state gate in subagent_dispatch_register_command that "
+        "checks if the linked task is in an executable state BEFORE registering "
+        "a dispatch. Currently the stale guard only runs post-dispatch during "
+        "drain and settlement. The goal is to prevent non-executable dispatches "
+        "from being registered in the first place. Let me look at the register "
+        "command's validation section and the _validate_subagent_dispatch_record "
+        "function:"
+    )
+    assert len(content) > 400
+    assert looks_like_stall(content, "stop", False, 400)
+
+
 def test_completion_text_is_not_a_stall() -> None:
     assert not looks_like_stall(
         "Done. The task is complete and no further action is needed.",

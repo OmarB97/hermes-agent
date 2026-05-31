@@ -805,6 +805,8 @@ def run_conversation(
     _stall_retry_count = 0
     _stall_retry_max_per_turn = get_stall_retry_max_per_turn(agent)
     agent._stall_retry_events = []
+    _tool_guardrail_continue_count = 0
+    _tool_guardrail_continue_max = 2
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         # Reset per-turn checkpoint dedup so each iteration can take one snapshot
@@ -4005,6 +4007,24 @@ def run_conversation(
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
+                    if (
+                        decision.code == "tool_reported_loop_block"
+                        and _tool_guardrail_continue_count < _tool_guardrail_continue_max
+                    ):
+                        _tool_guardrail_continue_count += 1
+                        agent._tool_guardrail_halt_decision = None
+                        recovery_prompt = agent._toolguard_recovery_prompt(decision)
+                        agent._emit_status(
+                            f"Tool guardrail redirected {decision.tool_name}; continuing with a new strategy"
+                        )
+                        messages.append({
+                            "role": "user",
+                            "content": recovery_prompt,
+                            "_tool_guardrail_recovery": True,
+                        })
+                        agent._stream_needs_break = True
+                        continue
+
                     _turn_exit_reason = "guardrail_halt"
                     final_response = agent._toolguard_controlled_halt_response(decision)
                     agent._emit_status(

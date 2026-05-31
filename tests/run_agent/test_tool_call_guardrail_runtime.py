@@ -374,7 +374,7 @@ def test_default_run_conversation_warns_without_guardrail_halt():
     assert any("repeated_exact_failure_warning" in content for content in tool_contents)
 
 
-def test_tool_reported_loop_block_run_conversation_halts_with_default_config():
+def test_tool_reported_loop_block_run_conversation_auto_continues_with_default_config():
     agent = _make_agent("search_files", max_iterations=10)
     args = {"pattern": "def.*drain", "path": "/repo", "target": "content"}
     blocked_result = json.dumps(
@@ -386,11 +386,14 @@ def test_tool_reported_loop_block_run_conversation_halts_with_default_config():
             "already_searched": 4,
         }
     )
-    agent.client.chat.completions.create.return_value = _mock_response(
-        content="",
-        finish_reason="tool_calls",
-        tool_calls=[_mock_tool_call("search_files", json.dumps(args), "c-search")],
-    )
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("search_files", json.dumps(args), "c-search")],
+        ),
+        _mock_response(content="done", finish_reason="stop", tool_calls=None),
+    ]
 
     with (
         patch("run_agent.handle_function_call", return_value=blocked_result) as mock_hfc,
@@ -401,12 +404,18 @@ def test_tool_reported_loop_block_run_conversation_halts_with_default_config():
         result = agent.run_conversation("find the drain implementation")
 
     mock_hfc.assert_called_once()
-    assert result["turn_exit_reason"] == "guardrail_halt"
-    assert result["api_calls"] == 1
-    assert "stopped retrying search_files" in result["final_response"].lower()
-    assert result["guardrail"]["code"] == "tool_reported_loop_block"
+    assert result["turn_exit_reason"] == "text_response(finish_reason=stop)"
+    assert result["api_calls"] == 2
+    assert result["final_response"] == "done"
+    assert "guardrail" not in result
     tool_contents = [m["content"] for m in result["messages"] if m.get("role") == "tool"]
     assert any("Tool loop hard stop" in content for content in tool_contents)
+    recovery_prompts = [
+        m for m in result["messages"]
+        if m.get("role") == "user" and m.get("_tool_guardrail_recovery")
+    ]
+    assert len(recovery_prompts) == 1
+    assert "without asking the user to type continue" in recovery_prompts[0]["content"]
 
 
 def test_low_information_search_streak_redirects_same_tool_without_halting():

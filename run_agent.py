@@ -4447,6 +4447,17 @@ class AIAgent:
             "to change strategy instead of repeating the same call."
         )
 
+    def _toolguard_recovery_prompt(self, decision: ToolGuardrailDecision) -> str:
+        tool = decision.tool_name or "the tool"
+        return (
+            f"The previous {tool} call was blocked by the tool-loop guardrail "
+            f"({decision.code}) after {decision.count} repeated non-progressing "
+            "attempts. Use the information already returned, switch to a different "
+            "tool/query/file region, make the edit, or state the blocker with "
+            "evidence. Continue the same user request now without asking the user "
+            "to type continue."
+        )
+
     def _append_guardrail_observation(
         self,
         tool_name: str,

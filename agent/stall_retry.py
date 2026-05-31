@@ -21,7 +21,8 @@ Env:
   HERMES_STALL_RETRY_MODEL  retry lane/model name (required to enable)
   HERMES_STALL_RETRY_MAX_PER_TURN  max retries per user turn (default 5)
   HERMES_STALL_RETRY_MAX_CHARS  max content length to still count as a stall
-                                (default 400; real final answers are longer)
+                                (default 400; longer open action preambles
+                                ending in ":" get a bounded exception)
   HERMES_STALL_RETRY_NUDGE  true/false; add a retry-only continuation nudge
                             (default true)
   HERMES_STALL_RETRY_TELEMETRY  true/false; append local NDJSON telemetry
@@ -288,11 +289,18 @@ def looks_like_stall(content: str, finish_reason: str, has_tool_calls: bool,
         # Truly empty responses have their own recovery path in the
         # conversation loop. Do not let stall retry preempt that machinery.
         return False
-    if len(c) > max_chars:
-        return False  # long => almost certainly a real answer
     if _COMPLETION_RE.search(c):
         return False  # model said it's done => respect it
-    if _ACTION_RE.search(c):
+    has_action_preamble = bool(_ACTION_RE.search(c))
+    long_but_open_action = (
+        len(c) > max_chars
+        and len(c) <= max(max_chars * 2, 800)
+        and has_action_preamble
+        and c.endswith(":")
+    )
+    if len(c) > max_chars and not long_but_open_action:
+        return False  # long => almost certainly a real answer
+    if has_action_preamble:
         return True   # announced an action, no tool call => stall
     # Short prose that doesn't declare completion and isn't an obvious answer:
     # a trailing colon strongly implies "about to do something".
