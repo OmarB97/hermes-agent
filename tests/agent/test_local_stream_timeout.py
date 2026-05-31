@@ -80,16 +80,17 @@ class TestLocalDflashStaleTimeout:
     def _make_agent(self, *, model="dflash", base_url="http://10.10.20.211:8080/v1"):
         from run_agent import AIAgent
 
-        return AIAgent(
-            api_key="sk-dummy",
-            base_url=base_url,
-            provider="taro",
-            model=model,
-            quiet_mode=True,
-            skip_context_files=True,
-            skip_memory=True,
-            platform="cli",
-        )
+        with patch("agent.context_compressor.get_model_context_length", return_value=131072):
+            return AIAgent(
+                api_key="sk-dummy",
+                base_url=base_url,
+                provider="taro",
+                model=model,
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                platform="cli",
+            )
 
     def test_default_local_dflash_stream_stale_timeout_is_bounded(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))

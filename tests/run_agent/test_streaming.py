@@ -695,15 +695,16 @@ class TestStreamingFallback:
         mock_client.chat.completions.create.return_value = BlockingStream()
         mock_create.return_value = mock_client
 
-        agent = AIAgent(
-            api_key="test-key",
-            base_url="http://10.10.20.211:8080/v1",
-            provider="taro",
-            model="dflash",
-            quiet_mode=True,
-            skip_context_files=True,
-            skip_memory=True,
-        )
+        with patch("agent.context_compressor.get_model_context_length", return_value=131072):
+            agent = AIAgent(
+                api_key="test-key",
+                base_url="http://10.10.20.211:8080/v1",
+                provider="taro",
+                model="dflash",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
         agent.api_mode = "chat_completions"
         agent._interrupt_requested = False
         agent._abort_request_openai_client = lambda client, reason: aborted.set()
