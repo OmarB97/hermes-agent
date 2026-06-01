@@ -48,6 +48,7 @@ from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
     get_context_length_from_provider_error,
+    is_local_endpoint,
     parse_available_output_tokens_from_error,
     save_context_length,
 )
@@ -62,6 +63,136 @@ from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
+
+
+_DEFAULT_LOCAL_PREFILL_COMPACT_TOKENS = 80_000
+
+
+def _as_nonnegative_int(value: Any, default: int = 0) -> int:
+    try:
+        if isinstance(value, bool):
+            raise ValueError
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0, parsed)
+
+
+def _local_prefill_compact_tokens(agent: Any) -> int:
+    """Return the local-model prompt size where latency compaction starts.
+
+    The normal compression threshold protects the model context window.  Local
+    dflash has another failure mode: huge-but-valid prompts can spend minutes in
+    prefill or hit the no-first-chunk watchdog, and falling back then repeats
+    that full prefill on another local model.  This lower guard is deliberately
+    separate and can be disabled with ``0``.
+    """
+
+    env_value = os.getenv("HERMES_LOCAL_PREFILL_COMPACT_TOKENS")
+    if env_value is not None:
+        return _as_nonnegative_int(env_value, _DEFAULT_LOCAL_PREFILL_COMPACT_TOKENS)
+    return _as_nonnegative_int(
+        getattr(agent, "_local_prefill_compact_tokens", None),
+        _DEFAULT_LOCAL_PREFILL_COMPACT_TOKENS,
+    )
+
+
+def _local_prefill_model_matches(agent: Any) -> bool:
+    patterns = getattr(agent, "_local_prefill_compact_models", None)
+    if patterns is None:
+        patterns = ("dflash",)
+    elif isinstance(patterns, str):
+        patterns = [p.strip() for p in patterns.split(",")]
+
+    text = " ".join(
+        str(v or "").lower()
+        for v in (
+            getattr(agent, "model", ""),
+            getattr(agent, "provider", ""),
+            getattr(agent, "base_url", ""),
+        )
+    )
+    for pattern in patterns:
+        p = str(pattern or "").strip().lower()
+        if not p:
+            continue
+        if p in {"*", "all", "local"}:
+            return True
+        if p in text:
+            return True
+    return False
+
+
+def _should_compact_for_local_prefill_latency(agent: Any, request_tokens: int) -> bool:
+    guard_tokens = _local_prefill_compact_tokens(agent)
+    if guard_tokens <= 0 or request_tokens < guard_tokens:
+        return False
+    if not getattr(agent, "base_url", "") or not is_local_endpoint(agent.base_url):
+        return False
+    if not _local_prefill_model_matches(agent):
+        return False
+
+    compressor = getattr(agent, "context_compressor", None)
+    if getattr(compressor, "_ineffective_compression_count", 0) >= 2:
+        return False
+    return True
+
+
+def _usage_extra_value(usage: Any, key: str) -> Any:
+    if isinstance(usage, dict):
+        return usage.get(key)
+    value = getattr(usage, key, None)
+    if value is not None:
+        return value
+    for extra_name in ("model_extra", "extra", "__pydantic_extra__"):
+        extra = getattr(usage, extra_name, None)
+        if isinstance(extra, dict) and key in extra:
+            return extra.get(key)
+    return None
+
+
+def _extract_usage_cache_info(usage: Any) -> dict[str, Any] | None:
+    cache = _usage_extra_value(usage, "cache")
+    if cache is None:
+        return None
+    if not isinstance(cache, dict):
+        data = getattr(cache, "model_dump", lambda: None)()
+        if isinstance(data, dict):
+            cache = data
+        elif hasattr(cache, "__dict__"):
+            cache = dict(cache.__dict__)
+        else:
+            return None
+
+    out: dict[str, Any] = {}
+    for key in (
+        "restore",
+        "slot",
+        "prefix_tokens",
+        "prompt_tokens",
+        "effective_prompt_tokens",
+        "prefix_reuse_ratio",
+        "disk_hit",
+        "pflash_compressed",
+    ):
+        if key in cache:
+            out[key] = cache[key]
+    return out or None
+
+
+def _preflight_compression_reason(agent: Any, compressor: Any, request_tokens: int) -> tuple[str, int] | None:
+    if compressor.should_compress(request_tokens):
+        return "context_threshold", getattr(compressor, "threshold_tokens", 0) or 0
+
+    # If the normal threshold was reached but ``should_compress`` vetoed it
+    # (anti-thrash), do not bypass that veto with the latency guard.
+    threshold = getattr(compressor, "threshold_tokens", 0) or 0
+    if threshold and request_tokens >= threshold:
+        return None
+
+    if _should_compact_for_local_prefill_latency(agent, request_tokens):
+        return "local_prefill_latency", _local_prefill_compact_tokens(agent)
+    return None
 
 
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
@@ -620,6 +751,7 @@ def run_conversation(
             lambda _tokens: False,
         )
         _preflight_deferred = _defer_preflight(_preflight_tokens)
+        _preflight_reason = None
 
         if not _preflight_deferred:
             # Keep the CLI/ACP context display in sync with what preflight
@@ -646,19 +778,40 @@ def run_conversation(
                 f"{_compressor.threshold_tokens:,}",
                 f"{_compressor.last_real_prompt_tokens:,}",
             )
-        elif _compressor.should_compress(_preflight_tokens):
-            logger.info(
-                "Preflight compression: ~%s tokens >= %s threshold (model %s, ctx %s)",
-                f"{_preflight_tokens:,}",
-                f"{_compressor.threshold_tokens:,}",
-                agent.model,
-                f"{_compressor.context_length:,}",
+        else:
+            _preflight_reason = _preflight_compression_reason(
+                agent, _compressor, _preflight_tokens
             )
-            agent._emit_status(
-                f"📦 Preflight compression: ~{_preflight_tokens:,} tokens "
-                f">= {_compressor.threshold_tokens:,} threshold. "
-                "This may take a moment."
-            )
+        if not _preflight_deferred and _preflight_reason:
+            _reason, _limit = _preflight_reason
+            if _reason == "local_prefill_latency":
+                logger.info(
+                    "Local-prefill compression: ~%s tokens >= %s guard "
+                    "(model %s, ctx %s, base_url=%s)",
+                    f"{_preflight_tokens:,}",
+                    f"{_limit:,}",
+                    agent.model,
+                    f"{_compressor.context_length:,}",
+                    getattr(agent, "base_url", "") or "none",
+                )
+                agent._emit_status(
+                    f"📦 Local dflash prefill guard: ~{_preflight_tokens:,} "
+                    f"tokens >= {_limit:,}. Compacting before the local model "
+                    "spends another long turn in prefill."
+                )
+            else:
+                logger.info(
+                    "Preflight compression: ~%s tokens >= %s threshold (model %s, ctx %s)",
+                    f"{_preflight_tokens:,}",
+                    f"{_limit:,}",
+                    agent.model,
+                    f"{_compressor.context_length:,}",
+                )
+                agent._emit_status(
+                    f"📦 Preflight compression: ~{_preflight_tokens:,} tokens "
+                    f">= {_limit:,} threshold. "
+                    "This may take a moment."
+                )
             # May need multiple passes for very large sessions with small
             # context windows (each pass summarises the middle N turns).
             for _pass in range(3):
@@ -692,7 +845,10 @@ def run_conversation(
                     system_prompt=active_system_prompt or "",
                     tools=agent.tools or None,
                 )
-                if not _compressor.should_compress(_preflight_tokens):
+                _preflight_reason = _preflight_compression_reason(
+                    agent, _compressor, _preflight_tokens
+                )
+                if not _preflight_reason:
                     break  # Under threshold or anti-thrash guard stopped it
 
     # Plugin hook: pre_llm_call
@@ -1861,6 +2017,19 @@ def run_conversation(
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
                     agent.context_compressor.update_from_response(usage_dict)
+                    cache_info = _extract_usage_cache_info(response.usage)
+                    if cache_info:
+                        agent._last_local_cache_usage = cache_info
+                        if is_local_endpoint(getattr(agent, "base_url", "")):
+                            logger.info(
+                                "Local cache usage: restore=%s prefix=%s/%s slot=%s disk=%s pflash=%s",
+                                cache_info.get("restore"),
+                                cache_info.get("prefix_tokens"),
+                                cache_info.get("effective_prompt_tokens"),
+                                cache_info.get("slot"),
+                                cache_info.get("disk_hit"),
+                                cache_info.get("pflash_compressed"),
+                            )
 
                     # Cache discovered context length after successful call.
                     # Only persist limits confirmed by the provider (parsed
@@ -3065,6 +3234,50 @@ def run_conversation(
                             "compression_exhausted": True,
                         }
 
+                # ── Local dflash no-first-chunk recovery ───────────────
+                # A first-chunk timeout on a huge local prompt is usually a
+                # prefill/slot problem, not proof that the next local fallback
+                # model will be cheaper.  Compact once before falling through
+                # to fallback so we do not pay a second full long-context
+                # prefill on taro's single large-model slot.
+                if classified.reason == FailoverReason.local_first_chunk_timeout:
+                    _first_chunk_meta = classified.error_context or {}
+                    _ctx_tokens = _as_nonnegative_int(
+                        _first_chunk_meta.get("context_tokens"),
+                        approx_request_tokens or approx_tokens or 0,
+                    )
+                    if (
+                        agent.compression_enabled
+                        and _should_compact_for_local_prefill_latency(agent, _ctx_tokens)
+                        and compression_attempts < max_compression_attempts
+                    ):
+                        compression_attempts += 1
+                        original_len = len(messages)
+                        agent._buffer_status(
+                            f"🗜️ Local dflash produced no first chunk at "
+                            f"~{_ctx_tokens:,} tokens — compacting before "
+                            f"fallback ({compression_attempts}/{max_compression_attempts})."
+                        )
+                        messages, active_system_prompt = agent._compress_context(
+                            messages,
+                            system_message,
+                            approx_tokens=_ctx_tokens,
+                            task_id=effective_task_id,
+                        )
+                        conversation_history = None
+                        if len(messages) < original_len:
+                            agent._buffer_status(
+                                f"🗜️ Compressed {original_len} → {len(messages)} "
+                                "messages, retrying local dflash before fallback."
+                            )
+                            time.sleep(2)
+                            restart_with_compressed_messages = True
+                            break
+                        agent._buffer_status(
+                            "⚠️ Local dflash compaction made no progress; "
+                            "falling through to fallback."
+                        )
+
                 # Check for non-retryable client errors.  The classifier
                 # already accounts for 413, 429, 529 (transient), context
                 # overflow, and generic-400 heuristics.  Local validation
@@ -3144,7 +3357,19 @@ def run_conversation(
                     # session looks like it's recovering when it's about to
                     # abort silently (#35314, #17446).
                     if agent._has_pending_fallback():
-                        if classified.reason == FailoverReason.content_policy_blocked:
+                        if classified.reason == FailoverReason.local_first_chunk_timeout:
+                            meta = classified.error_context or {}
+                            waited = meta.get("elapsed")
+                            waited_text = (
+                                f" after {int(waited)}s"
+                                if isinstance(waited, (int, float)) and waited > 0
+                                else ""
+                            )
+                            agent._buffer_status(
+                                "⚠️ Local dflash produced no first chunk"
+                                f"{waited_text} — trying fallback..."
+                            )
+                        elif classified.reason == FailoverReason.content_policy_blocked:
                             agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
