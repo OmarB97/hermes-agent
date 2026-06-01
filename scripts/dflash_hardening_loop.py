@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -33,6 +34,7 @@ from dflash_stability_canary import (
 
 
 TASK_ID_RE = re.compile(r"[^a-z0-9-]+")
+DEFAULT_MESHBOARD_PROJECT = "hermes-agent"
 
 
 def slug(value: object) -> str:
@@ -61,17 +63,28 @@ def build_meshboard_failure_command(
     log_path: Path,
     actor: str,
     parent_task: str,
+    project_id: str = DEFAULT_MESHBOARD_PROJECT,
 ) -> list[str]:
     meshctl = meshboard_root / ".mesh" / "tools" / "meshctl.py"
+    case_name = str(record.get("case") or "unknown").strip() or "unknown"
+    evidence_path = str(log_path)
+    reproduce = (
+        f"python3 scripts/dflash_stability_canary.py --case {shlex.quote(case_name)} "
+        "--rounds 1"
+    )
     details = (
         "Automated dflash hardening loop detected a canary failure. "
-        f"case={record.get('case')} failure={record.get('failure')} "
+        f"case={case_name} failure={record.get('failure')} "
         f"returncode={record.get('returncode')} elapsed_s={record.get('elapsed_s')}. "
-        "Raw stdout/stderr stay in the local evidence log."
+        f"Evidence log path: {evidence_path}. "
+        f"Reproduce the same case with: {reproduce}. "
+        "Do not search the scratch repo .mesh directory for this evidence; "
+        "read the evidence log path above first. Raw stdout/stderr stay only "
+        "in that local JSONL evidence file."
     )
     next_step = (
-        "Inspect the evidence log, reproduce the canary failure from the same "
-        "Hermes checkout, fix the root cause, verify with the canary, then "
+        f"Inspect {evidence_path}, reproduce {case_name} from the same Hermes "
+        "checkout, fix the root cause, verify with the one-case canary, then "
         "restart the dflash hardening loop."
     )
     cmd = [
@@ -97,7 +110,7 @@ def build_meshboard_failure_command(
         "--data-policy",
         "workspace-private",
         "--title",
-        f"Repair dflash canary failure: {record.get('case')} {record.get('failure')}",
+        f"Repair dflash canary failure: {case_name} {record.get('failure')}",
         "--next",
         next_step,
         "--details",
@@ -106,9 +119,13 @@ def build_meshboard_failure_command(
         str(log_path),
         "--required-tool",
         "hermes",
+        "--required-tool",
+        "python3",
         "--verification",
-        "Run scripts/dflash_stability_canary.py with the failing case until it passes.",
+        f"Run `{reproduce}` with the failing case until it passes.",
     ]
+    if project_id:
+        cmd.extend(["--project", project_id])
     if parent_task:
         cmd.extend(["--parent-task", parent_task])
     return cmd
@@ -122,6 +139,7 @@ def register_meshboard_failure(
     log_path: Path,
     actor: str,
     parent_task: str,
+    project_id: str = DEFAULT_MESHBOARD_PROJECT,
 ) -> dict:
     cmd = build_meshboard_failure_command(
         meshboard_root=meshboard_root,
@@ -130,6 +148,7 @@ def register_meshboard_failure(
         log_path=log_path,
         actor=actor,
         parent_task=parent_task,
+        project_id=project_id,
     )
     result = subprocess.run(
         cmd,
@@ -164,6 +183,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--meshboard-root", type=Path, help="If set, register/update a MeshBoard task on failure.")
     parser.add_argument("--meshboard-actor", default="dflash-hardening-loop", help="Owner for failure tasks.")
     parser.add_argument("--meshboard-parent-task", default="", help="Parent MeshBoard task id for failures.")
+    parser.add_argument(
+        "--meshboard-project",
+        default=DEFAULT_MESHBOARD_PROJECT,
+        help="MeshBoard project id for failure tasks; pass an empty value to omit.",
+    )
     parser.add_argument("--task-prefix", default="hermes-dflash-hardening-loop", help="Failure task id prefix.")
     parser.add_argument("--continue-after-failure", action="store_true", help="Keep looping after filing a failure.")
     parser.add_argument("--json", action="store_true", help="Print JSON records to stdout.")
@@ -210,6 +234,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         log_path=log_path,
                         actor=args.meshboard_actor,
                         parent_task=args.meshboard_parent_task,
+                        project_id=args.meshboard_project,
                     )
                     write_record(log_path, {"cycle": cycle, "meshboard": mesh_record})
                     if not args.json:
