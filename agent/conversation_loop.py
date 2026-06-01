@@ -811,13 +811,16 @@ def run_conversation(
     # See agent/stall_retry.py.
     from agent.stall_retry import (
         get_stall_retry_max_per_turn,
+        get_stall_retry_no_tool_recovery_max,
         get_stall_retry_promote_after,
     )
 
     _stall_retry_count = 0
     _stall_retry_success_count = 0
     _stall_retry_failed_count = 0
+    _stall_retry_no_tool_recovery_count = 0
     _stall_retry_max_per_turn = get_stall_retry_max_per_turn(agent)
+    _stall_retry_no_tool_recovery_max = get_stall_retry_no_tool_recovery_max(agent)
     _stall_retry_promote_after = get_stall_retry_promote_after(agent)
     agent._stall_retry_runtime_promoted = False
     agent._stall_retry_events = []
@@ -3651,11 +3654,12 @@ def run_conversation(
             # the synthetic nudge is not persisted to the real session. If
             # the retry returns tool calls, fall through to the normal
             # executor below in this same loop iteration. If it still returns
-            # no tool call, fail this turn as partial instead of persisting
-            # the planning-only text as a completed assistant message that
-            # poisons future "continue" turns.
+            # no tool call, feed a bounded corrective continuation back into
+            # the same turn before finally failing as partial; this prevents
+            # one bad retry-lane sample from killing long mobile sessions.
             from agent.stall_retry import (
                 EMPTY_AFTER_TOOL_RETRY_NUDGE,
+                FAILED_STALL_RETRY_RECOVERY_NUDGE,
                 activate_stall_retry_runtime,
                 get_stall_retry_max_chars,
                 get_stall_retry_model,
@@ -3862,6 +3866,45 @@ def run_conversation(
                                 )
                         else:
                             _stall_retry_failed_count += 1
+                            if (
+                                _stall_retry_no_tool_recovery_count
+                                < _stall_retry_no_tool_recovery_max
+                            ):
+                                _stall_retry_no_tool_recovery_count += 1
+                                record_stall_retry_event(
+                                    agent,
+                                    "no_tool_recovery_prompt",
+                                    finish_reason=finish_reason,
+                                    api_call=api_call_count,
+                                    retry_count=_stall_retry_count,
+                                    failed_count=_stall_retry_failed_count,
+                                    recovery_count=_stall_retry_no_tool_recovery_count,
+                                    recovery_max=_stall_retry_no_tool_recovery_max,
+                                    content=stalled_content,
+                                )
+                                agent._vprint(
+                                    (
+                                        f"{agent.log_prefix}↻ Stall retry still "
+                                        "returned no tool call; feeding a bounded "
+                                        "same-turn correction back to the model "
+                                        f"({_stall_retry_no_tool_recovery_count}/"
+                                        f"{_stall_retry_no_tool_recovery_max})."
+                                    ),
+                                    force=True,
+                                )
+                                assistant_msg = agent._build_assistant_message(
+                                    assistant_message,
+                                    finish_reason,
+                                )
+                                messages.append(assistant_msg)
+                                messages.append(
+                                    {
+                                        "role": "user",
+                                        "content": FAILED_STALL_RETRY_RECOVERY_NUDGE,
+                                    }
+                                )
+                                agent._session_messages = messages
+                                continue
                             _turn_exit_reason = "stall_retry_failed_no_tool_call"
                             agent._mute_post_response = False
                             agent._vprint(
