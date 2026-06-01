@@ -14,6 +14,8 @@ from agent.model_metadata import is_local_endpoint
 from agent.chat_completion_helpers import (
     _dflash_local_first_chunk_timeout,
     _dflash_local_stale_timeout,
+    _local_provider_first_chunk_timeout,
+    _mark_dflash_first_chunk_timeout,
     resolve_stream_stale_timeout,
 )
 
@@ -131,6 +133,47 @@ class TestLocalDflashStaleTimeout:
         monkeypatch.setenv("HERMES_DFLASH_FIRST_CHUNK_TIMEOUT", "45")
 
         assert _dflash_local_first_chunk_timeout({"messages": []}, "dflash") == 45.0
+
+    def test_generic_local_first_chunk_timeout_is_finite(self, monkeypatch):
+        monkeypatch.delenv("HERMES_LOCAL_FIRST_CHUNK_TIMEOUT", raising=False)
+        monkeypatch.delenv("HERMES_LOCAL_TTFB_TIMEOUT", raising=False)
+
+        timeout = _local_provider_first_chunk_timeout(
+            self._payload_for_estimated_tokens(6_000),
+            "qwen3.6-27b-256k",
+        )
+
+        assert timeout == 180.0
+
+    def test_generic_local_first_chunk_timeout_scales_for_large_context(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LOCAL_FIRST_CHUNK_TIMEOUT", "120")
+
+        timeout = _local_provider_first_chunk_timeout(
+            self._payload_for_estimated_tokens(66_000),
+            "qwen3.6-27b-256k",
+        )
+
+        assert timeout == 600.0
+
+    def test_dflash_first_chunk_timeout_marker_preserves_watchdog_metadata(self):
+        err = RuntimeError("Connection error.")
+
+        marked = _mark_dflash_first_chunk_timeout(
+            err,
+            elapsed=75.4,
+            threshold=75.0,
+            model="dflash",
+            context_tokens=19956,
+        )
+
+        assert marked is err
+        assert getattr(err, "_hermes_local_dflash_first_chunk_timeout") is True
+        assert getattr(err, "_hermes_dflash_first_chunk_meta") == {
+            "elapsed": 75,
+            "threshold": 75,
+            "model": "dflash",
+            "context_tokens": 19956,
+        }
 
     def test_generic_local_stream_stale_timeout_still_disables_by_default(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
