@@ -15,6 +15,7 @@ from agent.chat_completion_helpers import (
     _dflash_local_first_chunk_timeout,
     _dflash_local_stale_timeout,
     _local_provider_first_chunk_timeout,
+    _mark_local_first_chunk_timeout,
     _mark_dflash_first_chunk_timeout,
     resolve_stream_stale_timeout,
 )
@@ -173,6 +174,27 @@ class TestLocalDflashStaleTimeout:
             "threshold": 75,
             "model": "dflash",
             "context_tokens": 19956,
+        }
+
+    def test_generic_local_first_chunk_timeout_marker_is_not_dflash_specific(self):
+        err = RuntimeError("Connection error.")
+
+        marked = _mark_local_first_chunk_timeout(
+            err,
+            elapsed=180.4,
+            threshold=180.0,
+            model="qwen3.6-27b-256k",
+            context_tokens=42000,
+        )
+
+        assert marked is err
+        assert getattr(err, "_hermes_local_first_chunk_timeout") is True
+        assert not getattr(err, "_hermes_local_dflash_first_chunk_timeout", False)
+        assert getattr(err, "_hermes_local_first_chunk_meta") == {
+            "elapsed": 180,
+            "threshold": 180,
+            "model": "qwen3.6-27b-256k",
+            "context_tokens": 42000,
         }
 
     def test_generic_local_stream_stale_timeout_still_disables_by_default(self, monkeypatch, tmp_path):

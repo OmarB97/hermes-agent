@@ -216,7 +216,7 @@ def _mark_local_first_chunk_timeout(
     model: Any,
     context_tokens: int,
 ) -> Exception:
-    """Preserve the dflash TTFB watchdog reason across SDK transport wrappers."""
+    """Preserve the local TTFB watchdog reason across SDK transport wrappers."""
     meta = {
         "elapsed": int(elapsed),
         "threshold": int(threshold),
@@ -225,9 +225,10 @@ def _mark_local_first_chunk_timeout(
     }
     try:
         setattr(error, "_hermes_local_first_chunk_timeout", True)
-        setattr(error, "_hermes_local_dflash_first_chunk_timeout", True)
-        setattr(error, "_hermes_dflash_first_chunk_meta", meta)
         setattr(error, "_hermes_local_first_chunk_meta", meta)
+        if _is_dflash_like_model(model):
+            setattr(error, "_hermes_local_dflash_first_chunk_timeout", True)
+            setattr(error, "_hermes_dflash_first_chunk_meta", meta)
     except Exception:
         pass
     return error
