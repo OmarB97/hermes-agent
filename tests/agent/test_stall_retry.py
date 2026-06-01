@@ -229,6 +229,57 @@ def test_retry_on_stall_switches_model_and_returns_tool_calls(monkeypatch) -> No
     assert summary["recovered"] == 1
 
 
+def test_retry_on_stall_keeps_local_retry_streaming(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    tool_call = SimpleNamespace(
+        function=SimpleNamespace(name="terminal", arguments='{"cmd":"pwd"}')
+    )
+    normalized = SimpleNamespace(
+        content="",
+        tool_calls=[tool_call],
+        finish_reason="tool_calls",
+    )
+
+    def interruptible_streaming_call(kwargs: dict[str, object]) -> object:
+        captured["kwargs"] = dict(kwargs)
+        return normalized
+
+    agent = SimpleNamespace(
+        api_mode="openai",
+        _is_anthropic_oauth=False,
+        base_url="http://127.0.0.1:9090/v1",
+        log_prefix="",
+        _build_api_kwargs=lambda messages: {
+            "model": "dflash",
+            "messages": messages,
+            "stream": True,
+        },
+        _interruptible_api_call=lambda _kwargs: (_ for _ in ()).throw(
+            AssertionError("local retry should stay streaming")
+        ),
+        _interruptible_streaming_api_call=interruptible_streaming_call,
+        _get_transport=lambda: SimpleNamespace(
+            normalize_response=lambda response, **_kwargs: response
+        ),
+        _vprint=lambda *_args, **_kwargs: None,
+    )
+
+    monkeypatch.setenv("HERMES_STALL_RETRY_MODEL", "qwen3.6-27b-256k")
+    monkeypatch.setenv("HERMES_STALL_RETRY_TELEMETRY", "0")
+
+    result = retry_on_stall(
+        agent,
+        [{"role": "user", "content": "go"}],
+        "stop",
+        stalled_content="Let me check the repo.",
+        retry_index=1,
+    )
+
+    assert result is normalized
+    assert captured["kwargs"]["model"] == "qwen3.6-27b-256k"
+    assert captured["kwargs"]["stream"] is True
+
+
 def test_retry_on_stall_can_accept_visible_content(monkeypatch) -> None:
     captured: dict[str, object] = {}
     normalized = SimpleNamespace(

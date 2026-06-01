@@ -550,6 +550,9 @@ def _retry_api_call(agent: Any, api_kwargs: dict[str, Any], retry_model: str) ->
         retry_kwargs["model"] = resolved_model or retry_model
         return client.chat.completions.create(**retry_kwargs)
 
+    if api_kwargs.get("stream") and hasattr(agent, "_interruptible_streaming_api_call"):
+        return agent._interruptible_streaming_api_call(api_kwargs)
+
     return agent._interruptible_api_call(api_kwargs)
 
 
@@ -870,9 +873,26 @@ def retry_on_stall(
             )
         api_kwargs = dict(api_kwargs)
         api_kwargs["model"] = retry_model
-        # Force non-streaming for the retry (simpler, we only inspect the result).
-        api_kwargs.pop("stream", None)
-        api_kwargs["stream"] = False
+        # Local OpenAI-compatible backends must stay streaming so the
+        # first-chunk watchdog can abort a wedged single-slot server.  For
+        # remote retry lanes, keep the historic non-streaming path because we
+        # only inspect the result.
+        try:
+            from agent.model_metadata import is_local_endpoint
+
+            _retry_should_stream = bool(
+                getattr(agent, "base_url", None)
+                and is_local_endpoint(getattr(agent, "base_url", ""))
+                and not get_stall_retry_provider(agent)
+                and not get_stall_retry_base_url(agent)
+            )
+        except Exception:
+            _retry_should_stream = False
+        if _retry_should_stream:
+            api_kwargs["stream"] = True
+        else:
+            api_kwargs.pop("stream", None)
+            api_kwargs["stream"] = False
 
         try:
             agent._vprint(
