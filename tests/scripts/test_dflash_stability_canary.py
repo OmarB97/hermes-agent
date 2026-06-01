@@ -12,6 +12,13 @@ canary = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = canary
 SPEC.loader.exec_module(canary)
 
+LOOP_MODULE_PATH = Path(__file__).resolve().parents[2] / "scripts" / "dflash_hardening_loop.py"
+LOOP_SPEC = importlib.util.spec_from_file_location("dflash_hardening_loop", LOOP_MODULE_PATH)
+assert LOOP_SPEC is not None and LOOP_SPEC.loader is not None
+loop = importlib.util.module_from_spec(LOOP_SPEC)
+sys.modules[LOOP_SPEC.name] = loop
+LOOP_SPEC.loader.exec_module(loop)
+
 
 def test_incomplete_tail_classifier_catches_short_connector_fragment():
     assert canary.looks_like_incomplete_tail("I see a lot of discord-res tasks (digest Discord content) and some")
@@ -101,3 +108,39 @@ def test_run_case_uses_runner_and_sanitizes_prompt_from_logged_command(tmp_path)
     assert record["failure"] is None
     assert record["cmd"][-1] == "<prompt>"
     assert record["stdout"] == "OK\n"
+
+
+def test_hardening_loop_failure_task_id_is_stable_and_sanitized():
+    record = {"case": "MeshBoard Onboard", "failure": "nonzero_exit"}
+
+    assert (
+        loop.failure_task_id(record, prefix="Hermes DFlash Hardening Loop")
+        == "hermes-dflash-hardening-loop-meshboard-onboard-nonzero-exit"
+    )
+
+
+def test_hardening_loop_meshboard_command_omits_raw_stdout(tmp_path):
+    record = {
+        "case": "meshboard-onboard",
+        "failure": "auth-error",
+        "returncode": 1,
+        "elapsed_s": 12.3,
+        "stdout": "secret-ish raw model text",
+        "stderr": "raw stderr",
+    }
+
+    cmd = loop.build_meshboard_failure_command(
+        meshboard_root=tmp_path,
+        task_id="hermes-dflash-hardening-loop-meshboard-onboard-auth-error",
+        record=record,
+        log_path=tmp_path / "evidence.jsonl",
+        actor="ko-taro.hermes",
+        parent_task="parent-task",
+    )
+    command_text = "\n".join(cmd)
+
+    assert "secret-ish raw model text" not in command_text
+    assert "raw stderr" not in command_text
+    assert "--parent-task" in cmd
+    assert "parent-task" in cmd
+    assert str(tmp_path / "evidence.jsonl") in cmd
