@@ -207,3 +207,35 @@ def test_hardening_loop_meshboard_command_omits_raw_stdout(tmp_path):
     assert "--parent-task" in cmd
     assert "parent-task" in cmd
     assert str(tmp_path / "evidence.jsonl") in cmd
+
+
+def test_hardening_loop_meshboard_command_exposes_evidence_contract(tmp_path):
+    evidence_path = tmp_path / "evidence.jsonl"
+    record = {
+        "case": "meshboard-onboard",
+        "failure": "marker-mismatch",
+        "returncode": 0,
+        "elapsed_s": 105.333,
+        "stdout": "raw model text should stay in JSONL",
+        "stderr": "raw stderr should stay in JSONL",
+    }
+
+    cmd = loop.build_meshboard_failure_command(
+        meshboard_root=tmp_path,
+        task_id="hermes-dflash-hardening-loop-meshboard-onboard-marker-mismatch",
+        record=record,
+        log_path=evidence_path,
+        actor="ko-taro.hermes",
+        parent_task="parent-task",
+    )
+    values_by_flag = dict(zip(cmd, cmd[1:]))
+    command_text = "\n".join(cmd)
+
+    assert values_by_flag["--project"] == "hermes-agent"
+    assert str(evidence_path) in values_by_flag["--details"]
+    assert str(evidence_path) in values_by_flag["--next"]
+    assert "python3 scripts/dflash_stability_canary.py --case meshboard-onboard --rounds 1" in values_by_flag["--details"]
+    assert "python3 scripts/dflash_stability_canary.py --case meshboard-onboard --rounds 1" in values_by_flag["--verification"]
+    assert "scratch repo .mesh" in values_by_flag["--details"]
+    assert "raw model text should stay in JSONL" not in command_text
+    assert "raw stderr should stay in JSONL" not in command_text
