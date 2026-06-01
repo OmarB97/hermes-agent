@@ -23,6 +23,7 @@ Methods covered:
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 import logging
 import re
@@ -45,6 +46,22 @@ def _ra():
     """Lazy ``run_agent`` reference for test-patch routing."""
     import run_agent
     return run_agent
+
+
+def _handle_function_call_accepts_kwarg(handle_function_call, name: str) -> bool:
+    """Return whether a loaded handle_function_call accepts ``name``.
+
+    Live installs can temporarily contain a newer runtime helper with an older
+    model_tools dispatcher during source sync. In that state blindly passing
+    newly-added keyword arguments breaks every registry tool call.
+    """
+    try:
+        params = inspect.signature(handle_function_call).parameters
+    except (TypeError, ValueError):
+        return True
+    if name in params:
+        return True
+    return any(param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values())
 
 
 
@@ -1695,15 +1712,33 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     elif function_name == "delegate_task":
         return agent._dispatch_delegate_task(function_args)
     else:
-        return _ra().handle_function_call(
-            function_name, function_args, effective_task_id,
-            tool_call_id=tool_call_id,
-            session_id=agent.session_id or "",
-            enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
-            skip_pre_tool_call_hook=True,
-            enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-        )
+        handle_function_call = _ra().handle_function_call
+        kwargs = {
+            "tool_call_id": tool_call_id,
+            "session_id": agent.session_id or "",
+            "enabled_tools": list(agent.valid_tool_names) if agent.valid_tool_names else None,
+            "skip_pre_tool_call_hook": True,
+        }
+        toolset_kwargs = {
+            "enabled_toolsets": getattr(agent, "enabled_toolsets", None),
+            "disabled_toolsets": getattr(agent, "disabled_toolsets", None),
+        }
+        for key, value in toolset_kwargs.items():
+            if _handle_function_call_accepts_kwarg(handle_function_call, key):
+                kwargs[key] = value
+        try:
+            return handle_function_call(function_name, function_args, effective_task_id, **kwargs)
+        except TypeError as exc:
+            message = str(exc)
+            unsupported = [
+                key for key in toolset_kwargs
+                if key in kwargs and f"unexpected keyword argument '{key}'" in message
+            ]
+            if not unsupported:
+                raise
+            for key in toolset_kwargs:
+                kwargs.pop(key, None)
+            return handle_function_call(function_name, function_args, effective_task_id, **kwargs)
 
 
 
