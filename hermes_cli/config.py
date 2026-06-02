@@ -739,6 +739,11 @@ DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
     "fallback_providers": [],
+    "fallback_promotions": {
+        "enabled": True,
+        "providers": ["nous"],
+        "position": "prepend",
+    },
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
     "agent": {
@@ -1052,12 +1057,30 @@ DEFAULT_CONFIG = {
         },
     },
 
+    # Agentic stall retry is default-off until a retry model is configured.
+    # It is useful for local models that sometimes stop after an action
+    # preamble with no tool call. When enabled, local bounded telemetry is
+    # appended under ~/.hermes/logs/ so operators can measure recoveries.
+    "stall_retry": {
+        "model": "",
+        "max_per_turn": 5,
+        "max_chars": 400,
+        "nudge": True,
+        "telemetry": True,
+    },
+
     "compression": {
         "enabled": True,
         "threshold": 0.50,            # compress when context usage exceeds this ratio
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
         "hygiene_hard_message_limit": 400,  # gateway session-hygiene force-compress threshold by message count
+        "local_prefill_compact_tokens": 80000,  # earlier compaction guard for
+                                      # selected local models whose long
+                                      # prefill can stall before first token
+                                      # (0 disables; env override:
+                                      # HERMES_LOCAL_PREFILL_COMPACT_TOKENS)
+        "local_prefill_compact_models": ["dflash"],  # substring list, or ["*"]
         "protect_first_n": 3,         # non-system head messages always preserved
                                       # verbatim, in ADDITION to the system prompt
                                       # (which is always implicitly protected). Set to
@@ -3812,8 +3835,9 @@ def check_config_version() -> Tuple[int, int]:
 # Fields that are valid at root level of config.yaml
 _KNOWN_ROOT_KEYS = {
     "_config_version", "model", "providers", "fallback_model",
-    "fallback_providers", "credential_pool_strategies", "toolsets",
-    "agent", "terminal", "display", "compression", "delegation",
+    "fallback_providers", "fallback_promotions",
+    "credential_pool_strategies", "toolsets", "agent", "terminal",
+    "display", "compression", "delegation",
     "auxiliary", "custom_providers", "context", "memory", "gateway",
     "sessions", "streaming",
 }

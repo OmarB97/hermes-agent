@@ -932,13 +932,8 @@ def prompt_enable_tool_gateway(
 # ---------------------------------------------------------------------------
 
 
-def ensure_nous_portal_access(
-    *,
-    capability: str = "the Nous Tool Gateway",
-    coverage_category: Optional[str] = None,
-) -> bool:
-    """Make sure the user is entitled to the Nous Tool Gateway, logging in if
-    needed.
+def ensure_nous_portal_access(*, capability: str = "the Nous Tool Gateway") -> bool:
+    """Make sure the user has paid Nous Portal access, logging in if needed.
 
     Used by ``hermes tools`` when a user selects a Nous-managed Tool Gateway
     backend (e.g. "Firecrawl (Nous Portal)").  Unlike ``hermes model``'s Nous
@@ -952,28 +947,15 @@ def ensure_nous_portal_access(
     already logged in) and refreshes entitlement, so the caller can enable the
     single tool the user picked.
 
-    Entitlement is satisfied by paid service access OR a live free tool pool.
-    When ``coverage_category`` is given (e.g. ``"fal"`` for image gen), the pool
-    must cover that category specifically — so a pool user selecting video
-    (``"fal-video"``, not pool-funded) is correctly denied.
-
-    Returns ``True`` when the account is entitled after the flow, ``False``
-    otherwise (declined login, login failed, or no entitlement).
+    Returns ``True`` when the account has paid service access after the flow,
+    ``False`` otherwise (declined login, login failed, or no paid entitlement).
     """
-
-    def _entitled(account) -> bool:
-        if account is None:
-            return False
-        if coverage_category is not None:
-            return account.tool_gateway_entitled_for(coverage_category)
-        return account.tool_gateway_entitled
-
     # Fast path: already entitled.
     try:
         info = get_nous_portal_account_info(force_fresh=True)
     except Exception:
         info = None
-    if _entitled(info):
+    if info is not None and info.paid_service_access is True:
         return True
 
     # If not logged in at all, run the device-code login (auth only).
@@ -985,15 +967,11 @@ def ensure_nous_portal_access(
         except Exception:
             info = None
 
-    if _entitled(info):
+    if info is not None and info.paid_service_access is True:
         return True
 
-    # Logged in but not entitled for this capability — surface neutral billing
-    # guidance, do not enable. coverage_category keeps a pool user who lacks this
-    # one category from being told their credits are exhausted.
-    message = format_nous_portal_entitlement_message(
-        info, capability=capability, coverage_category=coverage_category
-    )
+    # Logged in but no paid access — surface billing guidance, do not enable.
+    message = format_nous_portal_entitlement_message(info, capability=capability)
     if message:
         for line in message.splitlines():
             print(f"  {line}")

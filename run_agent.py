@@ -175,6 +175,8 @@ from utils import atomic_json_write, base_url_host_matches, base_url_hostname
 
 
 _MAX_TOOL_WORKERS = 8
+_TEXT_TOOL_COMPACT_DEFAULT_THRESHOLD = 4_000
+_TEXT_TOOL_COMPACT_DEFAULT_CHARS = 3_000
 
 # Guard so the OpenRouter metadata pre-warm thread is only spawned once per
 # process, not once per AIAgent instantiation.  Without this, long-running
@@ -1053,9 +1055,9 @@ class AIAgent:
              ``_compute_non_stream_stale_timeout``.
 
         Returns ``(timeout_seconds, uses_implicit_default)`` so the caller can
-        preserve legacy behaviors that only apply when the user has *not*
-        explicitly configured a stale timeout, such as auto-disabling the
-        detector for local endpoints.
+        apply behaviors that only make sense when the user has *not* explicitly
+        configured a stale timeout, such as using local-backend defaults for
+        loopback endpoints.
         """
         cfg = get_provider_stale_timeout(self.provider, self.model)
         if cfg is not None:
@@ -1078,7 +1080,11 @@ class AIAgent:
         stale_base, uses_implicit_default = self._resolved_api_call_stale_timeout_base()
         base_url = getattr(self, "_base_url", None) or self.base_url or ""
         if uses_implicit_default and base_url and is_local_endpoint(base_url):
-            return float("inf")
+            from agent.chat_completion_helpers import _local_provider_non_stream_stale_timeout
+            model = self.model
+            if isinstance(api_payload, dict):
+                model = api_payload.get("model") or model
+            return _local_provider_non_stream_stale_timeout(api_payload, model)
 
         from agent.chat_completion_helpers import estimate_request_context_tokens
         est_tokens = estimate_request_context_tokens(api_payload)
@@ -1310,6 +1316,76 @@ class AIAgent:
 
         return not self._has_natural_response_ending(visible_text)
 
+    def _detect_malformed_tool_final_response(
+        self,
+        content: str,
+        finish_reason: str,
+        messages: Optional[list] = None,
+    ) -> Optional[str]:
+        """Detect non-empty final answers that are structurally broken.
+
+        Empty/thinking-only finals already have a dedicated recovery path. This
+        catches a different local-model failure mode: after tool results, a
+        backend can report ``finish_reason=stop`` with visible text that ends in
+        a degenerate character run, making the loop treat a corrupted answer as
+        successful.
+        """
+        if finish_reason != "stop" or self.api_mode != "chat_completions":
+            return None
+        recent_messages = messages or []
+        if not any(
+            isinstance(msg, dict) and msg.get("role") == "tool"
+            for msg in recent_messages[-12:]
+        ):
+            return None
+        if not content:
+            return None
+
+        visible_text = self._strip_think_blocks(content).strip()
+        if self._looks_like_dangling_self_correction(visible_text):
+            return "dangling self-correction after tool calls"
+        if len(visible_text) < 80:
+            return None
+
+        tail = visible_text[-160:]
+        repeated_tail = re.search(r"([^\s\w])\1{11,}\s*$", tail)
+        punctuation_tail = re.search(r"[!?.,;:_=+\-*/#~`|\\]{16,}\s*$", tail)
+        if repeated_tail or punctuation_tail:
+            return "degenerate repeated punctuation at final-response tail"
+        if not self._has_natural_response_ending(visible_text):
+            open_connector_tail = re.search(
+                r"\b(?:and|but|or|because|since|while|although|though|if|"
+                r"when|where|with|without|to|for|from|into|as|by)\s*$",
+                visible_text,
+                re.IGNORECASE,
+            )
+            if open_connector_tail:
+                return "open connector at final-response tail"
+        return None
+
+    @staticmethod
+    def _looks_like_dangling_self_correction(content: str) -> bool:
+        """Detect a short self-correction that needs another tool/reasoning step."""
+        text = re.sub(r"\s+", " ", content or "").strip()
+        if not text or len(text) > 180:
+            return False
+        starts_like_correction = bool(
+            re.match(
+                r"^(?:wait|hold on|actually|hmm|okay,?\s+wait|one sec)\b",
+                text,
+                re.IGNORECASE,
+            )
+        )
+        if not starts_like_correction:
+            return False
+        problem_marker = re.search(
+            r"\b(?:logic issue|bug|problem|mistake|wrong|not right|"
+            r"need(?:s)? to (?:fix|adjust|change|correct|rework))\b",
+            text,
+            re.IGNORECASE,
+        )
+        return bool(problem_marker)
+
     def _looks_like_codex_intermediate_ack(
         self,
         user_message: str,
@@ -1363,11 +1439,16 @@ class AIAgent:
         keep working.
         """
         from agent.background_review import spawn_background_review_thread
+        foreground_generation = int(getattr(self, "_foreground_turn_generation", 0) or 0)
         target, _prompt = spawn_background_review_thread(
             self,
             messages_snapshot,
             review_memory=review_memory,
             review_skills=review_skills,
+            foreground_generation=foreground_generation,
+            idle_delay_seconds=float(
+                getattr(self, "_background_review_idle_delay_seconds", 0.0) or 0.0
+            ),
         )
         t = threading.Thread(target=target, daemon=True, name="bg-review")
         t.start()
@@ -1413,13 +1494,23 @@ class AIAgent:
 
         Ensures conversations are never lost, even on errors or early returns.
         """
-        self._drop_trailing_empty_response_scaffolding(messages)
+        rewound_transcript = self._drop_trailing_empty_response_scaffolding(messages)
         self._apply_persist_user_message_override(messages)
         self._session_messages = messages
         self._save_session_log(messages)
+        if rewound_transcript and self._session_db:
+            try:
+                self._session_db.replace_messages(self.session_id, messages)
+                self._last_flushed_db_idx = len(messages)
+                return
+            except Exception as e:
+                logger.warning(
+                    "Failed to rewrite session DB after empty-response cleanup: %s",
+                    e,
+                )
         self._flush_messages_to_session_db(messages, conversation_history)
 
-    def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
+    def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> bool:
         """Remove private empty-response retry/failure scaffolding from transcript tails.
 
         Also rewinds past any trailing tool-result / assistant(tool_calls) pair
@@ -1427,7 +1518,8 @@ class AIAgent:
         a raw ``tool`` message and the next user turn lands as
         ``...tool, user, user`` — a protocol-invalid sequence that most
         providers silently reject (returns empty content), causing the
-        empty-retry loop to fire forever. See #<TBD>.
+        empty-retry loop to fire forever. Returns True when the transcript was
+        mutated so callers can rewrite already-flushed persistent stores.
         """
         # Pass 1: strip the flagged scaffolding messages themselves.
         dropped_scaffolding = False
@@ -1437,6 +1529,7 @@ class AIAgent:
             and (
                 messages[-1].get("_empty_recovery_synthetic")
                 or messages[-1].get("_empty_terminal_sentinel")
+                or messages[-1].get("_malformed_final_recovery_synthetic")
             )
         ):
             messages.pop()
@@ -1449,7 +1542,7 @@ class AIAgent:
         # result. Only runs when scaffolding was actually present — normal
         # conversation tails (real tool loops mid-progress) are untouched.
         if not dropped_scaffolding:
-            return
+            return False
 
         # Drop any trailing tool-result messages
         while (
@@ -1471,6 +1564,7 @@ class AIAgent:
             and messages[-1].get("tool_calls")
         ):
             messages.pop()
+        return True
 
     def _repair_message_sequence(self, messages: List[Dict]) -> int:
         """Forwarder — see ``agent.agent_runtime_helpers.repair_message_sequence``."""
@@ -3922,6 +4016,65 @@ class AIAgent:
             )
         return transformed
 
+    @staticmethod
+    def _env_int(name: str, default: int) -> int:
+        try:
+            value = int(os.environ.get(name, str(default)) or default)
+        except (TypeError, ValueError):
+            return default
+        return value if value > 0 else default
+
+    def _should_compact_text_tool_results_for_active_model(self) -> bool:
+        """Return True when raw text tool outputs should be kept compact.
+
+        The dflash lane is a local llama.cpp/Qwen quant where long raw tool
+        outputs have repeatedly pushed the next decision turn into ordinary
+        text completion instead of structured tool calls. The env override is
+        intentionally generic so operators can opt other local lanes in/out
+        without a code change.
+        """
+        override = os.environ.get("HERMES_COMPACT_TEXT_TOOL_RESULTS", "").strip().lower()
+        if override in {"1", "true", "yes", "on"}:
+            return True
+        if override in {"0", "false", "no", "off"}:
+            return False
+
+        model_lower = (getattr(self, "model", "") or "").strip().lower()
+        if "dflash" in model_lower:
+            return True
+
+        return False
+
+    def _compact_text_tool_result_for_active_model(self, tool_name: str, result: str) -> str:
+        if not self._should_compact_text_tool_results_for_active_model():
+            return result
+
+        threshold = self._env_int(
+            "HERMES_TEXT_TOOL_RESULT_COMPACT_THRESHOLD",
+            _TEXT_TOOL_COMPACT_DEFAULT_THRESHOLD,
+        )
+        if len(result) <= threshold:
+            return result
+
+        keep_chars = self._env_int(
+            "HERMES_TEXT_TOOL_RESULT_COMPACT_CHARS",
+            _TEXT_TOOL_COMPACT_DEFAULT_CHARS,
+        )
+        keep_chars = max(500, min(keep_chars, threshold))
+        head_chars = keep_chars // 2
+        tail_chars = keep_chars - head_chars
+        original_size = len(result)
+
+        head = result[:head_chars].rstrip()
+        tail = result[-tail_chars:].lstrip()
+        return (
+            f"{head}\n\n"
+            f"[Tool output compacted for {getattr(self, 'model', 'the active model')}: "
+            f"original result was {original_size:,} characters. Rerun a narrower "
+            "command or read a specific file/range if more detail is needed.]\n\n"
+            f"{tail}"
+        )
+
     def _tool_result_content_for_active_model(self, tool_name: str, result: Any) -> Any:
         """Return the tool message content that is safe for the active model.
 
@@ -3932,6 +4085,8 @@ class AIAgent:
         the agent has a chance to recover.
         """
         if not _is_multimodal_tool_result(result):
+            if isinstance(result, str):
+                return self._compact_text_tool_result_for_active_model(tool_name, result)
             return result
 
         content = result.get("content") or []
@@ -4450,6 +4605,37 @@ class AIAgent:
         if decision.should_halt and self._tool_guardrail_halt_decision is None:
             self._tool_guardrail_halt_decision = decision
 
+    def _log_tool_guardrail_decision(self, decision: ToolGuardrailDecision) -> None:
+        if decision.action == "allow":
+            return
+        try:
+            metadata = json.dumps(decision.to_metadata(), ensure_ascii=False, sort_keys=True)
+        except Exception:
+            metadata = str(decision.to_metadata())
+        logger.info("tool_guardrail_decision %s", metadata)
+
+    def _observe_progress_outcome(self, tool_calls, tool_results):
+        tracker = getattr(self, "_progress_outcome_canary", None)
+        if tracker is None:
+            return None
+        decision = tracker.after_tool_round(tool_calls, tool_results)
+        if decision.action == "warn":
+            events = getattr(self, "_progress_outcome_events", None)
+            if events is None:
+                events = []
+                self._progress_outcome_events = events
+            metadata = decision.to_metadata()
+            events.append(metadata)
+            try:
+                logger.info(
+                    "progress_outcome_canary_decision %s",
+                    json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+                )
+            except Exception:
+                logger.info("progress_outcome_canary_decision %s", metadata)
+            return decision
+        return None
+
     def _toolguard_controlled_halt_response(self, decision: ToolGuardrailDecision) -> str:
         tool = decision.tool_name or "a tool"
         return (
@@ -4457,6 +4643,17 @@ class AIAgent:
             f"({decision.code}) after {decision.count} repeated non-progressing "
             "attempts. The last tool result explains the blocker; the next step is "
             "to change strategy instead of repeating the same call."
+        )
+
+    def _toolguard_recovery_prompt(self, decision: ToolGuardrailDecision) -> str:
+        tool = decision.tool_name or "the tool"
+        return (
+            f"The previous {tool} call was blocked by the tool-loop guardrail "
+            f"({decision.code}) after {decision.count} repeated non-progressing "
+            "attempts. Use the information already returned, switch to a different "
+            "tool/query/file region, make the edit, or state the blocker with "
+            "evidence. Continue the same user request now without asking the user "
+            "to type continue."
         )
 
     def _append_guardrail_observation(
@@ -4473,13 +4670,15 @@ class AIAgent:
             function_result,
             failed=failed,
         )
-        if decision.action in {"warn", "halt"}:
+        if decision.action in {"warn", "redirect", "halt"}:
+            self._log_tool_guardrail_decision(decision)
             function_result = append_toolguard_guidance(function_result, decision)
         if decision.should_halt:
             self._set_tool_guardrail_halt(decision)
         return function_result
 
     def _guardrail_block_result(self, decision: ToolGuardrailDecision) -> str:
+        self._log_tool_guardrail_decision(decision)
         self._set_tool_guardrail_halt(decision)
         return toolguard_synthetic_result(decision)
 
@@ -4597,7 +4796,10 @@ class AIAgent:
             str: Final assistant response
         """
         result = self.run_conversation(message, stream_callback=stream_callback)
-        return result["final_response"]
+        # run_conversation's error/failure return paths (API error after retries,
+        # billing/credits exhaustion, policy halt, etc.) omit "final_response";
+        # surface the error message instead of raising KeyError here.
+        return result.get("final_response") or result.get("error") or ""
 
     def _run_codex_app_server_turn(
         self,
@@ -4790,7 +4992,7 @@ def main(
     print(f"📞 API Calls: {result['api_calls']}")
     print(f"💬 Messages: {len(result['messages'])}")
     
-    if result['final_response']:
+    if result.get('final_response'):
         print("\n🎯 FINAL RESPONSE:")
         print("-" * 30)
         print(result['final_response'])

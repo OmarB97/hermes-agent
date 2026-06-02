@@ -18,6 +18,7 @@ from typing import Any, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.fallback_config import get_fallback_chain
 from utils import is_truthy_value
 from tui_gateway.transport import (
     StdioTransport,
@@ -391,14 +392,62 @@ def _emit(event: str, sid: str, payload: dict | None = None):
     write_json({"jsonrpc": "2.0", "method": "event", "params": params})
 
 
+def _usage_for_sid(sid: str) -> dict | None:
+    try:
+        agent = (_sessions.get(sid) or {}).get("agent")
+        if agent is None:
+            return None
+        return _get_usage(agent)
+    except Exception:
+        return None
+
+
+def _rough_context_estimate(agent) -> int:
+    for attr in ("_last_request_context_tokens", "_last_request_tokens_estimate"):
+        try:
+            value = int(getattr(agent, attr, 0) or 0)
+        except Exception:
+            value = 0
+        if value > 0:
+            return value
+
+    try:
+        cached = int(getattr(agent, "_last_usage_context_estimate", 0) or 0)
+    except Exception:
+        cached = 0
+    if cached > 0:
+        return cached
+
+    try:
+        from agent.model_metadata import estimate_request_tokens_rough
+
+        estimate = estimate_request_tokens_rough(
+            [],
+            system_prompt=getattr(agent, "_cached_system_prompt", "") or "",
+            tools=getattr(agent, "tools", None) or None,
+        )
+    except Exception:
+        estimate = 0
+    if estimate > 0:
+        try:
+            agent._last_usage_context_estimate = estimate
+        except Exception:
+            pass
+    return estimate
+
+
 def _status_update(sid: str, kind: str, text: str | None = None):
     body = (text if text is not None else kind).strip()
     if not body:
         return
+    payload = {"kind": kind if text is not None else "status", "text": body}
+    usage = _usage_for_sid(sid)
+    if usage is not None:
+        payload["usage"] = usage
     _emit(
         "status.update",
         sid,
-        {"kind": kind if text is not None else "status", "text": body},
+        payload,
     )
 
 
@@ -1461,6 +1510,7 @@ def _sync_session_key_after_compress(
 
 def _get_usage(agent) -> dict:
     g = lambda k, fb=None: getattr(agent, k, 0) or (getattr(agent, fb, 0) if fb else 0)
+    rough_context = _rough_context_estimate(agent)
     usage = {
         "model": getattr(agent, "model", "") or "",
         "input": g("session_input_tokens", "session_prompt_tokens"),
@@ -1475,12 +1525,15 @@ def _get_usage(agent) -> dict:
     }
     comp = getattr(agent, "context_compressor", None)
     if comp:
-        ctx_used = getattr(comp, "last_prompt_tokens", 0) or usage["total"] or 0
+        ctx_real = getattr(comp, "last_prompt_tokens", 0) or 0
+        ctx_used = ctx_real if ctx_real > 0 else rough_context or usage["total"] or 0
+        ctx_estimated = ctx_real <= 0 and rough_context > 0
         ctx_max = getattr(comp, "context_length", 0) or 0
         if ctx_max:
             usage["context_used"] = ctx_used
             usage["context_max"] = ctx_max
             usage["context_percent"] = max(0, min(100, round(ctx_used / ctx_max * 100)))
+            usage["context_estimated"] = ctx_estimated
         usage["compressions"] = getattr(comp, "compression_count", 0) or 0
     try:
         from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
@@ -1929,6 +1982,13 @@ def _on_tool_progress(
 
 
 def _agent_cbs(sid: str) -> dict:
+    def _thinking_delta(text):
+        payload = {"text": text}
+        usage = _usage_for_sid(sid)
+        if usage is not None:
+            payload["usage"] = usage
+        _emit("thinking.delta", sid, payload)
+
     return {
         "tool_start_callback": lambda tc_id, name, args: _on_tool_start(
             sid, tc_id, name, args
@@ -1941,7 +2001,7 @@ def _agent_cbs(sid: str) -> dict:
         ),
         "tool_gen_callback": lambda name: _tool_progress_enabled(sid)
         and _emit("tool.generating", sid, {"name": name}),
-        "thinking_callback": lambda text: _emit("thinking.delta", sid, {"text": text}),
+        "thinking_callback": _thinking_delta,
         "reasoning_callback": lambda text: _emit(
             "reasoning.delta",
             sid,
@@ -2146,7 +2206,10 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
         "platform": "tui",
         "session_db": _get_db(),
-        "fallback_model": getattr(agent, "_fallback_model", None),
+        "fallback_model": (
+            list(getattr(agent, "_fallback_chain", None) or [])
+            or getattr(agent, "_fallback_model", None)
+        ),
     }
 
 
@@ -2320,6 +2383,7 @@ def _make_agent(sid: str, key: str, session_id: str | None = None):
         pass
 
     cfg = _load_cfg()
+    fallback_chain = get_fallback_chain(cfg)
     agent_cfg = cfg.get("agent") or {}
     system_prompt = _prompt_text(agent_cfg.get("system_prompt", ""))
     startup_skills = _parse_tui_skills_env()
@@ -2351,6 +2415,7 @@ def _make_agent(sid: str, key: str, session_id: str | None = None):
         acp_command=runtime.get("command"),
         acp_args=runtime.get("args"),
         credential_pool=runtime.get("credential_pool"),
+        fallback_model=fallback_chain or None,
         quiet_mode=True,
         # verbose_logging controls DEBUG-level agent logging; it is intentionally
         # independent of tool_progress_mode (which only controls per-tool

@@ -22,6 +22,7 @@ import contextlib
 import json
 import logging
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -67,6 +68,12 @@ _SKILL_REVIEW_PROMPT = (
     "from. Capture it.\n"
     "  • A skill that got loaded or consulted this session turned out "
     "to be wrong, missing a step, or outdated. Patch it NOW.\n\n"
+    "Evidence discipline: do not encode the foreground assistant's own "
+    "unverified diagnosis as a durable rule. For operational/debugging "
+    "lessons, prefer timestamp-matched tool output, logs, tests, or a user "
+    "correction. If the turn ended with an error sentinel, malformed final "
+    "response, interrupted stream, or retry/fallback exhaustion, capture the "
+    "recovery pattern only, not the failed hypothesis.\n\n"
     "Preference order — prefer the earliest action that fits, but do "
     "pick one when a signal above fired:\n"
     "  1. UPDATE A CURRENTLY-LOADED SKILL. Look back through the "
@@ -169,6 +176,12 @@ _COMBINED_REVIEW_PROMPT = (
     "emerged.\n"
     "  • A skill that was loaded or consulted turned out wrong, "
     "missing, or outdated — patch it now.\n\n"
+    "Evidence discipline: do not encode the foreground assistant's own "
+    "unverified diagnosis as a durable rule. For operational/debugging "
+    "lessons, prefer timestamp-matched tool output, logs, tests, or a user "
+    "correction. If the turn ended with an error sentinel, malformed final "
+    "response, interrupted stream, or retry/fallback exhaustion, capture the "
+    "recovery pattern only, not the failed hypothesis.\n\n"
     "Preference order for skills — pick the earliest that fits:\n"
     "  1. UPDATE A CURRENTLY-LOADED SKILL. Check what skills were "
     "loaded via /skill-name or skill_view in the conversation. If one "
@@ -328,6 +341,8 @@ def _run_review_in_thread(
     agent: Any,
     messages_snapshot: List[Dict],
     prompt: str,
+    foreground_generation: Optional[int] = None,
+    idle_delay_seconds: float = 0.0,
 ) -> None:
     """Worker function executed in the background-review daemon thread.
 
@@ -338,6 +353,19 @@ def _run_review_in_thread(
     # Local import to avoid a hard circular dep at module load.
     from run_agent import AIAgent
     from tools.terminal_tool import set_approval_callback as _set_approval_callback
+
+    if idle_delay_seconds > 0:
+        time.sleep(idle_delay_seconds)
+        current_generation = getattr(agent, "_foreground_turn_generation", None)
+        if (
+            foreground_generation is not None
+            and current_generation is not None
+            and current_generation != foreground_generation
+        ):
+            logger.info(
+                "Background review skipped: foreground turn resumed during idle delay"
+            )
+            return
 
     # Install a non-interactive approval callback on this worker
     # thread so any dangerous-command guard the review agent trips
@@ -471,6 +499,16 @@ def _run_review_in_thread(
                 ),
             )
             try:
+                current_generation = getattr(agent, "_foreground_turn_generation", None)
+                if (
+                    foreground_generation is not None
+                    and current_generation is not None
+                    and current_generation != foreground_generation
+                ):
+                    logger.info(
+                        "Background review skipped: foreground turn resumed before model call"
+                    )
+                    return
                 review_agent.run_conversation(
                     user_message=(
                         prompt
@@ -564,6 +602,8 @@ def spawn_background_review_thread(
     messages_snapshot: List[Dict],
     review_memory: bool = False,
     review_skills: bool = False,
+    foreground_generation: Optional[int] = None,
+    idle_delay_seconds: float = 0.0,
 ):
     """Build the review thread target and prompt for a background review.
 
@@ -582,7 +622,13 @@ def spawn_background_review_thread(
         prompt = getattr(agent, "_SKILL_REVIEW_PROMPT", _SKILL_REVIEW_PROMPT)
 
     def _target() -> None:
-        _run_review_in_thread(agent, messages_snapshot, prompt)
+        _run_review_in_thread(
+            agent,
+            messages_snapshot,
+            prompt,
+            foreground_generation=foreground_generation,
+            idle_delay_seconds=idle_delay_seconds,
+        )
 
     return _target, prompt
 

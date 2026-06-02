@@ -40,6 +40,10 @@ from agent.model_metadata import (
     query_ollama_num_ctx,
 )
 from agent.process_bootstrap import _install_safe_stdio
+from agent.progress_outcome import (
+    ProgressOutcomeConfig,
+    ProgressOutcomeTracker,
+)
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.think_scrubber import StreamingThinkScrubber
 from agent.tool_guardrails import (
@@ -414,6 +418,14 @@ def init_agent(
     agent._execution_thread_id: int | None = None  # Set at run_conversation() start
     agent._interrupt_thread_signal_pending = False
     agent._client_lock = threading.RLock()
+    agent._foreground_turn_generation = 0
+    agent._background_review_idle_delay_seconds = 60.0 if platform == "tui" else 0.0
+    try:
+        _bg_idle_raw = os.getenv("HERMES_BACKGROUND_REVIEW_IDLE_DELAY_SECONDS")
+        if _bg_idle_raw not in (None, ""):
+            agent._background_review_idle_delay_seconds = max(0.0, float(_bg_idle_raw))
+    except Exception:
+        pass
 
     # /steer mechanism — inject a user note into the next tool result
     # without interrupting the agent. Unlike interrupt(), steer() does
@@ -1055,6 +1067,18 @@ def init_agent(
         )
     except Exception as _tlg_err:
         _ra().logger.warning("Tool loop guardrail config ignored: %s", _tlg_err)
+    try:
+        agent._progress_outcome_canary = ProgressOutcomeTracker(
+            ProgressOutcomeConfig.from_mapping(
+                _agent_cfg.get("progress_outcome_canary", {})
+            )
+        )
+    except Exception as _poc_err:
+        _ra().logger.warning("Progress outcome canary config ignored: %s", _poc_err)
+        agent._progress_outcome_canary = ProgressOutcomeTracker()
+    agent._progress_outcome_events = []
+    _stall_retry_cfg = _agent_cfg.get("stall_retry", {})
+    agent._stall_retry_config = _stall_retry_cfg if isinstance(_stall_retry_cfg, dict) else {}
     # Cache only the derived auxiliary compression context override that is
     # needed later by the startup feasibility check.  Avoid exposing a
     # broad pseudo-public config object on the agent instance.
@@ -1237,6 +1261,43 @@ def init_agent(
     compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in {"true", "1", "yes"}
     compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
     compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
+    # Local dflash can be well under its 256K context window and still be too
+    # expensive for interactive phone "continue" turns: first-token prefill can
+    # stall, and falling back to another local model repeats the same long
+    # prefill.  This guard lets the conversation loop compact earlier for
+    # selected local models.  Set to 0 to disable.
+    compression_local_prefill_guard = _compression_cfg.get(
+        "local_prefill_compact_tokens",
+        80_000,
+    )
+    try:
+        if isinstance(compression_local_prefill_guard, bool):
+            raise ValueError
+        compression_local_prefill_guard = max(0, int(compression_local_prefill_guard))
+    except (TypeError, ValueError):
+        compression_local_prefill_guard = 80_000
+    compression_local_prefill_models = _compression_cfg.get(
+        "local_prefill_compact_models",
+        ["dflash"],
+    )
+    if isinstance(compression_local_prefill_models, str):
+        compression_local_prefill_models = [
+            p.strip()
+            for p in compression_local_prefill_models.split(",")
+            if p.strip()
+        ]
+    elif isinstance(compression_local_prefill_models, (list, tuple)):
+        compression_local_prefill_models = [
+            str(p).strip()
+            for p in compression_local_prefill_models
+            if str(p).strip()
+        ]
+    else:
+        compression_local_prefill_models = ["dflash"]
+    if not compression_local_prefill_models:
+        compression_local_prefill_models = ["dflash"]
+    agent._local_prefill_compact_tokens = compression_local_prefill_guard
+    agent._local_prefill_compact_models = tuple(compression_local_prefill_models)
     # protect_first_n is the number of non-system messages to protect at
     # the head, in addition to the system prompt (which is always
     # implicitly protected by the compressor).  Floor at 0 — a value of

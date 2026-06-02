@@ -23,11 +23,31 @@ from __future__ import annotations
 
 import logging
 import os
+import faulthandler
+import signal
 import sys
 from contextlib import redirect_stderr, redirect_stdout
 from typing import Optional
 
 from hermes_cli.fallback_config import get_fallback_chain
+
+
+def _install_oneshot_timeout_diagnostics() -> None:
+    """Allow canary supervisors to request a Python thread dump before kill."""
+    if os.getenv("HERMES_ONESHOT_FAULTHANDLER", "1").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        return
+    try:
+        faulthandler.enable(file=sys.stderr, all_threads=True)
+        sigusr1 = getattr(signal, "SIGUSR1", None)
+        if sigusr1 is not None:
+            faulthandler.register(sigusr1, file=sys.stderr, all_threads=True, chain=False)
+    except Exception:
+        pass
 
 
 def _normalize_toolsets(toolsets: object = None) -> list[str] | None:
@@ -140,12 +160,9 @@ def run_oneshot(
 
     Returns the exit code.  Caller should sys.exit() with the return.
     """
-    # Silence every stdlib logger for the duration.  AIAgent, tools, and
-    # provider adapters all log to stderr through the root logger; file
-    # handlers added by setup_logging() keep working (they're attached to
-    # the root logger's handler list, not affected by level), but no
-    # bytes reach the terminal.
-    logging.disable(logging.CRITICAL)
+    # Do not call logging.disable() here.  stdout/stderr are redirected below
+    # so terminal chatter stays hidden, while file handlers keep the provider
+    # watchdog evidence needed by automated hardening loops.
 
     # --provider without --model is ambiguous: carrying the user's configured
     # model across to a different provider is usually wrong (that provider may
@@ -175,6 +192,7 @@ def run_oneshot(
     # We'll print the final response to the real stdout at the end.
     real_stdout = sys.stdout
     real_stderr = sys.stderr
+    _install_oneshot_timeout_diagnostics()
     devnull = open(os.devnull, "w", encoding="utf-8")
 
     response: Optional[str] = None
@@ -364,7 +382,10 @@ def _run_agent(
     agent.stream_delta_callback = None
     agent.tool_gen_callback = None
 
-    return agent.chat(prompt) or ""
+    result = agent.run_conversation(prompt)
+    if result.get("failed") or (result.get("error") and not result.get("final_response")):
+        raise RuntimeError(result.get("error") or "agent failed without final response")
+    return result.get("final_response") or ""
 
 
 def _oneshot_clarify_callback(question: str, choices=None) -> str:

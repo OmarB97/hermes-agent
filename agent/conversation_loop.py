@@ -48,6 +48,7 @@ from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
     get_context_length_from_provider_error,
+    is_local_endpoint,
     parse_available_output_tokens_from_error,
     save_context_length,
 )
@@ -62,6 +63,136 @@ from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
+
+
+_DEFAULT_LOCAL_PREFILL_COMPACT_TOKENS = 80_000
+
+
+def _as_nonnegative_int(value: Any, default: int = 0) -> int:
+    try:
+        if isinstance(value, bool):
+            raise ValueError
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0, parsed)
+
+
+def _local_prefill_compact_tokens(agent: Any) -> int:
+    """Return the local-model prompt size where latency compaction starts.
+
+    The normal compression threshold protects the model context window.  Local
+    dflash has another failure mode: huge-but-valid prompts can spend minutes in
+    prefill or hit the no-first-chunk watchdog, and falling back then repeats
+    that full prefill on another local model.  This lower guard is deliberately
+    separate and can be disabled with ``0``.
+    """
+
+    env_value = os.getenv("HERMES_LOCAL_PREFILL_COMPACT_TOKENS")
+    if env_value is not None:
+        return _as_nonnegative_int(env_value, _DEFAULT_LOCAL_PREFILL_COMPACT_TOKENS)
+    return _as_nonnegative_int(
+        getattr(agent, "_local_prefill_compact_tokens", None),
+        _DEFAULT_LOCAL_PREFILL_COMPACT_TOKENS,
+    )
+
+
+def _local_prefill_model_matches(agent: Any) -> bool:
+    patterns = getattr(agent, "_local_prefill_compact_models", None)
+    if patterns is None:
+        patterns = ("dflash",)
+    elif isinstance(patterns, str):
+        patterns = [p.strip() for p in patterns.split(",")]
+
+    text = " ".join(
+        str(v or "").lower()
+        for v in (
+            getattr(agent, "model", ""),
+            getattr(agent, "provider", ""),
+            getattr(agent, "base_url", ""),
+        )
+    )
+    for pattern in patterns:
+        p = str(pattern or "").strip().lower()
+        if not p:
+            continue
+        if p in {"*", "all", "local"}:
+            return True
+        if p in text:
+            return True
+    return False
+
+
+def _should_compact_for_local_prefill_latency(agent: Any, request_tokens: int) -> bool:
+    guard_tokens = _local_prefill_compact_tokens(agent)
+    if guard_tokens <= 0 or request_tokens < guard_tokens:
+        return False
+    if not getattr(agent, "base_url", "") or not is_local_endpoint(agent.base_url):
+        return False
+    if not _local_prefill_model_matches(agent):
+        return False
+
+    compressor = getattr(agent, "context_compressor", None)
+    if getattr(compressor, "_ineffective_compression_count", 0) >= 2:
+        return False
+    return True
+
+
+def _usage_extra_value(usage: Any, key: str) -> Any:
+    if isinstance(usage, dict):
+        return usage.get(key)
+    value = getattr(usage, key, None)
+    if value is not None:
+        return value
+    for extra_name in ("model_extra", "extra", "__pydantic_extra__"):
+        extra = getattr(usage, extra_name, None)
+        if isinstance(extra, dict) and key in extra:
+            return extra.get(key)
+    return None
+
+
+def _extract_usage_cache_info(usage: Any) -> dict[str, Any] | None:
+    cache = _usage_extra_value(usage, "cache")
+    if cache is None:
+        return None
+    if not isinstance(cache, dict):
+        data = getattr(cache, "model_dump", lambda: None)()
+        if isinstance(data, dict):
+            cache = data
+        elif hasattr(cache, "__dict__"):
+            cache = dict(cache.__dict__)
+        else:
+            return None
+
+    out: dict[str, Any] = {}
+    for key in (
+        "restore",
+        "slot",
+        "prefix_tokens",
+        "prompt_tokens",
+        "effective_prompt_tokens",
+        "prefix_reuse_ratio",
+        "disk_hit",
+        "pflash_compressed",
+    ):
+        if key in cache:
+            out[key] = cache[key]
+    return out or None
+
+
+def _preflight_compression_reason(agent: Any, compressor: Any, request_tokens: int) -> tuple[str, int] | None:
+    if compressor.should_compress(request_tokens):
+        return "context_threshold", getattr(compressor, "threshold_tokens", 0) or 0
+
+    # If the normal threshold was reached but ``should_compress`` vetoed it
+    # (anti-thrash), do not bypass that veto with the latency guard.
+    threshold = getattr(compressor, "threshold_tokens", 0) or 0
+    if threshold and request_tokens >= threshold:
+        return None
+
+    if _should_compact_for_local_prefill_latency(agent, request_tokens):
+        return "local_prefill_latency", _local_prefill_compact_tokens(agent)
+    return None
 
 
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
@@ -444,6 +575,7 @@ def run_conversation(
     agent._incomplete_scratchpad_retries = 0
     agent._codex_incomplete_retries = 0
     agent._thinking_prefill_retries = 0
+    agent._malformed_final_retries = 0
     agent._post_tool_empty_retried = False
     agent._last_content_with_tools = None
     agent._last_content_tools_all_housekeeping = False
@@ -451,6 +583,9 @@ def run_conversation(
     agent._unicode_sanitization_passes = 0
     agent._tool_guardrails.reset_for_turn()
     agent._tool_guardrail_halt_decision = None
+    if hasattr(agent, "_progress_outcome_canary"):
+        agent._progress_outcome_canary.reset_for_turn()
+    agent._progress_outcome_events = []
     # True until the server rejects an image_url content part with an error
     # like "Only 'text' content type is supported."  Set to False on first
     # rejection and kept False for the rest of the session so we never re-send
@@ -491,6 +626,12 @@ def run_conversation(
         agent.platform or "unknown", len(conversation_history or []),
         _msg_preview,
     )
+    try:
+        agent._foreground_turn_generation = (
+            int(getattr(agent, "_foreground_turn_generation", 0) or 0) + 1
+        )
+    except Exception:
+        agent._foreground_turn_generation = 1
 
     # Initialize conversation (copy to avoid mutating the caller's list)
     messages = list(conversation_history) if conversation_history else []
@@ -610,6 +751,7 @@ def run_conversation(
             lambda _tokens: False,
         )
         _preflight_deferred = _defer_preflight(_preflight_tokens)
+        _preflight_reason = None
 
         if not _preflight_deferred:
             # Keep the CLI/ACP context display in sync with what preflight
@@ -636,19 +778,40 @@ def run_conversation(
                 f"{_compressor.threshold_tokens:,}",
                 f"{_compressor.last_real_prompt_tokens:,}",
             )
-        elif _compressor.should_compress(_preflight_tokens):
-            logger.info(
-                "Preflight compression: ~%s tokens >= %s threshold (model %s, ctx %s)",
-                f"{_preflight_tokens:,}",
-                f"{_compressor.threshold_tokens:,}",
-                agent.model,
-                f"{_compressor.context_length:,}",
+        else:
+            _preflight_reason = _preflight_compression_reason(
+                agent, _compressor, _preflight_tokens
             )
-            agent._emit_status(
-                f"📦 Preflight compression: ~{_preflight_tokens:,} tokens "
-                f">= {_compressor.threshold_tokens:,} threshold. "
-                "This may take a moment."
-            )
+        if not _preflight_deferred and _preflight_reason:
+            _reason, _limit = _preflight_reason
+            if _reason == "local_prefill_latency":
+                logger.info(
+                    "Local-prefill compression: ~%s tokens >= %s guard "
+                    "(model %s, ctx %s, base_url=%s)",
+                    f"{_preflight_tokens:,}",
+                    f"{_limit:,}",
+                    agent.model,
+                    f"{_compressor.context_length:,}",
+                    getattr(agent, "base_url", "") or "none",
+                )
+                agent._emit_status(
+                    f"📦 Local dflash prefill guard: ~{_preflight_tokens:,} "
+                    f"tokens >= {_limit:,}. Compacting before the local model "
+                    "spends another long turn in prefill."
+                )
+            else:
+                logger.info(
+                    "Preflight compression: ~%s tokens >= %s threshold (model %s, ctx %s)",
+                    f"{_preflight_tokens:,}",
+                    f"{_limit:,}",
+                    agent.model,
+                    f"{_compressor.context_length:,}",
+                )
+                agent._emit_status(
+                    f"📦 Preflight compression: ~{_preflight_tokens:,} tokens "
+                    f">= {_limit:,} threshold. "
+                    "This may take a moment."
+                )
             # May need multiple passes for very large sessions with small
             # context windows (each pass summarises the middle N turns).
             for _pass in range(3):
@@ -672,6 +835,7 @@ def run_conversation(
                 # context loss.
                 agent._empty_content_retries = 0
                 agent._thinking_prefill_retries = 0
+                agent._malformed_final_retries = 0
                 agent._last_content_with_tools = None
                 agent._last_content_tools_all_housekeeping = False
                 agent._mute_post_response = False
@@ -681,7 +845,10 @@ def run_conversation(
                     system_prompt=active_system_prompt or "",
                     tools=agent.tools or None,
                 )
-                if not _compressor.should_compress(_preflight_tokens):
+                _preflight_reason = _preflight_compression_reason(
+                    agent, _compressor, _preflight_tokens
+                )
+                if not _preflight_reason:
                     break  # Under threshold or anti-thrash guard stopped it
 
     # Plugin hook: pre_llm_call
@@ -792,6 +959,29 @@ def run_conversation(
             effective_task_id=effective_task_id,
             should_review_memory=_should_review_memory,
         )
+
+    # Agentic stall-retry guard: dflash can stall more than once in a long
+    # tool loop. Count total attempts for telemetry, but only consume the
+    # terminal budget when the retry lane fails to produce forward progress.
+    # A recovered tool call is work advanced, not a reason to kill the turn.
+    # See agent/stall_retry.py.
+    from agent.stall_retry import (
+        get_stall_retry_max_per_turn,
+        get_stall_retry_no_tool_recovery_max,
+        get_stall_retry_promote_after,
+    )
+
+    _stall_retry_count = 0
+    _stall_retry_success_count = 0
+    _stall_retry_failed_count = 0
+    _stall_retry_no_tool_recovery_count = 0
+    _stall_retry_max_per_turn = get_stall_retry_max_per_turn(agent)
+    _stall_retry_no_tool_recovery_max = get_stall_retry_no_tool_recovery_max(agent)
+    _stall_retry_promote_after = get_stall_retry_promote_after(agent)
+    agent._stall_retry_runtime_promoted = False
+    agent._stall_retry_events = []
+    _tool_guardrail_continue_count = 0
+    _tool_guardrail_continue_max = 2
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         # Reset per-turn checkpoint dedup so each iteration can take one snapshot
@@ -1084,6 +1274,14 @@ def run_conversation(
         approx_request_tokens = estimate_request_tokens_rough(
             api_messages, tools=agent.tools or None
         )
+        # Some local/OpenAI-compatible lanes do not return usage on streamed
+        # responses. Keep a rough request-pressure estimate available for the
+        # TUI status bar so context does not stay pinned at 0 until a provider
+        # supplies real token usage.
+        try:
+            agent._last_request_context_tokens = approx_request_tokens
+        except Exception:
+            pass
 
         _runtime_context_error = _ollama_context_limit_error(
             agent, approx_request_tokens
@@ -1856,6 +2054,19 @@ def run_conversation(
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
                     agent.context_compressor.update_from_response(usage_dict)
+                    cache_info = _extract_usage_cache_info(response.usage)
+                    if cache_info:
+                        agent._last_local_cache_usage = cache_info
+                        if is_local_endpoint(getattr(agent, "base_url", "")):
+                            logger.info(
+                                "Local cache usage: restore=%s prefix=%s/%s slot=%s disk=%s pflash=%s",
+                                cache_info.get("restore"),
+                                cache_info.get("prefix_tokens"),
+                                cache_info.get("effective_prompt_tokens"),
+                                cache_info.get("slot"),
+                                cache_info.get("disk_hit"),
+                                cache_info.get("pflash_compressed"),
+                            )
 
                     # Cache discovered context length after successful call.
                     # Only persist limits confirmed by the provider (parsed
@@ -3060,6 +3271,50 @@ def run_conversation(
                             "compression_exhausted": True,
                         }
 
+                # ── Local dflash no-first-chunk recovery ───────────────
+                # A first-chunk timeout on a huge local prompt is usually a
+                # prefill/slot problem, not proof that the next local fallback
+                # model will be cheaper.  Compact once before falling through
+                # to fallback so we do not pay a second full long-context
+                # prefill on taro's single large-model slot.
+                if classified.reason == FailoverReason.local_first_chunk_timeout:
+                    _first_chunk_meta = classified.error_context or {}
+                    _ctx_tokens = _as_nonnegative_int(
+                        _first_chunk_meta.get("context_tokens"),
+                        approx_request_tokens or approx_tokens or 0,
+                    )
+                    if (
+                        agent.compression_enabled
+                        and _should_compact_for_local_prefill_latency(agent, _ctx_tokens)
+                        and compression_attempts < max_compression_attempts
+                    ):
+                        compression_attempts += 1
+                        original_len = len(messages)
+                        agent._buffer_status(
+                            f"🗜️ Local dflash produced no first chunk at "
+                            f"~{_ctx_tokens:,} tokens — compacting before "
+                            f"fallback ({compression_attempts}/{max_compression_attempts})."
+                        )
+                        messages, active_system_prompt = agent._compress_context(
+                            messages,
+                            system_message,
+                            approx_tokens=_ctx_tokens,
+                            task_id=effective_task_id,
+                        )
+                        conversation_history = None
+                        if len(messages) < original_len:
+                            agent._buffer_status(
+                                f"🗜️ Compressed {original_len} → {len(messages)} "
+                                "messages, retrying local dflash before fallback."
+                            )
+                            time.sleep(2)
+                            restart_with_compressed_messages = True
+                            break
+                        agent._buffer_status(
+                            "⚠️ Local dflash compaction made no progress; "
+                            "falling through to fallback."
+                        )
+
                 # Check for non-retryable client errors.  The classifier
                 # already accounts for 413, 429, 529 (transient), context
                 # overflow, and generic-400 heuristics.  Local validation
@@ -3139,7 +3394,19 @@ def run_conversation(
                     # session looks like it's recovering when it's about to
                     # abort silently (#35314, #17446).
                     if agent._has_pending_fallback():
-                        if classified.reason == FailoverReason.content_policy_blocked:
+                        if classified.reason == FailoverReason.local_first_chunk_timeout:
+                            meta = classified.error_context or {}
+                            waited = meta.get("elapsed")
+                            waited_text = (
+                                f" after {int(waited)}s"
+                                if isinstance(waited, (int, float)) and waited > 0
+                                else ""
+                            )
+                            agent._buffer_status(
+                                "⚠️ Local dflash produced no first chunk"
+                                f"{waited_text} — trying fallback..."
+                            )
+                        elif classified.reason == FailoverReason.content_policy_blocked:
                             agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
@@ -3274,6 +3541,25 @@ def run_conversation(
                     }
 
                 if retry_count >= max_retries:
+                    if classified.reason == FailoverReason.local_first_chunk_timeout:
+                        if agent._has_pending_fallback():
+                            meta = classified.error_context or {}
+                            waited = meta.get("elapsed")
+                            waited_text = (
+                                f" after {int(waited)}s"
+                                if isinstance(waited, (int, float)) and waited > 0
+                                else ""
+                            )
+                            agent._buffer_status(
+                                "⚠️ Local dflash produced no first chunk"
+                                f"{waited_text} — trying fallback..."
+                            )
+                        if agent._try_activate_fallback(reason=classified.reason):
+                            retry_count = 0
+                            compression_attempts = 0
+                            primary_recovery_attempted = False
+                            continue
+                        primary_recovery_attempted = True
                     # Before falling back, try rebuilding the primary
                     # client once for transient transport errors (stale
                     # connection pool, TCP reset).  Only attempted once
@@ -3647,7 +3933,319 @@ def run_conversation(
                 }
             elif hasattr(agent, "_codex_incomplete_retries"):
                 agent._codex_incomplete_retries = 0
-            
+
+            # ── Agentic stall-retry (opt-in via HERMES_STALL_RETRY_MODEL) ──
+            # dflash Q4 can stop right after an action preamble ("Let me
+            # check X") without producing the promised tool_call. Retry the
+            # configured higher-quality lane before the final-response branch
+            # sees it. The retry request carries a tiny recovery nudge, but
+            # the synthetic nudge is not persisted to the real session. If
+            # the retry returns tool calls, fall through to the normal
+            # executor below in this same loop iteration. If it still returns
+            # no tool call, feed a bounded corrective continuation back into
+            # the same turn before finally failing as partial; this prevents
+            # one bad retry-lane sample from killing long mobile sessions.
+            from agent.stall_retry import (
+                EMPTY_AFTER_TOOL_RETRY_NUDGE,
+                FAILED_STALL_RETRY_RECOVERY_NUDGE,
+                activate_stall_retry_runtime,
+                get_stall_retry_max_chars,
+                get_stall_retry_model,
+                has_recent_tool_result,
+                looks_like_incomplete_final_fragment,
+                looks_like_stall,
+                record_stall_retry_event,
+                retry_on_stall,
+                stall_retry_summary,
+            )
+
+            retry_model = get_stall_retry_model(agent)
+            # dflash can also return a true empty response immediately after a
+            # substantive tool result. The normal empty-response path retries
+            # the same model, then falls through to the generic fallback chain.
+            # For local dflash that is backwards: first try the configured
+            # higher-quality local lane on the same exact turn so the agent can
+            # either continue with another tool call or produce visible text.
+            _empty_after_tool_result = (
+                getattr(agent, "tools", None)
+                and not getattr(assistant_message, "tool_calls", None)
+                and not agent._strip_think_blocks(
+                    assistant_message.content or ""
+                ).strip()
+                and has_recent_tool_result(messages)
+            )
+            if (
+                retry_model
+                and _empty_after_tool_result
+                and _stall_retry_failed_count < _stall_retry_max_per_turn
+            ):
+                try:
+                    record_stall_retry_event(
+                        agent,
+                        "detected",
+                        finish_reason=finish_reason,
+                        api_call=api_call_count,
+                        retry_count=_stall_retry_count,
+                        max_per_turn=_stall_retry_max_per_turn,
+                        content="empty_after_tool_result",
+                    )
+                    _stall_retry_count += 1
+                    retried = retry_on_stall(
+                        agent,
+                        api_messages,
+                        finish_reason,
+                        stalled_content="",
+                        retry_index=_stall_retry_count,
+                        accept_content=True,
+                        retry_nudge=EMPTY_AFTER_TOOL_RETRY_NUDGE,
+                    )
+                    if retried is not None:
+                        assistant_message = retried
+                        finish_reason = (
+                            getattr(retried, "finish_reason", None)
+                            or (
+                                "tool_calls"
+                                if getattr(retried, "tool_calls", None)
+                                else "stop"
+                            )
+                        )
+                        agent._empty_content_retries = 0
+                        agent._post_tool_empty_retried = False
+                        _stall_retry_success_count += 1
+                        _stall_retry_failed_count = 0
+                        if (
+                            getattr(retried, "tool_calls", None)
+                            and _stall_retry_promote_after > 0
+                            and _stall_retry_success_count >= _stall_retry_promote_after
+                        ):
+                            activate_stall_retry_runtime(
+                                agent,
+                                retry_model,
+                                promote_after=_stall_retry_promote_after,
+                                successful_retries=_stall_retry_success_count,
+                            )
+                    else:
+                        _stall_retry_failed_count += 1
+                        logger.warning(
+                            "Stall retry lane did not recover empty post-tool "
+                            "response; continuing empty-response recovery "
+                            "(model=%s provider=%s)",
+                            agent.model,
+                            agent.provider,
+                        )
+                except Exception as exc:
+                    record_stall_retry_event(
+                        agent,
+                        "exception",
+                        error_type=type(exc).__name__,
+                        error=str(exc)[:300],
+                    )
+                    logger.warning(
+                        "Stall retry lane failed during empty post-tool "
+                        "recovery; continuing empty-response recovery",
+                        exc_info=True,
+                    )
+
+            if (
+                retry_model
+                and getattr(agent, "tools", None)
+                and not getattr(assistant_message, "tool_calls", None)
+                and not _empty_after_tool_result
+                and not agent._detect_malformed_tool_final_response(
+                    assistant_message.content or "",
+                    finish_reason,
+                    messages,
+                )
+            ):
+                max_chars = get_stall_retry_max_chars(agent)
+                try:
+                    stalled_content = assistant_message.content or ""
+                    _retry_accepts_content = looks_like_incomplete_final_fragment(
+                        stalled_content,
+                        finish_reason,
+                        False,
+                        max_chars,
+                    )
+                    if looks_like_stall(
+                        stalled_content,
+                        finish_reason,
+                        False,
+                        max_chars,
+                    ):
+                        record_stall_retry_event(
+                            agent,
+                            "detected",
+                            finish_reason=finish_reason,
+                            api_call=api_call_count,
+                            retry_count=_stall_retry_count,
+                            max_per_turn=_stall_retry_max_per_turn,
+                            content=stalled_content,
+                        )
+                        if _stall_retry_max_per_turn <= 0:
+                            _turn_exit_reason = "stall_retry_limit_exhausted"
+                            record_stall_retry_event(
+                                agent,
+                                "limit_exhausted",
+                                finish_reason=finish_reason,
+                                api_call=api_call_count,
+                                retry_count=_stall_retry_count,
+                                max_per_turn=_stall_retry_max_per_turn,
+                                content=stalled_content,
+                            )
+                            agent._mute_post_response = False
+                            agent._vprint(
+                                (
+                                    f"{agent.log_prefix}❌ Stall retry limit "
+                                    f"({_stall_retry_max_per_turn}/turn) disabled; "
+                                    "saving as partial without storing the "
+                                    "planning-only assistant turn."
+                                ),
+                                force=True,
+                            )
+                            agent._cleanup_task_resources(effective_task_id)
+                            agent._persist_session(messages, conversation_history)
+                            return {
+                                "final_response": None,
+                                "messages": messages,
+                                "api_calls": api_call_count,
+                                "completed": False,
+                                "partial": True,
+                                "failed": True,
+                                "error": (
+                                    "Model repeatedly stopped after an agentic "
+                                    "preamble with no tool call; configured stall "
+                                    "retry limit was exhausted."
+                                ),
+                                "failure_subclass": "stall_retry_limit_exhausted",
+                                "stall_retry": stall_retry_summary(agent),
+                            }
+                        _stall_retry_count += 1
+                        retried = retry_on_stall(
+                            agent,
+                            api_messages,
+                            finish_reason,
+                            stalled_content=stalled_content,
+                            retry_index=_stall_retry_count,
+                            accept_content=_retry_accepts_content,
+                        )
+                        if retried is not None and (
+                            getattr(retried, "tool_calls", None) or _retry_accepts_content
+                        ):
+                            assistant_message = retried
+                            finish_reason = getattr(retried, "finish_reason", None) or (
+                                "tool_calls"
+                                if getattr(retried, "tool_calls", None)
+                                else "stop"
+                            )
+                            if getattr(retried, "tool_calls", None) and finish_reason != "tool_calls":
+                                finish_reason = "tool_calls"
+                            _stall_retry_success_count += 1
+                            _stall_retry_failed_count = 0
+                            if (
+                                getattr(retried, "tool_calls", None)
+                                and _stall_retry_promote_after > 0
+                                and _stall_retry_success_count >= _stall_retry_promote_after
+                            ):
+                                activate_stall_retry_runtime(
+                                    agent,
+                                    retry_model,
+                                    promote_after=_stall_retry_promote_after,
+                                    successful_retries=_stall_retry_success_count,
+                                )
+                        else:
+                            _stall_retry_failed_count += 1
+                            if (
+                                _stall_retry_no_tool_recovery_count
+                                < _stall_retry_no_tool_recovery_max
+                            ):
+                                _stall_retry_no_tool_recovery_count += 1
+                                record_stall_retry_event(
+                                    agent,
+                                    "no_tool_recovery_prompt",
+                                    finish_reason=finish_reason,
+                                    api_call=api_call_count,
+                                    retry_count=_stall_retry_count,
+                                    failed_count=_stall_retry_failed_count,
+                                    recovery_count=_stall_retry_no_tool_recovery_count,
+                                    recovery_max=_stall_retry_no_tool_recovery_max,
+                                    content=stalled_content,
+                                )
+                                agent._vprint(
+                                    (
+                                        f"{agent.log_prefix}↻ Stall retry still "
+                                        "returned no tool call; feeding a bounded "
+                                        "same-turn correction back to the model "
+                                        f"({_stall_retry_no_tool_recovery_count}/"
+                                        f"{_stall_retry_no_tool_recovery_max})."
+                                    ),
+                                    force=True,
+                                )
+                                assistant_msg = agent._build_assistant_message(
+                                    assistant_message,
+                                    finish_reason,
+                                )
+                                messages.append(assistant_msg)
+                                messages.append(
+                                    {
+                                        "role": "user",
+                                        "content": FAILED_STALL_RETRY_RECOVERY_NUDGE,
+                                    }
+                                )
+                                agent._session_messages = messages
+                                continue
+                            _turn_exit_reason = "stall_retry_failed_no_tool_call"
+                            agent._mute_post_response = False
+                            agent._vprint(
+                                (
+                                    f"{agent.log_prefix}❌ Stall retry did not produce "
+                                    "tool calls; saving as partial without storing the "
+                                    "planning-only assistant turn."
+                                ),
+                                force=True,
+                            )
+                            agent._cleanup_task_resources(effective_task_id)
+                            agent._persist_session(messages, conversation_history)
+                            return {
+                                "final_response": None,
+                                "messages": messages,
+                                "api_calls": api_call_count,
+                                "completed": False,
+                                "partial": True,
+                                "failed": True,
+                                "error": (
+                                    "Model stopped after an action preamble with no "
+                                    "tool call; configured stall retry also produced "
+                                    "no tool call."
+                                ),
+                                "failure_subclass": "stall_retry_failed_no_tool_call",
+                                "stall_retry": stall_retry_summary(agent),
+                            }
+                except Exception as exc:
+                    _turn_exit_reason = "stall_retry_exception"
+                    record_stall_retry_event(
+                        agent,
+                        "exception",
+                        error_type=type(exc).__name__,
+                        error=str(exc)[:300],
+                    )
+                    agent._mute_post_response = False
+                    agent._vprint(
+                        f"{agent.log_prefix}❌ Stall retry failed before recovery: {exc}",
+                        force=True,
+                    )
+                    agent._cleanup_task_resources(effective_task_id)
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": None,
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "partial": True,
+                        "failed": True,
+                        "error": f"Stall retry failed before recovery: {exc}",
+                        "failure_subclass": "stall_retry_exception",
+                        "stall_retry": stall_retry_summary(agent),
+                    }
             # Check for tool calls
             if assistant_message.tool_calls:
                 if not agent.quiet_mode:
@@ -3861,6 +4459,7 @@ def run_conversation(
                 if _had_prefill:
                     agent._thinking_prefill_retries = 0
                     agent._empty_content_retries = 0
+                    agent._malformed_final_retries = 0
                 # Successful tool execution — reset the post-tool nudge
                 # flag so it can fire again if the model goes empty on
                 # a LATER tool round.
@@ -3881,10 +4480,29 @@ def run_conversation(
                     except Exception:
                         pass
 
+                _tool_results_start = len(messages)
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
+                    if (
+                        decision.code == "tool_reported_loop_block"
+                        and _tool_guardrail_continue_count < _tool_guardrail_continue_max
+                    ):
+                        _tool_guardrail_continue_count += 1
+                        agent._tool_guardrail_halt_decision = None
+                        recovery_prompt = agent._toolguard_recovery_prompt(decision)
+                        agent._emit_status(
+                            f"Tool guardrail redirected {decision.tool_name}; continuing with a new strategy"
+                        )
+                        messages.append({
+                            "role": "user",
+                            "content": recovery_prompt,
+                            "_tool_guardrail_recovery": True,
+                        })
+                        agent._stream_needs_break = True
+                        continue
+
                     _turn_exit_reason = "guardrail_halt"
                     final_response = agent._toolguard_controlled_halt_response(decision)
                     agent._emit_status(
@@ -3905,6 +4523,18 @@ def run_conversation(
                             except Exception:
                                 pass
                     break
+
+                _progress_decision = agent._observe_progress_outcome(
+                    assistant_message.tool_calls,
+                    messages[_tool_results_start:],
+                )
+                if _progress_decision is not None:
+                    agent._emit_status("Progress canary nudged the model to pick a concrete outcome")
+                    messages.append({
+                        "role": "user",
+                        "content": _progress_decision.message,
+                        "_progress_outcome_canary": True,
+                    })
 
                 # Reset per-turn retry counters after successful tool
                 # execution so a single truncation doesn't poison the
@@ -3983,7 +4613,7 @@ def run_conversation(
             else:
                 # No tool calls - this is the final response
                 final_response = assistant_message.content or ""
-                
+
                 # Fix: unmute output when entering the no-tool-call branch
                 # so the user can see empty-response warnings and recovery
                 # status messages.  _mute_post_response was set during a
@@ -4253,6 +4883,76 @@ def run_conversation(
                 # Reset retry counter/signature on successful content
                 agent._empty_content_retries = 0
                 agent._thinking_prefill_retries = 0
+
+                malformed_final_reason = agent._detect_malformed_tool_final_response(
+                    final_response,
+                    finish_reason,
+                    messages,
+                )
+                if malformed_final_reason:
+                    agent._malformed_final_retries += 1
+                    logger.warning(
+                        "Malformed final response after tool calls (%s) — "
+                        "recovery attempt %d (model=%s provider=%s)",
+                        malformed_final_reason,
+                        agent._malformed_final_retries,
+                        agent.model,
+                        agent.provider,
+                    )
+                    agent._buffer_status(
+                        "⚠️ Model returned a malformed final response after "
+                        f"tool calls — retrying ({agent._malformed_final_retries}/2)"
+                    )
+                    if agent._malformed_final_retries == 1:
+                        recovery_msg = agent._build_assistant_message(
+                            assistant_message,
+                            finish_reason,
+                        )
+                        recovery_msg["content"] = "[malformed final response omitted]"
+                        recovery_msg["_malformed_final_recovery_synthetic"] = True
+                        messages.append(recovery_msg)
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "The previous final response was malformed. "
+                                "Regenerate a concise, complete final answer "
+                                "from the tool results above. Do not repeat "
+                                "punctuation or stop mid-word."
+                            ),
+                            "_malformed_final_recovery_synthetic": True,
+                        })
+                        agent._session_messages = messages
+                        continue
+
+                    if agent._fallback_chain:
+                        agent._buffer_status(
+                            "⚠️ Malformed final response repeated — "
+                            "switching to fallback provider..."
+                        )
+                        if agent._try_activate_fallback():
+                            agent._buffer_status(
+                                f"↻ Switched to fallback: {agent.model} "
+                                f"({agent.provider})"
+                            )
+                            continue
+
+                    agent._flush_status_buffer()
+                    _turn_exit_reason = "malformed_final_exhausted"
+                    assistant_msg = agent._build_assistant_message(
+                        assistant_message,
+                        finish_reason,
+                    )
+                    assistant_msg["content"] = "(malformed final response)"
+                    assistant_msg["_malformed_final_recovery_synthetic"] = True
+                    messages.append(assistant_msg)
+                    final_response = (
+                        "Model returned a malformed final response after "
+                        "tool calls and recovery was exhausted. Try again "
+                        "or switch providers."
+                    )
+                    break
+
+                agent._malformed_final_retries = 0
                 # Successful content reached — drop any buffered retry
                 # status from earlier failed attempts in this turn.
                 agent._clear_status_buffer()
@@ -4305,6 +5005,7 @@ def run_conversation(
                         messages[-1].get("_thinking_prefill")
                         or messages[-1].get("_empty_recovery_synthetic")
                         or messages[-1].get("_empty_terminal_sentinel")
+                        or messages[-1].get("_malformed_final_recovery_synthetic")
                     )
                 ):
                     messages.pop()
@@ -4675,6 +5376,17 @@ def run_conversation(
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
+    _progress_events = getattr(agent, "_progress_outcome_events", None) or []
+    if _progress_events:
+        result["progress_outcome_canary"] = list(_progress_events)
+    try:
+        from agent.stall_retry import stall_retry_summary
+
+        _stall_retry = stall_retry_summary(agent)
+        if _stall_retry:
+            result["stall_retry"] = _stall_retry
+    except Exception:
+        pass
     # If a /steer landed after the final assistant turn (no more tool
     # batches to drain into), hand it back to the caller so it can be
     # delivered as the next user turn instead of being silently lost.
