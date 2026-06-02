@@ -26,11 +26,13 @@ def test_incomplete_tail_classifier_catches_short_connector_fragment():
     assert not canary.looks_like_incomplete_tail("CANARY_ONBOARD_OK")
 
 
-def test_classify_result_requires_exact_marker():
+def test_classify_result_requires_standalone_marker_line():
     ok = canary.CommandResult(returncode=0, stdout="CANARY_ONBOARD_OK\n", stderr="", elapsed_s=1.0)
+    prose = canary.CommandResult(returncode=0, stdout="Done.\nCANARY_ONBOARD_OK\n", stderr="", elapsed_s=1.0)
     noisy = canary.CommandResult(returncode=0, stdout="Done. CANARY_ONBOARD_OK\n", stderr="", elapsed_s=1.0)
 
     assert canary.classify_result(ok, "CANARY_ONBOARD_OK") is None
+    assert canary.classify_result(prose, "CANARY_ONBOARD_OK") is None
     assert canary.classify_result(noisy, "CANARY_ONBOARD_OK") == "marker-mismatch"
     assert canary.classify_result(noisy, "CANARY_ONBOARD_OK", strict_marker=False) is None
 
@@ -78,6 +80,7 @@ def test_build_command_includes_model_provider_toolsets():
         "dflash",
         "--toolsets",
         "terminal,file",
+        "--ignore-rules",
         "-z",
         "reply OK",
     ]
