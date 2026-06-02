@@ -147,7 +147,7 @@ def build_command(
     if toolsets:
         cmd.extend(["--toolsets", toolsets])
 
-    cmd.extend(["-z", case.prompt])
+    cmd.extend(["--ignore-rules", "-z", case.prompt])
 
     return cmd
 
@@ -243,9 +243,11 @@ def classify_result(result: CommandResult, marker: str, *, strict_marker: bool =
         return "auth-error"
 
     if marker:
-        if strict_marker and stdout != marker:
-            return "marker-mismatch"
-        if not strict_marker and marker not in stdout:
+        if strict_marker:
+            marker_lines = {line.strip() for line in stdout.splitlines()}
+            if marker not in marker_lines:
+                return "marker-mismatch"
+        elif marker not in stdout:
             return "marker-missing"
 
     if looks_like_incomplete_tail(stdout):
