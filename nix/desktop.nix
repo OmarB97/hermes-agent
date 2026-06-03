@@ -106,6 +106,14 @@ stdenv.mkDerivation {
     runHook postInstall
   '';
 
+  passthru = {
+    npmLockfile = {
+      attr = "desktop";
+      folder = "apps/desktop";
+      nixFile = "nix/desktop.nix";
+    };
+  };
+
   meta = with lib; {
     description = "Native Electron desktop shell for Hermes Agent";
     homepage = "https://github.com/NousResearch/hermes-agent";
