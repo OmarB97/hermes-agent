@@ -1420,8 +1420,6 @@ async function applyUpdatesPosixInApp(opts = {}) {
     return { ok: true, manual: true, command: 'hermes update', hermesRoot: updateRoot }
   }
 
-  // Put the Hermes-managed Node and the venv on PATH so `hermes desktop`'s
-  // npm build can find them on a machine with no system Node.
   const extraPath = [path.join(HERMES_HOME, 'node', 'bin'), path.join(updateRoot, 'venv', 'bin')]
     .filter(Boolean)
     .join(path.delimiter)
@@ -1430,20 +1428,10 @@ async function applyUpdatesPosixInApp(opts = {}) {
     PATH: [extraPath, process.env.PATH].filter(Boolean).join(path.delimiter)
   }
 
-  // `hermes update` reaps stale `hermes dashboard` backends (a code update
-  // leaves the running process serving old Python against the freshly-updated
-  // JS bundle). But OUR backend is one of those processes, and killing it
-  // mid-update produces the boot→kill→crash loop in #37532 — the desktop
-  // already restarts its own backend via the rebuild+relaunch below, so the
-  // reap must spare it. Hand the live backend's PID to the update process;
-  // _kill_stale_dashboard_processes reads HERMES_DESKTOP_CHILD_PID and excludes
-  // it while still reaping any genuinely-orphaned dashboards. (#37532)
   if (hermesProcess && Number.isInteger(hermesProcess.pid)) {
     env.HERMES_DESKTOP_CHILD_PID = String(hermesProcess.pid)
   }
 
-  // Branch-pin so a non-main checkout doesn't get switched to main (and self-heal
-  // to main when the pinned branch no longer exists on origin).
   let branchArgs = []
   try {
     const head = await runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: updateRoot })
@@ -1455,7 +1443,7 @@ async function applyUpdatesPosixInApp(opts = {}) {
     // best effort
   }
 
-  emitUpdateProgress({ stage: 'update', message: 'Updating Hermes (git + dependencies)…', percent: 10 })
+  emitUpdateProgress({ stage: 'update', message: 'Updating Hermes (git + dependencies)...', percent: 10 })
   const updated = await runStreamedUpdate(hermes, ['update', '--yes', ...branchArgs], {
     cwd: updateRoot,
     env,
@@ -1466,7 +1454,7 @@ async function applyUpdatesPosixInApp(opts = {}) {
     return { ok: false, error: 'hermes update failed' }
   }
 
-  emitUpdateProgress({ stage: 'rebuild', message: 'Rebuilding the desktop app…', percent: 60 })
+  emitUpdateProgress({ stage: 'rebuild', message: 'Rebuilding the desktop app...', percent: 60 })
   const rebuilt = await runStreamedUpdate(hermes, ['desktop', '--build-only'], {
     cwd: updateRoot,
     env,
@@ -1487,8 +1475,6 @@ async function applyUpdatesPosixInApp(opts = {}) {
   ].find(directoryExists)
   const targetApp = runningAppBundle()
 
-  // No bundle to swap (dev run, Linux AppImage, or unresolved paths): the
-  // backend is updated; the next launch picks up the rebuilt GUI.
   if (!rebuiltApp || !targetApp) {
     emitUpdateProgress({
       stage: 'done',
@@ -1498,55 +1484,41 @@ async function applyUpdatesPosixInApp(opts = {}) {
     return { ok: true, backendUpdated: true, rebuiltApp: rebuiltApp || null }
   }
 
-  emitUpdateProgress({ stage: 'restart', message: 'Installing the updated app and restarting…', percent: 95 })
+  emitUpdateProgress({ stage: 'restart', message: 'Installing the updated app and restarting...', percent: 95 })
 
-  // Detached swapper: wait for THIS process to exit (so the bundle is free),
-  // then atomically replace the running .app, clear quarantine, and reopen it.
-  // If the swap fails, fall back to launching the freshly rebuilt bundle
-  // directly so we do not leave the user with a dead quit.
-  const swapScript = `#!/bin/bash
-set -euo pipefail
-APP_PID=${process.pid}
-SRC=${shellQuote(rebuiltApp)}
-DST=${shellQuote(targetApp)}
-for _ in $(seq 1 240); do
-  kill -0 "$APP_PID" 2>/dev/null || break
-  sleep 0.5
-done
-cleanup() { rm -rf "$DST.hermes-update-old" 2>/dev/null || true; }
-trap cleanup EXIT
-if [ "$SRC" != "$DST" ]; then
-  if ! /usr/bin/ditto "$SRC" "$DST.hermes-update-new"; then
-    echo "[updates] ditto failed" >&2
-    /usr/bin/open "$SRC"
-    exit 0
-  fi
-  mv "$DST" "$DST.hermes-update-old" 2>/dev/null || rm -rf "$DST"
-  if ! mv "$DST.hermes-update-new" "$DST"; then
-    echo "[updates] destination replace failed" >&2
-    /usr/bin/open "$SRC"
-    exit 0
-  fi
-  rm -rf "$DST.hermes-update-old" 2>/dev/null || true
-fi
-/usr/bin/xattr -dr com.apple.quarantine "$DST" 2>/dev/null || true
-/usr/bin/open "$DST"
-`
   const scriptPath = path.join(app.getPath('temp'), `hermes-desktop-update-${Date.now()}.sh`)
+  const script = [
+    '#!/bin/bash',
+    'set -uo pipefail',
+    `APP_PID=${process.pid}`,
+    `SRC=${shellQuote(rebuiltApp)}`,
+    `DST=${shellQuote(targetApp)}`,
+    '',
+    'while kill -0 "$APP_PID" 2>/dev/null; do sleep 0.5; done || true',
+    '',
+    'sleep 1',
+    'if [ "$SRC" != "$DST" ]; then',
+    '  /usr/bin/ditto "$SRC" "$DST.hermes-update-new"',
+    '  mv "$DST" "$DST.hermes-update-old" 2>/dev/null || rm -rf "$DST"',
+    '  mv "$DST.hermes-update-new" "$DST"',
+    'fi',
+    '/usr/bin/xattr -dr com.apple.quarantine "$DST" 2>/dev/null || true',
+    'nohup /usr/bin/open -a "$DST" >/dev/null 2>&1 &',
+  ].join('\n') + '\n'
+
   try {
-    fs.writeFileSync(scriptPath, swapScript, { mode: 0o755 })
+    fs.writeFileSync(scriptPath, script, { mode: 0o755 })
   } catch (err) {
     emitUpdateProgress({
       stage: 'done',
-      message: 'Backend + app updated. Restart Hermes to load the new version.',
+      message: 'Backend updated. Restart Hermes to load the new version.',
       percent: 100
     })
     rememberLog(`[updates] could not write swap script: ${err.message}; rebuilt app at ${rebuiltApp}`)
     return { ok: true, backendUpdated: true, rebuiltApp }
   }
 
-  const child = spawn('/bin/bash', [scriptPath], { detached: true, stdio: 'ignore' })
-  child.unref()
+  spawn('launchctl', ['asuser', String(process.getuid()), 'bash', scriptPath], { detached: true, stdio: 'ignore' }).unref()
   rememberLog(`[updates] launched mac swap+relaunch: ${scriptPath} (${rebuiltApp} -> ${targetApp})`)
 
   setTimeout(() => app.quit(), 600)
