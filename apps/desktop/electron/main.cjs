@@ -1452,12 +1452,17 @@ async function applyUpdatesPosixInApp(opts = {}) {
 
   // Detached swapper: wait for THIS process to exit (so the bundle is free),
   // ditto the rebuilt app over the running one, clear quarantine, relaunch.
+  // If the first relaunch dies within 3s, try twice more so silent macOS
+  // Gatekeeper/broker failures don't leave the user staring at a closed app.
   const swapScript = `#!/bin/bash
-set -u
+set -eu
 APP_PID=${process.pid}
 SRC=${shellQuote(rebuiltApp)}
 DST=${shellQuote(targetApp)}
-for _ in $(seq 1 240); do
+ATTEMPTS=3
+WAIT=3
+QUIT_AFTER=240
+for _ in $(seq 1 "$QUIT_AFTER"); do
   kill -0 "$APP_PID" 2>/dev/null || break
   sleep 0.5
 done
@@ -1471,6 +1476,17 @@ if [ "$SRC" != "$DST" ]; then
 fi
 /usr/bin/xattr -dr com.apple.quarantine "$DST" 2>/dev/null || true
 /usr/bin/open "$DST"
+sleep "$WAIT"
+i=1
+while [ "$i" -lt "$ATTEMPTS" ]; do
+  if pgrep -x "$(basename "$DST" .app)" >/dev/null 2>&1; then
+    break
+  fi
+  /usr/bin/open "$DST"
+  sleep "$WAIT"
+  i=$((i + 1))
+done
+exit 0
 `
   const scriptPath = path.join(app.getPath('temp'), `hermes-desktop-update-${Date.now()}.sh`)
   try {
