@@ -420,6 +420,7 @@ class SessionDB:
             self._conn.row_factory = sqlite3.Row
             apply_wal_with_fallback(self._conn, db_label="state.db")
             self._conn.execute("PRAGMA foreign_keys=ON")
+            self._conn.execute("PRAGMA busy_timeout = 5000")
 
             self._init_schema()
         except Exception as exc:
