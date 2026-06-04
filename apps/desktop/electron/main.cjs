@@ -1645,6 +1645,11 @@ function isBootstrapComplete() {
   return isHermesSourceRoot(ACTIVE_HERMES_ROOT) && fileExists(getVenvPython(VENV_ROOT))
 }
 
+function hasRunnableActiveInstall() {
+  const venvPython = getVenvPython(VENV_ROOT)
+  return isHermesSourceRoot(ACTIVE_HERMES_ROOT) && fileExists(venvPython) && canImportHermesCli(venvPython)
+}
+
 function writeBootstrapMarker(payload) {
   fs.mkdirSync(path.dirname(BOOTSTRAP_COMPLETE_MARKER), { recursive: true })
   const merged = {
@@ -1805,6 +1810,13 @@ function resolveHermesBackend(dashboardArgs) {
   //    to spawning hermes. Updates flow through the in-app update path
   //    (applyUpdates -> git pull) or `hermes update` from the CLI.
   if (isBootstrapComplete()) {
+    return createActiveBackend(dashboardArgs)
+  }
+
+  if (hasRunnableActiveInstall()) {
+    rememberLog(
+      `Using existing Hermes install at ${ACTIVE_HERMES_ROOT}: venv imports hermes_cli even though bootstrap marker is missing.`
+    )
     return createActiveBackend(dashboardArgs)
   }
 
