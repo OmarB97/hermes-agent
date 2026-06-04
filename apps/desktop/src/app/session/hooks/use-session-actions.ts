@@ -15,6 +15,7 @@ import { requestDesktopOnboarding } from '@/store/onboarding'
 import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import {
   $currentCwd,
+  $desktopYoloDefault,
   $messages,
   $sessions,
   $yoloActive,
@@ -311,6 +312,7 @@ export function useSessionActions({
       // New chats inherit the current workspace.
       setCurrentCwd(getRememberedWorkspaceCwd())
       setCurrentBranch('')
+      setYoloActive($desktopYoloDefault.get())
       clearComposerDraft()
       clearComposerAttachments()
       setFreshDraftReady(true)
