@@ -5,6 +5,7 @@ import { BUILTIN_PERSONALITIES, normalizePersonalityValue, personalityNamesFromC
 import { desktopYoloDefaultFromConfig } from '@/lib/yolo-session'
 import {
   $currentCwd,
+  $freshDraftReady,
   setAvailablePersonalities,
   setCurrentCwd,
   setCurrentFastMode,
@@ -67,7 +68,7 @@ export function useHermesConfig({ activeSessionIdRef, refreshProjectBranch }: He
       setCurrentServiceTier(prev => (activeSessionIdRef.current ? prev : tier))
       setCurrentFastMode(prev => (activeSessionIdRef.current ? prev : FAST_TIERS.has(tier.toLowerCase())))
       setDesktopYoloDefaultActive(yoloDefault)
-      setYoloActive(prev => (activeSessionIdRef.current ? prev : yoloDefault))
+      setYoloActive(prev => (activeSessionIdRef.current && !$freshDraftReady.get() ? prev : yoloDefault))
 
       setVoiceMaxRecordingSeconds(recordingLimit(config.voice?.max_recording_seconds))
       setSttEnabled(config.stt?.enabled !== false)

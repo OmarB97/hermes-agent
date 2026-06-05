@@ -7,7 +7,7 @@ import {
   setYoloActive
 } from '@/store/session'
 
-import { desktopYoloDefaultFromConfig, setDesktopYoloDefault } from './yolo-session'
+import { desktopYoloDefaultFromConfig, desktopYoloEnabledForNewSession, setDesktopYoloDefault } from './yolo-session'
 
 describe('desktop YOLO preference', () => {
   beforeEach(() => {
@@ -23,6 +23,25 @@ describe('desktop YOLO preference', () => {
   it('honors an explicit saved desktop YOLO preference', () => {
     expect(desktopYoloDefaultFromConfig({ desktop: { yolo_default: false } })).toBe(false)
     expect(desktopYoloDefaultFromConfig({ desktop: { yolo_default: true } })).toBe(true)
+  })
+
+  it('arms new sessions from the durable desktop default when transient state is off', () => {
+    setDesktopYoloDefaultActive(true)
+    setYoloActive(false)
+
+    expect(desktopYoloEnabledForNewSession()).toBe(true)
+
+    setDesktopYoloDefaultActive(false)
+    setYoloActive(false)
+
+    expect(desktopYoloEnabledForNewSession()).toBe(false)
+  })
+
+  it('keeps an explicitly armed draft on even when the durable default is off', () => {
+    setDesktopYoloDefaultActive(false)
+    setYoloActive(true)
+
+    expect(desktopYoloEnabledForNewSession()).toBe(true)
   })
 
   it('persists the desktop YOLO default without dropping other desktop config', async () => {

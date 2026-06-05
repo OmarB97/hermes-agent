@@ -6,7 +6,7 @@ import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
 import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
 import { embeddedImageUrls, textWithoutEmbeddedImages } from '@/lib/embedded-images'
-import { setSessionYolo } from '@/lib/yolo-session'
+import { desktopYoloEnabledForNewSession, setSessionYolo } from '@/lib/yolo-session'
 import { clearComposerAttachments, clearComposerDraft } from '@/store/composer'
 import { clearQueuedPrompts } from '@/store/composer-queue'
 import { $pinnedSessionIds } from '@/store/layout'
@@ -18,7 +18,6 @@ import {
   $desktopYoloDefault,
   $messages,
   $sessions,
-  $yoloActive,
   getRememberedWorkspaceCwd,
   sessionPinId,
   setActiveSessionId,
@@ -363,7 +362,7 @@ export function useSessionActions({
         setActiveSessionId(created.session_id)
         setSelectedStoredSessionId(stored)
         setSessionStartedAt(Date.now())
-        const yoloArmed = $yoloActive.get()
+        const yoloArmed = desktopYoloEnabledForNewSession()
         const runtimeInfo = applyRuntimeInfo(created.info)
 
         if (runtimeInfo) {
@@ -371,8 +370,10 @@ export function useSessionActions({
         }
 
         // User may have armed YOLO on the new-chat draft before the runtime
-        // session existed — apply it to the freshly created session.
+        // session existed. Also honor the durable desktop new-chat default
+        // if transient renderer state was reset before the first prompt.
         if (yoloArmed) {
+          setYoloActive(true)
           await setSessionYolo(requestGateway, created.session_id, true).catch(() => undefined)
         }
 

@@ -19,6 +19,10 @@ export function desktopYoloDefaultFromConfig(config: { desktop?: unknown }): boo
   return typeof desktop.yolo_default === 'boolean' ? desktop.yolo_default : DEFAULT_DESKTOP_YOLO_ACTIVE
 }
 
+export function desktopYoloEnabledForNewSession(): boolean {
+  return $yoloActive.get() || $desktopYoloDefault.get()
+}
+
 export async function setDesktopYoloDefault(enabled: boolean): Promise<boolean> {
   const config = await getHermesConfigRecord()
   const desktop = isRecord(config.desktop) ? { ...config.desktop } : {}
