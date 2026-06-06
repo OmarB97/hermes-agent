@@ -477,6 +477,10 @@ export interface ProfileInfo {
   skill_count: number
 }
 
+export interface ProfileSetupCommand {
+  command: string
+}
+
 export interface ProfileSoul {
   content: string
   exists: boolean
