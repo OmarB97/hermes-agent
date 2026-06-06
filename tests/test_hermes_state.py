@@ -1309,6 +1309,30 @@ class TestCounts:
         assert db.session_count(source="cli") == 2
         assert db.session_count(source="telegram") == 1
 
+    def test_surfaced_counts_share_list_visibility_filter(self, db):
+        db.create_session("parent", "cli")
+        db.end_session("parent", "branched")
+        db.create_session(
+            "branch",
+            "cli",
+            model_config={"_branched_from": "parent"},
+            parent_session_id="parent",
+        )
+
+        # The marker must keep this real branch visible even if the parent later
+        # gets reopened and ended for a different reason.
+        db.reopen_session("parent")
+        db.end_session("parent", "tui_shutdown")
+        db.create_session("hidden-child", "cli", parent_session_id="parent")
+
+        visible_ids = {row["id"] for row in db.list_sessions_rich()}
+        assert visible_ids == {"parent", "branch"}
+        assert db.session_count() == 3
+        assert db.session_count(exclude_children=True) == 2
+        assert db.surfaced_session_count() == 2
+        assert db.surfaced_session_count(exclude_children=True) == 2
+        assert db.surfaced_session_count(exclude_children=False) == 3
+
     def test_message_count_total(self, db):
         assert db.message_count() == 0
         db.create_session(session_id="s1", source="cli")
