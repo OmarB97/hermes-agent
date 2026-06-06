@@ -11,7 +11,7 @@ import { Pane, PaneMain } from '@/components/pane-shell'
 import { useSkinCommand } from '@/themes/use-skin-command'
 
 import { formatRefValue } from '../components/assistant-ui/directive-text'
-import { autoArchiveOldSessions, getSessionMessages, listAllProfileSessions, listSessions, type SessionInfo } from '../hermes'
+import { autoArchiveOldSessions, getSessionMessages, listAllProfileSessions, type SessionInfo } from '../hermes'
 import { preserveLocalAssistantErrors, toChatMessages } from '../lib/chat-messages'
 import { toggleCommandPalette } from '../store/command-palette'
 import {
@@ -81,6 +81,7 @@ import { usePreviewRouting } from './session/hooks/use-preview-routing'
 import { usePromptActions } from './session/hooks/use-prompt-actions'
 import { useRouteResume } from './session/hooks/use-route-resume'
 import { useSessionActions } from './session/hooks/use-session-actions'
+import { useSessionPresence } from './session/hooks/use-session-presence'
 import { useSessionStateCache } from './session/hooks/use-session-state-cache'
 import { AppShell } from './shell/app-shell'
 import { useOverlayRouting } from './shell/hooks/use-overlay-routing'
@@ -397,6 +398,8 @@ export function DesktopController() {
     gatewayState,
     requestGateway
   })
+
+  useSessionPresence(gatewayState, requestGateway)
 
   const hydrateFromStoredSession = useCallback(
     async (
