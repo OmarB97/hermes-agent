@@ -21,7 +21,6 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
-import { DisclosureCaret } from '@/components/ui/disclosure-caret'
 import {
   Dialog,
   DialogContent,
@@ -30,6 +29,7 @@ import {
   DialogHeader,
   DialogTitle
 } from '@/components/ui/dialog'
+import { DisclosureCaret } from '@/components/ui/disclosure-caret'
 import { KbdGroup } from '@/components/ui/kbd'
 import { SearchField } from '@/components/ui/search-field'
 import {
@@ -44,8 +44,8 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tip } from '@/components/ui/tooltip'
 import { searchSessions, type SessionInfo, type SessionSearchResult } from '@/hermes'
-import { computeSessionEligibility } from '@/lib/session-eligibility'
 import { profileColor } from '@/lib/profile-color'
+import { computeSessionEligibility, sessionArchivePreserveIds } from '@/lib/session-eligibility'
 import { sessionMatchesSearch } from '@/lib/session-search'
 import { cn } from '@/lib/utils'
 import {
@@ -72,6 +72,7 @@ import {
   normalizeProfileKey
 } from '@/store/profile'
 import {
+  $activeSessionId,
   $selectedStoredSessionId,
   $sessionProfileTotals,
   $sessions,
@@ -256,6 +257,7 @@ export function ChatSidebar({
   const sessionsTotal = useStore($sessionsTotal)
   const sessionProfileTotals = useStore($sessionProfileTotals)
   const workingSessionIds = useStore($workingSessionIds)
+  const activeSessionId = useStore($activeSessionId)
   const profiles = useStore($profiles)
   const profileScope = useStore($profileScope)
   // Only surface the profile switcher when more than one profile exists, so
@@ -505,20 +507,13 @@ export function ChatSidebar({
   // Compute eligibility summary for the archive-all dialog so it can show
   // a precise breakdown of what will be archived vs what is protected.
   const archiveAllSummary = useMemo(() => {
-    const preserveIds = new Set<string>([...pinnedSessionIds, ...workingSessionIds])
-    if (selectedSessionId) {
-      preserveIds.add(selectedSessionId)
-    }
-    if (activeSessionId) {
-      preserveIds.add(activeSessionId)
-    }
-    // Also preserve lineage roots of active sessions
-    for (const session of agentSessions) {
-      if (session.id === selectedSessionId || session.id === activeSessionId) {
-        const rootId = session._lineage_root_id ?? session.id
-        preserveIds.add(String(rootId))
-      }
-    }
+    const preserveIds = sessionArchivePreserveIds(agentSessions, {
+      activeSessionId,
+      pinnedSessionIds,
+      selectedSessionId,
+      workingSessionIds
+    })
+
     return computeSessionEligibility(agentSessions, preserveIds)
   }, [agentSessions, pinnedSessionIds, workingSessionIds, selectedSessionId, activeSessionId])
 
@@ -811,11 +806,11 @@ export function ChatSidebar({
         )}
       </SidebarContent>
       <ArchiveAllSessionsDialog
-        summary={archiveAllSummary}
         onConfirm={handleArchiveAll}
         onOpenChange={setArchiveAllOpen}
         open={archiveAllOpen}
         submitting={archiveAllSubmitting}
+        summary={archiveAllSummary}
       />
     </Sidebar>
   )
