@@ -6,6 +6,7 @@ import { bulkArchiveSessions, deleteSession, getSessionMessages, setSessionArchi
 import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
 import { embeddedImageUrls, textWithoutEmbeddedImages } from '@/lib/embedded-images'
+import { sessionArchivePreserveIds } from '@/lib/session-eligibility'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { clearComposerAttachments, clearComposerDraft } from '@/store/composer'
 import { clearQueuedPrompts } from '@/store/composer-queue'
@@ -338,11 +339,13 @@ export function useSessionActions({
         // Pass the owning profile so a new chat under a non-launch profile (global
         // remote mode) builds its agent + persists against THAT profile's home/db.
         const newChatProfile = $newChatProfile.get()
+
         const created = await requestGateway<SessionCreateResponse>('session.create', {
           cols: 96,
           ...(cwd && { cwd }),
           ...(newChatProfile ? { profile: newChatProfile } : {})
         })
+
         const stored = created.stored_session_id ?? null
 
         if (
@@ -874,21 +877,13 @@ export function useSessionActions({
 
     const previousSessions = $sessions.get()
     const previousTotal = $sessionsTotal.get()
-    const preserveIds = new Set<string>([...$pinnedSessionIds.get(), ...$workingSessionIds.get()])
 
-    if (selectedStoredSessionId) {
-      preserveIds.add(selectedStoredSessionId)
-    }
-
-    if (activeSessionId) {
-      preserveIds.add(activeSessionId)
-    }
-
-    for (const session of previousSessions) {
-      if (session.id === selectedStoredSessionId || session.id === activeSessionId) {
-        preserveIds.add(sessionPinId(session))
-      }
-    }
+    const preserveIds = sessionArchivePreserveIds(previousSessions, {
+      activeSessionId,
+      pinnedSessionIds: $pinnedSessionIds.get(),
+      selectedSessionId: selectedStoredSessionId,
+      workingSessionIds: $workingSessionIds.get()
+    })
 
     const shouldPreserve = (session: SessionInfo) =>
       preserveIds.has(session.id) || (session._lineage_root_id != null && preserveIds.has(session._lineage_root_id))

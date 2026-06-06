@@ -20,6 +20,65 @@ export interface SessionEligibilitySummary {
   protected: number
 }
 
+interface SessionArchivePreserveOptions {
+  activeSessionId?: null | string
+  pinnedSessionIds?: Iterable<string>
+  selectedSessionId?: null | string
+  workingSessionIds?: Iterable<string>
+}
+
+function addPreserveId(ids: Set<string>, value: null | string | undefined) {
+  const id = String(value ?? '').trim()
+
+  if (id) {
+    ids.add(id)
+  }
+}
+
+/**
+ * Build the id set shared by the archive-all action and preview dialog. The
+ * backend accepts both live session ids and lineage roots, so include both for
+ * the current selected/active row when that row is present in the surfaced list.
+ */
+export function sessionArchivePreserveIds(
+  sessions: SessionInfo[],
+  {
+    activeSessionId,
+    pinnedSessionIds = [],
+    selectedSessionId,
+    workingSessionIds = []
+  }: SessionArchivePreserveOptions
+): Set<string> {
+  const preserveIds = new Set<string>()
+
+  for (const id of pinnedSessionIds) {
+    addPreserveId(preserveIds, id)
+  }
+
+  for (const id of workingSessionIds) {
+    addPreserveId(preserveIds, id)
+  }
+
+  addPreserveId(preserveIds, selectedSessionId)
+  addPreserveId(preserveIds, activeSessionId)
+
+  for (const session of sessions) {
+    const sessionId = String(session.id ?? '').trim()
+    const rootId = String(session._lineage_root_id ?? sessionId).trim()
+
+    const isCurrent =
+      preserveIds.has(sessionId) ||
+      (rootId !== '' && preserveIds.has(rootId))
+
+    if (isCurrent) {
+      addPreserveId(preserveIds, sessionId)
+      addPreserveId(preserveIds, rootId)
+    }
+  }
+
+  return preserveIds
+}
+
 /**
  * Compute which sessions are eligible for bulk archival given a set of
  * preserve IDs. Matches backend `archive_surfaced_sessions()` logic.
@@ -39,6 +98,7 @@ export function computeSessionEligibility(
 
   for (const session of sessions) {
     const sid = String(session.id).trim()
+
     if (!sid) {
       continue
     }
@@ -49,6 +109,7 @@ export function computeSessionEligibility(
     if (seenTargets.has(targetId)) {
       continue
     }
+
     seenTargets.add(targetId)
 
     const isPreserved = preserveIds.has(sid) || preserveIds.has(targetId)
@@ -56,6 +117,7 @@ export function computeSessionEligibility(
     const startedAt = Number(session.started_at) || 0
     const lastActive = Number(session.last_active) || startedAt
     const endedAt = session.ended_at
+
     const isRecentlyActive =
       endedAt === null &&
       ACTIVE_GRACE_SECONDS > 0 &&

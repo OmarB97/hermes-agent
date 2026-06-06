@@ -1688,6 +1688,18 @@ class SessionDB:
             current = row["id"]
         return current
 
+    @staticmethod
+    def _surfaced_session_clause(alias: str = "s") -> str:
+        """SQL predicate for rows shown by list_sessions_rich by default."""
+        return (
+            f"({alias}.parent_session_id IS NULL"
+            f" OR json_extract({alias}.model_config, '$._branched_from') IS NOT NULL"
+            " OR EXISTS (SELECT 1 FROM sessions p"
+            f"            WHERE p.id = {alias}.parent_session_id"
+            "            AND p.end_reason = 'branched'"
+            f"            AND {alias}.started_at >= p.ended_at))"
+        )
+
     def list_sessions_rich(
         self,
         source: str = None,
@@ -1747,14 +1759,7 @@ class SessionDB:
             #   2. The legacy heuristic (parent ended with 'branched' before the
             #      child started), covering branch sessions created before the
             #      marker existed.
-            where_clauses.append(
-                "(s.parent_session_id IS NULL"
-                " OR json_extract(s.model_config, '$._branched_from') IS NOT NULL"
-                " OR EXISTS (SELECT 1 FROM sessions p"
-                "            WHERE p.id = s.parent_session_id"
-                "            AND p.end_reason = 'branched'"
-                "            AND s.started_at >= p.ended_at))"
-            )
+            where_clauses.append(self._surfaced_session_clause())
 
         if source:
             where_clauses.append("s.source = ?")
@@ -3295,15 +3300,8 @@ class SessionDB:
 
         if exclude_children:
             # Mirror list_sessions_rich's child-exclusion clause exactly so the
-            # count lines up with the rows: roots (no parent) plus branch
-            # children (parent ended with end_reason='branched').
-            where_clauses.append(
-                "(s.parent_session_id IS NULL"
-                " OR EXISTS (SELECT 1 FROM sessions p"
-                "            WHERE p.id = s.parent_session_id"
-                "            AND p.end_reason = 'branched'"
-                "            AND s.started_at >= p.ended_at))"
-            )
+            # count lines up with the rows: roots plus visible branch children.
+            where_clauses.append(self._surfaced_session_clause())
         if source:
             where_clauses.append("s.source = ?")
             params.append(source)
@@ -3327,16 +3325,18 @@ class SessionDB:
         min_message_count: int = 0,
         include_archived: bool = False,
         archived_only: bool = False,
+        exclude_children: bool = True,
     ) -> int:
         """Count the root/branch conversations surfaced by list_sessions_rich."""
-        where_clauses = [
-            "(s.parent_session_id IS NULL"
-            " OR json_extract(s.model_config, '$._branched_from') IS NOT NULL"
-            " OR EXISTS (SELECT 1 FROM sessions p"
-            "            WHERE p.id = s.parent_session_id"
-            "            AND p.end_reason = 'branched'"
-            "            AND s.started_at >= p.ended_at))"
-        ]
+        if not exclude_children:
+            return self.session_count(
+                source=source,
+                min_message_count=min_message_count,
+                include_archived=include_archived,
+                archived_only=archived_only,
+            )
+
+        where_clauses = [self._surfaced_session_clause()]
         params = []
 
         if source:
