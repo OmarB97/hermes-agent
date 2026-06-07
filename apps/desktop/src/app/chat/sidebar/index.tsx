@@ -232,6 +232,7 @@ interface ChatSidebarProps extends React.ComponentProps<typeof Sidebar> {
   onLoadMoreSessions: () => void
   onArchiveAllSessions: () => Promise<void> | void
   onLoadMoreProfileSessions?: (profile: string) => Promise<void> | void
+  onOpenPresenceSession: (record: SessionPresenceRecord) => void
   onResumeSession: (sessionId: string) => void
   onDeleteSession: (sessionId: string) => void
   onArchiveSession: (sessionId: string) => void
@@ -244,6 +245,7 @@ export function ChatSidebar({
   onLoadMoreSessions,
   onArchiveAllSessions,
   onLoadMoreProfileSessions,
+  onOpenPresenceSession,
   onResumeSession,
   onDeleteSession,
   onArchiveSession,
@@ -336,12 +338,8 @@ export function ChatSidebar({
   )
 
   const visibleSessionPresence = useMemo(
-    () =>
-      (showAllProfiles
-        ? sessionPresence
-        : sessionPresence.filter(record => normalizeProfileKey(record.profile) === profileScope)
-      ).sort((a, b) => (b.updated_at ?? 0) - (a.updated_at ?? 0)),
-    [profileScope, sessionPresence, showAllProfiles]
+    () => [...sessionPresence].sort((a, b) => (b.updated_at ?? 0) - (a.updated_at ?? 0)),
+    [sessionPresence]
   )
 
   const workingSessionIdSet = useMemo(
@@ -770,7 +768,7 @@ export function ChatSidebar({
           <SidebarPresenceSection
             activeSessionId={activeSidebarSessionId}
             labelMeta={String(visibleSessionPresence.length)}
-            onOpenSession={onResumeSession}
+            onOpenPresenceSession={onOpenPresenceSession}
             onToggle={() => setLiveOpen(!liveOpen)}
             open={liveOpen}
             records={visibleSessionPresence}
@@ -971,7 +969,7 @@ function SidebarPinnedEmptyState() {
 interface SidebarPresenceSectionProps {
   activeSessionId: null | string
   labelMeta: React.ReactNode
-  onOpenSession: (sessionId: string) => void
+  onOpenPresenceSession: (record: SessionPresenceRecord) => void
   onToggle: () => void
   open: boolean
   records: SessionPresenceRecord[]
@@ -980,7 +978,7 @@ interface SidebarPresenceSectionProps {
 function SidebarPresenceSection({
   activeSessionId,
   labelMeta,
-  onOpenSession,
+  onOpenPresenceSession,
   onToggle,
   open,
   records
@@ -997,7 +995,7 @@ function SidebarPresenceSection({
               <SidebarPresenceRow
                 active={target === activeSessionId}
                 key={`${record.instance_id || record.host || 'instance'}:${record.session_id}`}
-                onOpen={() => onOpenSession(target)}
+                onOpen={() => onOpenPresenceSession(record)}
                 record={record}
               />
             )
@@ -1020,6 +1018,7 @@ function SidebarPresenceRow({
   const title = record.title?.trim() || record.session_key?.trim() || record.session_id
   const model = record.model?.trim()
   const origin = [record.host, record.client || record.source].filter(Boolean).join(' / ')
+  const detail = [model, origin].filter(Boolean).join('  ')
   const status = record.status?.trim().toLowerCase() || 'idle'
   const working = status !== 'idle' && status !== 'current'
 
@@ -1027,7 +1026,7 @@ function SidebarPresenceRow({
     <button
       aria-label={`Open live session ${title}`}
       className={cn(
-        'group grid min-h-7 grid-cols-[minmax(0,1fr)_minmax(3.5rem,auto)] items-center rounded-md bg-transparent px-2 text-left transition-colors duration-100 ease-out hover:bg-(--ui-row-hover-background) hover:transition-none',
+        'group flex min-h-9 flex-col justify-center rounded-md bg-transparent px-2 py-1 text-left transition-colors duration-100 ease-out hover:bg-(--ui-row-hover-background) hover:transition-none',
         active && 'bg-(--ui-row-active-background)'
       )}
       onClick={onOpen}
@@ -1048,11 +1047,10 @@ function SidebarPresenceRow({
         <span className="min-w-0 flex-1 truncate text-[0.8125rem] font-normal text-(--ui-text-secondary) group-hover:text-foreground">
           {title}
         </span>
-        {model && <span className="shrink-0 text-[0.625rem] text-(--ui-text-quaternary)">{model}</span>}
       </span>
-      {origin && (
-        <span className="min-w-0 truncate pl-2 text-right text-[0.625rem] text-(--ui-text-tertiary)">
-          {origin}
+      {detail && (
+        <span className="ml-5 min-w-0 truncate text-[0.625rem] leading-3 text-(--ui-text-tertiary)">
+          {detail}
         </span>
       )}
     </button>

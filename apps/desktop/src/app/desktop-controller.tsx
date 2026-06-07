@@ -438,6 +438,7 @@ export function DesktopController() {
     branchCurrentSession,
     createBackendSessionForSend,
     openSettings,
+    openPresenceSession,
     removeSession,
     resumeSession,
     selectSidebarItem,
@@ -630,6 +631,7 @@ export function DesktopController() {
       onLoadMoreSessions={loadMoreSessions}
       onNavigate={selectSidebarItem}
       onNewSessionInWorkspace={startSessionInWorkspace}
+      onOpenPresenceSession={openPresenceSession}
       onResumeSession={sessionId => navigate(sessionRoute(sessionId))}
     />
   )

@@ -4640,6 +4640,7 @@ def test_session_active_list_publishes_presence(monkeypatch):
     monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
     monkeypatch.setenv("HERMES_CLIENT_NAME", "desktop")
     monkeypatch.setenv("HERMES_SESSION_PRESENCE_ENDPOINT", "ws://private-gateway")
+    monkeypatch.setenv("HERMES_SESSION_PRESENCE_PROFILE", "default")
     monkeypatch.setattr(
         server,
         "write_session_presence",
@@ -4649,6 +4650,9 @@ def test_session_active_list_publishes_presence(monkeypatch):
         agent=types.SimpleNamespace(model="model-live"),
         cwd="/repo",
         history=[{"role": "user", "content": "continue here"}],
+        presence_client="hphone",
+        presence_endpoint="tmux://taro/hermes-phone",
+        presence_profile="taro",
         session_key="stored-live",
     )
     try:
@@ -4660,12 +4664,15 @@ def test_session_active_list_publishes_presence(monkeypatch):
         server._sessions.update(previous_sessions)
 
     assert resp["result"]["sessions"][0]["id"] == "sid-live"
+    assert resp["result"]["sessions"][0]["session_id"] == "sid-live"
     assert published
     assert published[0]["session_id"] == "sid-live"
     assert published[0]["session_key"] == "stored-live"
-    assert published[0]["client"] == "desktop"
-    assert published[0]["endpoint"] == "ws://private-gateway"
+    assert published[0]["client"] == "hphone"
+    assert published[0]["endpoint"] == "tmux://taro/hermes-phone"
+    assert published[0]["profile"] == "taro"
     assert published[0]["source"] == "tui_gateway"
+    assert published[0]["metadata"]["route_profile"] == "taro"
     assert published[0]["metadata"]["session_key"] == "stored-live"
 
 
