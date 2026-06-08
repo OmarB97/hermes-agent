@@ -2730,6 +2730,25 @@ def _init_session(sid: str, key: str, agent, history: list, cols: int = 80):
             # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
             "transport": current_transport() or _stdio_transport,
         }
+        "history_version": 0,
+        "inflight_turn": None,
+        "created_at": now,
+        "last_active": now,
+        "running": False,
+        "attached_images": [],
+        "image_counter": 0,
+        "cwd": _completion_cwd(),
+        "cols": cols,
+        "slash_worker": None,
+        "show_reasoning": _load_show_reasoning(),
+        "tool_progress_mode": _load_tool_progress_mode(),
+        "edit_snapshots": {},
+        "tool_started_at": {},
+        # Pin async event emissions to whichever transport created the
+        # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
+        "transport": current_transport() or _stdio_transport,
+    }
+>>>>>>> 6854a7cfc (feat(session-presence): cross-device session discovery and live sync)
     db = _get_db()
     if db is not None:
         row = db.get_session(key)
@@ -2777,6 +2796,7 @@ def _init_session(sid: str, key: str, agent, history: list, cols: int = 80):
             _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
     _notify_session_boundary("on_session_reset", key)
     _emit("session.info", sid, _session_info(agent, _sessions.get(sid, {})))
+    _publish_session_presence(sid, _sessions.get(sid) or {})
 
 
 def _new_session_key() -> str:

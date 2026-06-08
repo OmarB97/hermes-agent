@@ -444,6 +444,8 @@ export function DesktopController() {
     selectSidebarItem,
     startFreshSessionDraft
   } = useSessionActions({
+
+  useSessionPresence(gatewayState, requestGateway)
     activeSessionId,
     activeSessionIdRef,
     busyRef,
