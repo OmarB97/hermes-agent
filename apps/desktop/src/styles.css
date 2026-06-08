@@ -647,6 +647,22 @@ textarea,
   user-select: text;
 }
 
+[data-slot='sidebar-foreground'] {
+  color: var(--color-sidebar-foreground);
+}
+
+[data-slot='sidebar-accent-foreground'] {
+  color: var(--color-sidebar-accent-foreground);
+}
+
+text-sidebar-foreground {
+  color: var(--color-sidebar-foreground);
+}
+
+text-sidebar-accent-foreground {
+  color: var(--color-sidebar-accent-foreground);
+}
+
 button,
 [role='button'] {
   -webkit-user-select: none;
