@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
-from hermes_constants import get_hermes_home
+from hermes_constants import get_device_name, get_hermes_home
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
@@ -910,7 +910,6 @@ class SessionDB:
                 # the current device identity so existing sessions appear
                 # under their correct device group instead of "Unknown".
                 try:
-                    from hermes_constants import get_device_name
                     dn = get_device_name()
                     cursor.execute(
                         "UPDATE sessions SET device_name = ? WHERE device_name IS NULL",
@@ -995,7 +994,6 @@ class SessionDB:
     def create_session(self, session_id: str, source: str, **kwargs) -> str:
         """Create a new session record. Returns the session_id."""
         if "device_name" not in kwargs:
-            from hermes_constants import get_device_name
             kwargs["device_name"] = get_device_name()
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
