@@ -1441,10 +1441,11 @@ class APIServerAdapter(BasePlatformAdapter):
         if err:
             return err
         db = self._ensure_session_db()
-        messages = db.get_messages(session_id)
+        resolved_id = db.resolve_resume_session_id(session_id)
+        messages = db.get_messages(resolved_id)
         return web.json_response({
             "object": "list",
-            "session_id": session_id,
+            "session_id": resolved_id,
             "data": [self._message_response(m) for m in messages],
         })
 
@@ -1819,7 +1820,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # producing an orphaned event clients can't correlate.
             _started_tool_call_ids: set[str] = set()
 
-            def _on_tool_start(tool_call_id, function_name, function_args):
+            def _on_tool_start(tool_call_id, function_name, function_args, **kwargs):
                 """Emit ``hermes.tool.progress`` with ``status: running``.
 
                 Replaces the old ``tool_progress_callback("tool.started",
@@ -1845,7 +1846,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "status": "running",
                 }))
 
-            def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
+            def _on_tool_complete(tool_call_id, function_name, function_args, function_result, **kwargs):
                 """Emit the matching ``status: completed`` event.
 
                 Dropped if the start was filtered (internal tool, missing
@@ -2883,7 +2884,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 """
                 return
 
-            def _on_tool_start(tool_call_id, function_name, function_args):
+            def _on_tool_start(tool_call_id, function_name, function_args, **kwargs):
                 """Queue a started tool for live function_call streaming."""
                 _stream_q.put(("__tool_started__", {
                     "tool_call_id": tool_call_id,
@@ -2891,7 +2892,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "arguments": function_args or {},
                 }))
 
-            def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
+            def _on_tool_complete(tool_call_id, function_name, function_args, function_result, **kwargs):
                 """Queue a completed tool result for live function_call_output streaming."""
                 _stream_q.put(("__tool_completed__", {
                     "tool_call_id": tool_call_id,
@@ -3462,35 +3463,46 @@ class APIServerAdapter(BasePlatformAdapter):
         loop = asyncio.get_running_loop()
 
         def _run():
-            agent = self._create_agent(
-                ephemeral_system_prompt=ephemeral_system_prompt,
-                session_id=session_id,
-                stream_delta_callback=stream_delta_callback,
-                tool_progress_callback=tool_progress_callback,
-                tool_start_callback=tool_start_callback,
-                tool_complete_callback=tool_complete_callback,
-                gateway_session_key=gateway_session_key,
+            from gateway.session_context import clear_session_vars, set_session_vars
+
+            tokens = set_session_vars(
+                platform="api_server",
+                chat_id=session_id or "",
+                session_key=gateway_session_key or session_id or "",
+                session_id=session_id or "",
             )
-            if agent_ref is not None:
-                agent_ref[0] = agent
-            effective_task_id = session_id or str(uuid.uuid4())
-            result = agent.run_conversation(
-                user_message=user_message,
-                conversation_history=conversation_history,
-                task_id=effective_task_id,
-            )
-            usage = {
-                "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-            }
-            # Include the effective session ID in the result so callers
-            # (e.g. X-Hermes-Session-Id header) can track compression-
-            # triggered session rotations. (#16938)
-            _eff_sid = getattr(agent, "session_id", session_id)
-            if isinstance(_eff_sid, str) and _eff_sid:
-                result["session_id"] = _eff_sid
-            return result, usage
+            try:
+                agent = self._create_agent(
+                    ephemeral_system_prompt=ephemeral_system_prompt,
+                    session_id=session_id,
+                    stream_delta_callback=stream_delta_callback,
+                    tool_progress_callback=tool_progress_callback,
+                    tool_start_callback=tool_start_callback,
+                    tool_complete_callback=tool_complete_callback,
+                    gateway_session_key=gateway_session_key,
+                )
+                if agent_ref is not None:
+                    agent_ref[0] = agent
+                effective_task_id = session_id or str(uuid.uuid4())
+                result = agent.run_conversation(
+                    user_message=user_message,
+                    conversation_history=conversation_history,
+                    task_id=effective_task_id,
+                )
+                usage = {
+                    "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                    "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+                    "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                }
+                # Include the effective session ID in the result so callers
+                # (e.g. X-Hermes-Session-Id header) can track compression-
+                # triggered session rotations. (#16938)
+                _eff_sid = getattr(agent, "session_id", session_id)
+                if isinstance(_eff_sid, str) and _eff_sid:
+                    result["session_id"] = _eff_sid
+                return result, usage
+            finally:
+                clear_session_vars(tokens)
 
         return await loop.run_in_executor(None, _run)
 

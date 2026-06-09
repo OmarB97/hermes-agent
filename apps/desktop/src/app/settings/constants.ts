@@ -235,6 +235,7 @@ export const BUILTIN_PERSONALITIES = [
 // backend schema only declares a string type.
 export const ENUM_OPTIONS: Record<string, string[]> = {
   'agent.image_input_mode': ['auto', 'native', 'text'],
+  'agent.reasoning_effort': ['', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh'],
   'approvals.mode': ['manual', 'smart', 'off'],
   'code_execution.mode': ['project', 'strict'],
   'context.engine': ['compressor', 'default', 'custom'],
@@ -261,7 +262,8 @@ export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
     imageInputMode: 'Image Attachments',
     apiMaxRetries: 'API Retries',
     serviceTier: 'Service Tier',
-    toolUseEnforcement: 'Tool-Use Enforcement'
+    toolUseEnforcement: 'Tool-Use Enforcement',
+    reasoningEffort: 'Thinking'
   },
   terminal: {
     cwd: 'Working Directory',
@@ -343,6 +345,7 @@ export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
   compression: {
     enabled: 'Auto-Compression',
     threshold: 'Compression Threshold',
+    minThreshold: 'Min Compression Threshold',
     targetRatio: 'Compression Target',
     protectLastN: 'Protected Recent Messages'
   },
@@ -477,6 +480,7 @@ export const SECTIONS: DesktopConfigSection[] = [
       'context.engine',
       'compression.enabled',
       'compression.threshold',
+      'compression.min_threshold',
       'compression.target_ratio',
       'compression.protect_last_n'
     ]
@@ -521,6 +525,7 @@ export const SECTIONS: DesktopConfigSection[] = [
       'agent.api_max_retries',
       'agent.service_tier',
       'agent.tool_use_enforcement',
+      'agent.reasoning_effort',
       'delegation.model',
       'delegation.provider',
       'delegation.max_iterations',

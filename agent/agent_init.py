@@ -151,6 +151,7 @@ def init_agent(
     save_trajectories: bool = False,
     verbose_logging: bool = False,
     quiet_mode: bool = False,
+    tool_progress_mode: str = "all",
     ephemeral_system_prompt: str = None,
     log_prefix_chars: int = 100,
     log_prefix: str = "",
@@ -262,6 +263,7 @@ def init_agent(
     agent.save_trajectories = save_trajectories
     agent.verbose_logging = verbose_logging
     agent.quiet_mode = quiet_mode
+    agent.tool_progress_mode = tool_progress_mode
     agent.ephemeral_system_prompt = ephemeral_system_prompt
     agent.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
     agent._user_id = user_id  # Platform user identifier (gateway sessions)
@@ -1250,6 +1252,13 @@ def init_agent(
     compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in {"true", "1", "yes"}
     compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
     compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
+    # Read optional min_threshold — prevents auto-lowering below this ratio
+    # even when the auxiliary compression model's context is smaller than the
+    # main model's compression threshold.  Default 0.0 means "no floor beyond
+    # what the aux model can safely handle."
+    agent._compression_min_threshold = float(
+        _compression_cfg.get("min_threshold", 0.0)
+    )
     # protect_first_n is the number of non-system messages to protect at
     # the head, in addition to the system prompt (which is always
     # implicitly protected by the compressor).  Floor at 0 — a value of

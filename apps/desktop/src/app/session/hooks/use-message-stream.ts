@@ -14,6 +14,7 @@ import {
   upsertToolPart
 } from '@/lib/chat-messages'
 import { coerceGatewayText, coerceThinkingText, normalizePersonalityValue } from '@/lib/chat-runtime'
+import { gatewayEventRequiresSessionId } from '@/lib/gateway-events'
 import { triggerHaptic } from '@/lib/haptics'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import { mergeTokenUsagePayload, type TokenUsagePayload } from '@/lib/token-usage'
@@ -611,6 +612,9 @@ export function useMessageStream({
     (event: RpcEvent) => {
       const payload = event.payload as GatewayEventPayload | undefined
       const explicitSid = event.session_id || ''
+      if (!explicitSid && gatewayEventRequiresSessionId(event.type)) {
+        return
+      }
       const sessionId = explicitSid || activeSessionIdRef.current
       const isActiveEvent = !!sessionId && sessionId === activeSessionIdRef.current
 
@@ -797,6 +801,10 @@ export function useMessageStream({
 
         flushQueuedDeltas(sessionId)
         upsertToolCall(sessionId, toTodoPayload(payload) ?? payload, 'running', event.type)
+        // Update context usage in real-time during tool execution.
+        if (payload?.usage && (!explicitSid || isActiveEvent)) {
+          setCurrentUsage(current => ({ ...current, ...payload.usage }))
+        }
       } else if (event.type === 'tool.complete') {
         if (sessionId) {
           flushQueuedDeltas(sessionId)
@@ -806,6 +814,11 @@ export function useMessageStream({
           // the sidebar indicator clears as soon as it's answered, not only at
           // message.complete.
           updateSessionState(sessionId, state => (state.needsInput ? { ...state, needsInput: false } : state))
+        }
+
+        // Update context usage in real-time after tool completion.
+        if (payload?.usage && (!explicitSid || isActiveEvent)) {
+          setCurrentUsage(current => ({ ...current, ...payload.usage }))
         }
 
         if (typeof payload?.inline_diff === 'string' && payload.inline_diff.trim()) {

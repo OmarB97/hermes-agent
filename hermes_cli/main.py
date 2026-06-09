@@ -7694,9 +7694,31 @@ def cmd_gui(args: argparse.Namespace):
                     for p in purged:
                         print(f"    - {p}")
                     build_result = subprocess.run([npm, "run", build_script], cwd=desktop_dir, env=env, check=False)
+            if build_result.returncode != 0 and not source_mode and not env.get("ELECTRON_MIRROR"):
+                # Still failing and the user hasn't pinned a mirror: GitHub's
+                # Electron release host is likely blocked/throttled (the repeating
+                # "retrying" download log). Retry once via npmmirror.com — the
+                # de-facto Electron community mirror (Alibaba). @electron/get
+                # SHASUM-checks the download, but the SHASUMS come from the same
+                # mirror, so that guards against a corrupt/partial download, NOT
+                # a compromised mirror: reaching for it is an explicit trust
+                # trade-off we only make AFTER the canonical GitHub download has
+                # failed, and we never override a user-pinned ELECTRON_MIRROR.
+                print("  ⚠ Desktop build still failing; the Electron download from "
+                      "GitHub looks blocked. Retrying once via a public mirror "
+                      "(npmmirror.com)... (set ELECTRON_MIRROR to use another mirror)")
+                mirror_env = dict(env)
+                mirror_env["ELECTRON_MIRROR"] = "https://npmmirror.com/mirrors/electron/"
+                _stop_desktop_processes_locking_build(desktop_dir)
+                build_result = subprocess.run([npm, "run", build_script], cwd=desktop_dir, env=mirror_env, check=False)
             if build_result.returncode != 0:
                 print("✗ Desktop GUI build failed")
                 print(f"  Run manually:  cd apps/desktop && npm run {build_script}")
+                if sys.platform == "win32":
+                    print("  If this says \"Access is denied\" on Hermes.exe, close any")
+                    print("  running Hermes desktop window and retry.")
+                print("  If the log shows Electron download retries, rebuild via a mirror:")
+                print("    ELECTRON_MIRROR=<mirror-base-url> hermes desktop --force-build")
                 sys.exit(build_result.returncode or 1)
             packaged_executable = _desktop_packaged_executable(desktop_dir)
             if not source_mode:
@@ -8720,12 +8742,63 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
 
     # If origin/main has commits not on upstream, don't trample
     if origin_ahead > 0:
+        if upstream_ahead == 0:
+            print()
+            print(f"  ✓ Fork already has {origin_ahead} commit(s) ahead of upstream")
+            return
+
+        # Fork has diverged — merge upstream into origin/main to keep fork
+        # up to date without losing local changes. This is the standard fork
+        # workflow: origin/main = upstream/main + your features.
         print()
-        print(f"ℹ Your fork has {origin_ahead} commit(s) not on upstream.")
-        print("  Skipping upstream sync to preserve your changes.")
-        print("  If you want to merge upstream changes, run:")
-        print("    git pull upstream main")
-        return
+        print(f"ℹ Your fork has {origin_ahead} commit(s) not on upstream, and is")
+        print(f"  {upstream_ahead} commit(s) behind. Merging upstream into fork main...")
+
+        try:
+            # Checkout local main (tracking origin/main)
+            subprocess.run(
+                git_cmd + ["checkout", "main"],
+                cwd=cwd,
+                capture_output=True,
+                check=True,
+            )
+            # Merge upstream/main into local main
+            merge_result = subprocess.run(
+                git_cmd + ["merge", "upstream/main", "--no-edit", "--no-ff"],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if merge_result.returncode != 0:
+                # Merge conflict or other error — don't corrupt the fork
+                print("  ✗ Merge failed (conflict). Skipping upstream sync.")
+                print("  Resolve manually: cd ~/.hermes/hermes-agent && git merge upstream/main")
+                return
+
+            # Push the merged result to origin/main
+            push_result = subprocess.run(
+                git_cmd + ["push", "origin", "main"],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if push_result.returncode != 0:
+                stderr = push_result.stderr.strip()
+                if "rejected" in stderr:
+                    print("  ✗ Push rejected. Fork main may have been updated elsewhere.")
+                    print("  Run: git pull upstream main && git push origin main")
+                else:
+                    print("  ✗ Push failed.")
+                    if stderr:
+                        print(f"  {stderr.splitlines()[0]}")
+                return
+
+            print(f"  ✓ Merged upstream into fork main and pushed ({origin_ahead} fork + {upstream_ahead} upstream commits)")
+        except subprocess.CalledProcessError as exc:
+            print(f"  ✗ Sync failed: {exc}")
+            return
 
     # If upstream is not ahead, fork is up to date
     if upstream_ahead == 0:

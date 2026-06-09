@@ -4,7 +4,7 @@ import type { ContextSuggestion } from '@/app/types'
 import type { HermesConnection } from '@/global'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { persistString, storedString } from '@/lib/storage'
-import type { SessionInfo, SessionPresenceRecord, UsageStats } from '@/types/hermes'
+import type { SessionInfo, UsageStats } from '@/types/hermes'
 
 type Updater<T> = T | ((current: T) => T)
 
@@ -76,13 +76,35 @@ export const $connection = atom<HermesConnection | null>(null)
 export const $gatewayState = atom('idle')
 export const $sessions = atom<SessionInfo[]>([])
 export const $sessionsTotal = atom<number>(0)
+// Cron-job sessions (source === 'cron') are fetched as their own list so the
+// scheduler's always-newest sessions never crowd recents out of the page
+// budget. Powers the collapsed "Cron jobs" sidebar section.
+export const $cronSessions = atom<SessionInfo[]>([])
+// Max cron sessions fetched for the sidebar section (single bounded page). When
+// the fetch returns exactly this many rows we know more exist, so the section
+// badge renders "N+". Lives here so the controller (fetch) and sidebar (badge)
+// share one source of truth without a circular import.
+export const CRON_SECTION_LIMIT = 50
+// Messaging-platform sessions (telegram/discord/...) are fetched as their own
+// slice — separate from local recents — so each platform renders a
+// self-managed sidebar section and never interleaves with (or buries) local
+// chats in the recents page. One combined fetch seeds every platform; a
+// platform that exceeds this cap gets its own per-platform "load more".
+export const $messagingSessions = atom<SessionInfo[]>([])
+export const MESSAGING_SECTION_LIMIT = 100
+// Exact per-platform conversation totals, keyed by source id. Empty until a
+// per-platform "load more" fetch resolves it (the combined seed fetch only
+// knows the aggregate), so sections fall back to their loaded count.
+export const $messagingPlatformTotals = atom<Record<string, number>>({})
+// True when the combined seed fetch hit MESSAGING_SECTION_LIMIT, so at least
+// one platform may have more rows on disk than were loaded.
+export const $messagingTruncated = atom<boolean>(false)
 // Listable conversation count per profile (children excluded), keyed by profile
 // name. Lets the sidebar scope its "Load more" footer to the active profile so a
 // huge default profile doesn't keep "Load more" visible while browsing a small
 // one. Empty for single-profile users (fall back to $sessionsTotal).
 export const $sessionProfileTotals = atom<Record<string, number>>({})
 export const $sessionsLoading = atom(true)
-export const $sessionPresence = atom<SessionPresenceRecord[]>([])
 export const $workingSessionIds = atom<string[]>([])
 export const $activeSessionId = atom<string | null>(null)
 export const $selectedStoredSessionId = atom<string | null>(null)
@@ -95,12 +117,10 @@ export const $currentProvider = atom('')
 export const $currentReasoningEffort = atom('')
 export const $currentServiceTier = atom('')
 export const $currentFastMode = atom(false)
-export const DEFAULT_DESKTOP_YOLO_ACTIVE = true
-// Desktop new-chat default. The backend approval bypass remains session-scoped;
-// this preference decides whether desktop applies that bypass to new sessions.
-export const $desktopYoloDefault = atom(DEFAULT_DESKTOP_YOLO_ACTIVE)
-// Effective approval-bypass state for the active desktop session/draft.
-export const $yoloActive = atom(DEFAULT_DESKTOP_YOLO_ACTIVE)
+// Effective approval-bypass state mirrored from the gateway (session.info).
+// Persistence lives in the backend config (approvals.mode), so this is a plain
+// reflection of the truth the gateway reports rather than its own store.
+export const $yoloActive = atom(false)
 export const $currentCwd = atom(getRememberedWorkspaceCwd())
 export const $currentBranch = atom('')
 export const $currentUsage = atom<UsageStats>({
@@ -122,10 +142,14 @@ export const setConnection = (next: Updater<HermesConnection | null>) => updateA
 export const setGatewayState = (next: Updater<string>) => updateAtom($gatewayState, next)
 export const setSessions = (next: Updater<SessionInfo[]>) => updateAtom($sessions, next)
 export const setSessionsTotal = (next: Updater<number>) => updateAtom($sessionsTotal, next)
+export const setCronSessions = (next: Updater<SessionInfo[]>) => updateAtom($cronSessions, next)
+export const setMessagingSessions = (next: Updater<SessionInfo[]>) => updateAtom($messagingSessions, next)
+export const setMessagingPlatformTotals = (next: Updater<Record<string, number>>) =>
+  updateAtom($messagingPlatformTotals, next)
+export const setMessagingTruncated = (next: Updater<boolean>) => updateAtom($messagingTruncated, next)
 export const setSessionProfileTotals = (next: Updater<Record<string, number>>) =>
   updateAtom($sessionProfileTotals, next)
 export const setSessionsLoading = (next: Updater<boolean>) => updateAtom($sessionsLoading, next)
-export const setSessionPresence = (next: Updater<SessionPresenceRecord[]>) => updateAtom($sessionPresence, next)
 export const setWorkingSessionIds = (next: Updater<string[]>) => updateAtom($workingSessionIds, next)
 export const setActiveSessionId = (next: Updater<string | null>) => updateAtom($activeSessionId, next)
 export const setSelectedStoredSessionId = (next: Updater<string | null>) => updateAtom($selectedStoredSessionId, next)
@@ -138,7 +162,6 @@ export const setCurrentProvider = (next: Updater<string>) => updateAtom($current
 export const setCurrentReasoningEffort = (next: Updater<string>) => updateAtom($currentReasoningEffort, next)
 export const setCurrentServiceTier = (next: Updater<string>) => updateAtom($currentServiceTier, next)
 export const setCurrentFastMode = (next: Updater<boolean>) => updateAtom($currentFastMode, next)
-export const setDesktopYoloDefaultActive = (next: Updater<boolean>) => updateAtom($desktopYoloDefault, next)
 export const setYoloActive = (next: Updater<boolean>) => updateAtom($yoloActive, next)
 
 export const setCurrentCwd = (next: Updater<string>) => {
@@ -197,6 +220,47 @@ function clearSessionWatchdog(sessionId: string) {
   }
 }
 
+// A session's "working" flag clears the instant its turn ends, but the
+// cross-profile aggregator (listSessions with min_messages=1) only sees the
+// just-persisted first turn a beat later. The active chat is shielded from that
+// race by sessionsToKeep(), but a brand-new session that finished *while you
+// were viewing a different chat* is, at the next refresh, neither working,
+// pinned, nor active — so mergeSessionPage() evicts it. Nothing re-fetches
+// afterward, so it stays gone until the app restarts. (Repro: start a new chat,
+// then click another session before the first reply lands.)
+//
+// To bridge that window we keep a session in the merge keep-set for a short
+// grace period after its turn settles, giving the aggregator time to catch up.
+// Entries auto-expire, so this never accumulates and can't resurrect a deleted
+// session (mergeSessionPage only revives rows still present in the in-memory
+// list, which optimistic delete/archive already drops).
+const SESSION_SETTLE_GRACE_MS = 30 * 1000
+const settledSessionExpiry = new Map<string, number>()
+
+function markSessionSettled(sessionId: string) {
+  settledSessionExpiry.set(sessionId, Date.now() + SESSION_SETTLE_GRACE_MS)
+}
+
+function clearSessionSettled(sessionId: string) {
+  settledSessionExpiry.delete(sessionId)
+}
+
+/** Stored ids of sessions whose turn ended within the grace window. Prunes
+ *  expired entries as it reads, so it stays bounded without a timer. */
+export function getRecentlySettledSessionIds(now: number = Date.now()): string[] {
+  const live: string[] = []
+
+  for (const [id, expiry] of settledSessionExpiry) {
+    if (expiry > now) {
+      live.push(id)
+    } else {
+      settledSessionExpiry.delete(id)
+    }
+  }
+
+  return live
+}
+
 /** Call when a streaming event for a session lands. Refreshes the watchdog
  *  so the session keeps its "working" status as long as data keeps coming. */
 export function noteSessionActivity(sessionId: string | null | undefined) {
@@ -238,13 +302,24 @@ export function setSessionWorking(sessionId: string | null | undefined, working:
     return
   }
 
+  const wasWorking = $workingSessionIds.get().includes(sessionId)
+
   toggleMembership(setWorkingSessionIds, sessionId, working)
 
   // Bookend the watchdog: arm on enter, disarm on leave. A later
   // noteSessionActivity() from a streaming event refreshes the timer.
   if (working) {
+    clearSessionSettled(sessionId)
     armSessionWatchdog(sessionId)
   } else {
     clearSessionWatchdog(sessionId)
+
+    // Only grant grace on a real working→idle transition (updateSessionState
+    // re-asserts `false` on every state tick, which must not keep extending the
+    // window). This keeps the just-finished session visible long enough for the
+    // aggregator to return its now-persisted row.
+    if (wasWorking) {
+      markSessionSettled(sessionId)
+    }
   }
 }

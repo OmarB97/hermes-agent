@@ -308,6 +308,14 @@ export interface SessionInfo {
   started_at: number
   title: null | string
   tool_call_count: number
+  /** Origin platform when this session was handed off from a messaging
+   *  platform (e.g. a Telegram thread continued in the desktop app). The live
+   *  {@link source} becomes local (tui/desktop) after a handoff, so the origin
+   *  is preserved here to surface the platform badge on the row. */
+  handoff_platform?: null | string
+  /** Handoff lifecycle: 'pending' | 'in_progress' | 'completed' | 'failed'. */
+  handoff_state?: null | string
+  handoff_error?: null | string
   /** Owning profile name, set by the cross-profile aggregator
    *  (`/api/profiles/sessions`). Absent on legacy single-profile responses,
    *  which the UI treats as the default profile. */
@@ -659,6 +667,27 @@ export interface ActionStatusResponse {
   running: boolean
 }
 
+export interface BackendUpdateCommit {
+  sha: string
+  summary: string
+  author: string
+  at: number
+}
+
+/** Shape of `GET /api/hermes/update/check` — the backend's own update state.
+ *  Used by the desktop's remote update overlay so the backend version (not the
+ *  Electron client clone) drives "what's changed + Install" in remote mode. */
+export interface BackendUpdateCheckResponse {
+  install_method: string
+  current_version: string
+  behind: number | null
+  update_available: boolean
+  can_apply: boolean
+  update_command: string | null
+  message: string | null
+  commits?: BackendUpdateCommit[]
+}
+
 export interface AuxiliaryTaskAssignment {
   base_url: string
   model: string
@@ -706,4 +735,29 @@ export interface ModelAssignmentResponse {
    *  their helper tasks aren't following the switch. Only set on scope:'main'. */
   stale_aux?: StaleAuxAssignment[]
   tasks?: string[]
+}
+
+/** Cross-device session presence record (written by Hermes CLI). */
+export interface SessionPresenceRecord {
+  client?: string
+  cwd?: string
+  endpoint?: string
+  expires_at?: number
+  host?: string
+  instance_id?: string
+  metadata?: Record<string, unknown>
+  model?: string
+  pid?: number
+  profile?: string
+  session_id: string
+  session_key?: string
+  source?: string
+  status?: string
+  title?: string
+  updated_at?: number
+  version?: number
+}
+
+export interface SessionPresenceListResponse {
+  sessions: SessionPresenceRecord[]
 }

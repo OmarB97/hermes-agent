@@ -660,6 +660,37 @@ class TestWebServerEndpoints:
             for r in results
         )
 
+    def test_get_session_messages_follows_compression_tip(self):
+        """Reading a compressed session by its old id should hydrate from the
+        live continuation, matching /resume behavior."""
+        import time as _time
+
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="desktop-root", source="cli")
+            db.append_message(session_id="desktop-root", role="user", content="before compression")
+            db.end_session("desktop-root", "compression")
+            now = _time.time()
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = ?",
+                (now - 10, now - 5, "desktop-root"),
+            )
+            db.create_session(session_id="desktop-tip", source="cli", parent_session_id="desktop-root")
+            db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (now - 4, "desktop-tip"))
+            db.replace_messages("desktop-root", [])
+            db.append_message(session_id="desktop-tip", role="user", content="after compression")
+            db._conn.commit()
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/sessions/desktop-root/messages")
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert payload["session_id"] == "desktop-tip"
+        assert [m["content"] for m in payload["messages"]] == ["after compression"]
+
     def test_get_sessions_archived_is_boolean(self):
         from hermes_state import SessionDB
 
@@ -3953,6 +3984,39 @@ class TestPtyWebSocket:
 
         assert env["HERMES_TUI_INLINE"] == "1"
         assert env["HERMES_TUI_DISABLE_MOUSE"] == "1"
+
+    def test_resolve_chat_argv_applies_terminal_backend_config(
+        self, monkeypatch, _isolate_hermes_home
+    ):
+        import hermes_cli.main as main_mod
+
+        config_path = Path(os.environ["HERMES_HOME"]) / "config.yaml"
+        config_path.write_text(
+            "\n".join(
+                [
+                    "terminal:",
+                    "  backend: docker",
+                    "  docker_image: example/hermes-tools:latest",
+                    "  docker_extra_args:",
+                    "    - --network=host",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.delenv("TERMINAL_ENV", raising=False)
+        monkeypatch.delenv("TERMINAL_DOCKER_IMAGE", raising=False)
+        monkeypatch.delenv("TERMINAL_DOCKER_EXTRA_ARGS", raising=False)
+        monkeypatch.setattr(
+            main_mod,
+            "_make_tui_argv",
+            lambda project_root, tui_dev=False: (["node", "dist/entry.js"], "/tmp/ui-tui"),
+        )
+
+        _argv, _cwd, env = self.ws_module._resolve_chat_argv()
+
+        assert env["TERMINAL_ENV"] == "docker"
+        assert env["TERMINAL_DOCKER_IMAGE"] == "example/hermes-tools:latest"
+        assert env["TERMINAL_DOCKER_EXTRA_ARGS"] == '["--network=host"]'
 
     def test_rejects_when_embedded_chat_disabled(self, monkeypatch):
         monkeypatch.setattr(self.ws_module, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", False)
