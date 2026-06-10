@@ -16,6 +16,10 @@ export const HERMES_SESSION_MIME = 'application/x-hermes-session'
  * ride as a type for drop zones to filter drags they would act on. */
 export const HERMES_SESSION_PINNED_MIME = 'application/x-hermes-session-pinned'
 
+/** Marker MIME set when the dragged row comes from the Archived section, for
+ * the same dragover-only-sees-types reason as the pinned marker. */
+export const HERMES_SESSION_ARCHIVED_MIME = 'application/x-hermes-session-archived'
+
 export interface SessionDragPayload {
   id: string
   profile: string
@@ -24,6 +28,8 @@ export interface SessionDragPayload {
   pinId?: string
   /** True when the drag started on a pinned sidebar row. */
   pinned?: boolean
+  /** True when the drag started on an Archived-section row. */
+  archived?: boolean
 }
 
 export function writeSessionDrag(transfer: DataTransfer, payload: SessionDragPayload) {
@@ -31,6 +37,10 @@ export function writeSessionDrag(transfer: DataTransfer, payload: SessionDragPay
 
   if (payload.pinned) {
     transfer.setData(HERMES_SESSION_PINNED_MIME, '1')
+  }
+
+  if (payload.archived) {
+    transfer.setData(HERMES_SESSION_ARCHIVED_MIME, '1')
   }
 
   transfer.effectAllowed = 'copy'
@@ -42,6 +52,10 @@ export function dragHasSession(transfer: DataTransfer | null) {
 
 export function dragSessionIsPinned(transfer: DataTransfer | null) {
   return Boolean(transfer) && Array.from(transfer!.types || []).includes(HERMES_SESSION_PINNED_MIME)
+}
+
+export function dragSessionIsArchived(transfer: DataTransfer | null) {
+  return Boolean(transfer) && Array.from(transfer!.types || []).includes(HERMES_SESSION_ARCHIVED_MIME)
 }
 
 export function readSessionDrag(transfer: DataTransfer | null): null | SessionDragPayload {
@@ -56,6 +70,7 @@ export function readSessionDrag(transfer: DataTransfer | null): null | SessionDr
 
     return parsed.id
       ? {
+          archived: Boolean(parsed.archived),
           id: parsed.id,
           pinId: parsed.pinId || parsed.id,
           pinned: Boolean(parsed.pinned),

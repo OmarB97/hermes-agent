@@ -55,6 +55,7 @@ import {
   $panesFlipped,
   $pinnedSessionIds,
   $sidebarAgentsGrouped,
+  $sidebarArchivedOpen,
   $sidebarCronOpen,
   $sidebarOpen,
   $sidebarOverlayMounted,
@@ -66,6 +67,7 @@ import {
   reorderPinnedSession,
   SESSION_SEARCH_FOCUS_EVENT,
   setSidebarAgentsGrouped,
+  setSidebarArchivedOpen,
   setSidebarCronOpen,
   setSidebarPinsOpen,
   setSidebarRecentsOpen,
@@ -83,6 +85,9 @@ import {
   normalizeProfileKey
 } from '@/store/profile'
 import {
+  $archivedSessions,
+  $archivedSessionsLoading,
+  $archivedSessionsTotal,
   $cronSessions,
   $messagingPlatformTotals,
   $messagingSessions,
@@ -95,6 +100,13 @@ import {
   $workingSessionIds,
   sessionPinId
 } from '@/store/session'
+import {
+  $sidebarSelection,
+  pruneSidebarSelection,
+  rangeSelectSessions,
+  type SidebarSectionKey,
+  toggleSessionSelected
+} from '@/store/sidebar-selection'
 
 import { type AppView, ARTIFACTS_ROUTE, MESSAGING_ROUTE, SKILLS_ROUTE } from '../../routes'
 import { SidebarPanelLabel } from '../../shell/sidebar-label'
@@ -103,6 +115,7 @@ import type { SidebarNavItem } from '../../types'
 import { SidebarCronJobsSection } from './cron-jobs-section'
 import { ProfileRail } from './profile-switcher'
 import { SidebarRemoteSessionsSection } from './remote-sessions-section'
+import { SelectionActionBar } from './selection-action-bar'
 import { SidebarSessionRow } from './session-row'
 import { sessionDropAnchor, useSessionDropZone } from './use-session-drop-zone'
 import { VirtualSessionList } from './virtual-session-list'
@@ -292,6 +305,14 @@ interface ChatSidebarProps extends React.ComponentProps<typeof Sidebar> {
   onNewSessionInWorkspace: (path: null | string) => void
   onManageCronJob: (jobId: string) => void
   onTriggerCronJob: (jobId: string) => void
+  /** Archived section: fetch the row page on first expand / page further. */
+  onEnsureArchivedLoaded?: () => void
+  onLoadMoreArchived?: () => void
+  onRestoreSession?: (sessionId: string) => void
+  /** Bulk verbs for the multi-select action bar. */
+  onArchiveSessions?: (sessionIds: string[]) => Promise<unknown> | void
+  onRestoreSessions?: (sessionIds: string[]) => Promise<unknown> | void
+  onDeleteSessions?: (sessionIds: string[]) => Promise<unknown> | void
 }
 
 export function ChatSidebar({
@@ -307,7 +328,13 @@ export function ChatSidebar({
   onArchiveAllSessions,
   onNewSessionInWorkspace,
   onManageCronJob,
-  onTriggerCronJob
+  onTriggerCronJob,
+  onEnsureArchivedLoaded,
+  onLoadMoreArchived,
+  onRestoreSession,
+  onArchiveSessions,
+  onRestoreSessions,
+  onDeleteSessions
 }: ChatSidebarProps) {
   const { t } = useI18n()
   const s = t.sidebar
@@ -328,6 +355,11 @@ export function ChatSidebar({
   const [remoteOpen, setRemoteOpen] = useState(true)
   const [archiveAllOpen, setArchiveAllOpen] = useState(false)
   const [archiveAllSubmitting, setArchiveAllSubmitting] = useState(false)
+  const archivedOpen = useStore($sidebarArchivedOpen)
+  const archivedSessions = useStore($archivedSessions)
+  const archivedTotal = useStore($archivedSessionsTotal)
+  const archivedLoading = useStore($archivedSessionsLoading)
+  const selection = useStore($sidebarSelection)
   const messagingSessions = useStore($messagingSessions)
   const messagingPlatformTotals = useStore($messagingPlatformTotals)
   const messagingTruncated = useStore($messagingTruncated)
@@ -452,7 +484,9 @@ export function ChatSidebar({
   // target section auto-opens so the landed row is visible even when it was
   // collapsed.
   const pinnedDropZone = useSessionDropZone({
-    acceptPinned: false,
+    // Archived rows can't pin — the Pinned section resolves pins against the
+    // live (unarchived) slices, so accepting one would pin into the void.
+    accepts: flags => !flags.pinned && !flags.archived,
     onDropSession: (payload, event) => {
       // Translate the anchor row into an index in the RAW pinned-id store:
       // rendered rows can be a subset of stored ids (a pin whose session
@@ -477,8 +511,16 @@ export function ChatSidebar({
   })
 
   const sessionsDropZone = useSessionDropZone({
-    acceptPinned: true,
+    // Pinned rows drop here to unpin; Archived rows drop here to restore.
+    accepts: flags => flags.pinned || flags.archived,
     onDropSession: (payload, event) => {
+      if (payload.archived) {
+        onRestoreSession?.(payload.id)
+        setSidebarRecentsOpen(true)
+
+        return
+      }
+
       unpinSession(payload.pinId ?? payload.id)
 
       // Positional drop applies only to the flat list — grouped and
@@ -501,6 +543,18 @@ export function ChatSidebar({
       }
 
       setSidebarRecentsOpen(true)
+    }
+  })
+
+  // The Archived section is itself a drop target: dragging any live row onto
+  // it archives the row — the spatial mirror of dragging an archived row onto
+  // Sessions to restore it.
+  const archivedDropZone = useSessionDropZone({
+    accepts: flags => !flags.archived,
+    onDropSession: payload => {
+      onArchiveSession(payload.id)
+      setSidebarArchivedOpen(true)
+      onEnsureArchivedLoaded?.()
     }
   })
 
@@ -720,6 +774,58 @@ export function ChatSidebar({
   ])
 
   const displayAgentSessions = agentSessions
+
+  // Resolve selected ids to loaded rows for the action bar (pin ids need the
+  // lineage root; archive/restore need the owning profile).
+  const selectionSessionsById = useMemo(() => {
+    const map = new Map<string, SessionInfo>()
+
+    for (const session of [...archivedSessions, ...searchResults, ...cronSessions, ...messagingSessions, ...visibleSessions]) {
+      map.set(session.id, session)
+    }
+
+    return map
+  }, [archivedSessions, searchResults, cronSessions, messagingSessions, visibleSessions])
+
+  // Drop selected ids whose rows left their section (archived elsewhere,
+  // deleted on another device, paged out) so the bar's count stays honest.
+  useEffect(() => {
+    const section = selection.section
+
+    if (!section || !selection.ids.length) {
+      return
+    }
+
+    let rows: SessionInfo[]
+
+    switch (section) {
+      case 'archived':
+        rows = archivedSessions
+
+        break
+
+      case 'pinned':
+        rows = pinnedSessions
+
+        break
+
+      case 'results':
+        rows = searchResults
+
+        break
+
+      case 'sessions':
+        rows = agentSessions
+
+        break
+      default: {
+        const sourceId = section.slice('messaging:'.length)
+        rows = messagingGroups.find(group => group.sourceId === sourceId)?.sessions ?? []
+      }
+    }
+
+    pruneSidebarSelection(section, new Set(rows.map(row => row.id)))
+  }, [selection, agentSessions, archivedSessions, messagingGroups, pinnedSessions, searchResults])
 
   // Pagination is scope-aware. In "All profiles" mode it tracks the global
   // unified set. When scoped to one profile it must compare that profile's own
@@ -953,6 +1059,7 @@ export function ChatSidebar({
             open
             pinned={false}
             rootClassName="min-h-0 flex-1 p-0"
+            sectionKey="results"
             sessions={searchResults}
             workingSessionIdSet={workingSessionIdSet}
           />
@@ -976,6 +1083,7 @@ export function ChatSidebar({
             open={pinsOpen}
             pinned
             rootClassName="shrink-0 p-0 pb-1"
+            sectionKey="pinned"
             sessions={pinnedSessions}
             sortable={pinnedSessions.length > 1}
             workingSessionIdSet={workingSessionIdSet}
@@ -1082,6 +1190,7 @@ export function ChatSidebar({
             open={agentsOpen}
             pinned={false}
             rootClassName="min-h-0 flex-1 p-0"
+            sectionKey="sessions"
             sessions={displayAgentSessions}
             sortable={!showAllProfiles && agentSessions.length > 1}
             workingSessionIdSet={workingSessionIdSet}
@@ -1123,6 +1232,7 @@ export function ChatSidebar({
               open={messagingOpen[group.sourceId] !== false}
               pinned={false}
               rootClassName="shrink-0 p-0"
+              sectionKey={`messaging:${group.sourceId}`}
               sessions={group.sessions}
               workingSessionIdSet={workingSessionIdSet}
             />
@@ -1151,7 +1261,79 @@ export function ChatSidebar({
           />
         )}
 
+        {/* Archived sits LAST in the section stack: it's cold storage, below
+            every live surface (pins, recents, platforms, cron, presence), but
+            always one scroll away — no settings detour. Collapsed by default;
+            hidden entirely while nothing is archived. Rows are fetched lazily
+            on first expand (the boot refresh only resolves the count). */}
+        {contentVisible && !trimmedQuery && (archivedTotal > 0 || archivedSessions.length > 0) && (
+          <SidebarSessionsSection
+            activeSessionId={activeSidebarSessionId}
+            archivedRows
+            contentClassName="flex max-h-56 shrink-0 flex-col gap-px overflow-y-auto overscroll-contain pb-1.75"
+            dropActive={archivedDropZone.active}
+            dropHandlers={archivedDropZone.dropHandlers}
+            emptyState={
+              archivedLoading ? (
+                <SidebarSessionSkeletons />
+              ) : (
+                <div className="flex min-h-7 items-center rounded-lg pl-2 text-[0.75rem] text-(--ui-text-tertiary)">
+                  {s.archivedEmpty}
+                </div>
+              )
+            }
+            footer={
+              archivedTotal > archivedSessions.length ? (
+                <SidebarLoadMoreRow
+                  loading={archivedLoading}
+                  onClick={() => onLoadMoreArchived?.()}
+                  step={Math.min(SIDEBAR_SESSIONS_PAGE_SIZE, archivedTotal - archivedSessions.length)}
+                />
+              ) : null
+            }
+            label={s.archived}
+            labelIcon={
+              <span className="grid w-4 shrink-0 place-items-center text-(--ui-text-quaternary)">
+                <Codicon name="archive" size="0.75rem" />
+              </span>
+            }
+            labelMeta={
+              archivedOpen
+                ? countLabel(archivedSessions.length, Math.max(archivedTotal, archivedSessions.length))
+                : String(Math.max(archivedTotal, archivedSessions.length))
+            }
+            onArchiveSession={onArchiveSession}
+            onDeleteSession={onDeleteSession}
+            onRestoreSession={onRestoreSession}
+            onResumeSession={onResumeSession}
+            onToggle={() => {
+              const next = !archivedOpen
+              setSidebarArchivedOpen(next)
+
+              if (next) {
+                onEnsureArchivedLoaded?.()
+              }
+            }}
+            onTogglePin={pinSession}
+            open={archivedOpen}
+            pinned={false}
+            rootClassName="shrink-0 p-0"
+            sectionKey="archived"
+            sessions={archivedSessions}
+            workingSessionIdSet={workingSessionIdSet}
+          />
+        )}
+
         {contentVisible && !showSessionSections && <div className="min-h-0 flex-1" />}
+
+        {contentVisible && selection.ids.length > 0 && (
+          <SelectionActionBar
+            onArchiveSessions={ids => onArchiveSessions?.(ids)}
+            onDeleteSessions={ids => onDeleteSessions?.(ids)}
+            onRestoreSessions={ids => onRestoreSessions?.(ids)}
+            sessionsById={selectionSessionsById}
+          />
+        )}
 
         {contentVisible && (
           <div className="shrink-0 px-0.5 pb-1 pt-0.5">
@@ -1312,6 +1494,11 @@ interface SidebarSessionsSectionProps {
   onTogglePin: (sessionId: string) => void
   onNewSessionInWorkspace?: (path: null | string) => void
   pinned: boolean
+  /** Identity for multi-select; sections without a key don't select. */
+  sectionKey?: SidebarSectionKey
+  /** Rows live in the Archived section (restore semantics, no pinning). */
+  archivedRows?: boolean
+  onRestoreSession?: (sessionId: string) => void
   rootClassName?: string
   contentClassName?: string
   emptyState: React.ReactNode
@@ -1343,6 +1530,9 @@ function SidebarSessionsSection({
   onTogglePin,
   onNewSessionInWorkspace,
   pinned,
+  sectionKey,
+  archivedRows = false,
+  onRestoreSession,
   rootClassName,
   contentClassName,
   emptyState,
@@ -1362,15 +1552,52 @@ function SidebarSessionsSection({
   const showEmptyState = forceEmptyState || (!hasGroupedSessions && sessions.length === 0)
   const dndActive = sortable && !!onReorder
 
+  // One subscription per SECTION (not per row): rows receive plain props, so
+  // only sections re-render as the selection changes.
+  const selection = useStore($sidebarSelection)
+  const selectable = Boolean(sectionKey)
+  const selectionActive = selectable && selection.section === sectionKey && selection.ids.length > 0
+
+  const selectedIdSet = useMemo(
+    () => (selectionActive ? new Set(selection.ids) : undefined),
+    [selectionActive, selection.ids]
+  )
+
+  // Range anchors resolve against this flat order. In grouped views it can
+  // differ from the rendered order — the range is still a contiguous run of
+  // the section's recency list, which is the least surprising interpretation.
+  const orderedIds = useMemo(() => sessions.map(s => s.id), [sessions])
+
+  const handleToggleSelect = useCallback(
+    (sessionId: string, mode: 'range' | 'single') => {
+      if (!sectionKey) {
+        return
+      }
+
+      if (mode === 'range') {
+        rangeSelectSessions(sectionKey, sessionId, orderedIds)
+      } else {
+        toggleSessionSelected(sectionKey, sessionId)
+      }
+    },
+    [sectionKey, orderedIds]
+  )
+
   const renderRow = (session: SessionInfo) => {
     const rowProps = {
+      archived: archivedRows,
+      checked: selectedIdSet?.has(session.id) ?? false,
       isPinned: pinned,
       isSelected: session.id === activeSessionId,
       isWorking: workingSessionIdSet.has(session.id),
       onArchive: () => onArchiveSession(session.id),
       onDelete: () => onDeleteSession(session.id),
       onPin: () => onTogglePin(sessionPinId(session)),
+      onRestore: onRestoreSession ? () => onRestoreSession(session.id) : undefined,
       onResume: () => onResumeSession(session.id),
+      onToggleSelect: sectionKey ? (mode: 'range' | 'single') => handleToggleSelect(session.id, mode) : undefined,
+      selectable,
+      selectionActive,
       session
     }
 
@@ -1444,11 +1671,17 @@ function SidebarSessionsSection({
     inner = (
       <VirtualSessionList
         activeSessionId={activeSessionId}
+        archived={archivedRows}
         onArchiveSession={onArchiveSession}
         onDeleteSession={onDeleteSession}
+        onRestoreSession={onRestoreSession}
         onResumeSession={onResumeSession}
         onTogglePin={onTogglePin}
+        onToggleSelect={sectionKey ? handleToggleSelect : undefined}
         pinned={pinned}
+        selectable={selectable}
+        selectedIds={selectedIdSet}
+        selectionActive={selectionActive}
         sessions={sessions}
         sortable={sortable}
         workingSessionIdSet={workingSessionIdSet}
@@ -1671,6 +1904,12 @@ interface SortableSessionRowProps {
   onDelete: () => void
   onPin: () => void
   onResume: () => void
+  archived?: boolean
+  checked?: boolean
+  onRestore?: () => void
+  onToggleSelect?: (mode: 'range' | 'single') => void
+  selectable?: boolean
+  selectionActive?: boolean
 }
 
 function SortableSidebarSessionRow(props: SortableSessionRowProps) {

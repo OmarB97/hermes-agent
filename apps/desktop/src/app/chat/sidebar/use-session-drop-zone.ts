@@ -2,14 +2,24 @@ import { type DragEvent as ReactDragEvent, useCallback, useRef, useState } from 
 
 import {
   dragHasSession,
+  dragSessionIsArchived,
   dragSessionIsPinned,
   readSessionDrag,
   type SessionDragPayload
 } from '@/app/chat/composer/inline-refs'
 
+/** Drag-state flags readable during dragover (they ride as marker MIME types;
+ * the payload itself is sealed until drop). */
+export interface SessionDragFlags {
+  pinned: boolean
+  archived: boolean
+}
+
 interface SessionDropZoneOptions {
-  /** Which drags this zone acts on: pinned rows (true) or unpinned rows (false). */
-  acceptPinned: boolean
+  /** Which drags this zone acts on — e.g. Pinned takes unpinned+unarchived
+   * rows, Sessions takes pinned (unpin) or archived (restore) rows, Archived
+   * takes anything not already archived. */
+  accepts: (flags: SessionDragFlags) => boolean
   /** The drop event rides along so handlers can resolve the drop position
    * (see {@link sessionDropAnchor}). */
   onDropSession: (session: SessionDragPayload, event: ReactDragEvent) => void
@@ -53,14 +63,18 @@ export function sessionDropAnchor(event: ReactDragEvent): null | SessionDropAnch
  *
  * Spread `dropHandlers` onto the section container; style off `active`.
  */
-export function useSessionDropZone({ acceptPinned, onDropSession }: SessionDropZoneOptions) {
+export function useSessionDropZone({ accepts: acceptsFlags, onDropSession }: SessionDropZoneOptions) {
   const [active, setActive] = useState(false)
   const depth = useRef(0)
 
   const accepts = useCallback(
     (event: ReactDragEvent) =>
-      dragHasSession(event.dataTransfer) && dragSessionIsPinned(event.dataTransfer) === acceptPinned,
-    [acceptPinned]
+      dragHasSession(event.dataTransfer) &&
+      acceptsFlags({
+        archived: dragSessionIsArchived(event.dataTransfer),
+        pinned: dragSessionIsPinned(event.dataTransfer)
+      }),
+    [acceptsFlags]
   )
 
   const reset = useCallback(() => {

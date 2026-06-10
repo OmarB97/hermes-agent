@@ -3,6 +3,7 @@ import type * as React from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
+  HERMES_SESSION_ARCHIVED_MIME,
   HERMES_SESSION_MIME,
   HERMES_SESSION_PINNED_MIME,
   readSessionDrag,
@@ -10,7 +11,7 @@ import {
   writeSessionDrag
 } from '@/app/chat/composer/inline-refs'
 
-import { sessionDropAnchor, useSessionDropZone } from './use-session-drop-zone'
+import { type SessionDragFlags, sessionDropAnchor, useSessionDropZone } from './use-session-drop-zone'
 
 // jsdom has no DataTransfer; a plain object with the same surface is enough
 // for both the writer (setData/effectAllowed) and the zone (types/getData).
@@ -38,6 +39,7 @@ function sessionTransfer(payload: SessionDragPayload) {
 }
 
 const UNPINNED_ROW: SessionDragPayload = {
+  archived: false,
   id: 'live-1',
   pinId: 'root-1',
   pinned: false,
@@ -46,6 +48,7 @@ const UNPINNED_ROW: SessionDragPayload = {
 }
 
 const PINNED_ROW: SessionDragPayload = {
+  archived: false,
   id: 'live-2',
   pinId: 'root-2',
   pinned: true,
@@ -53,14 +56,29 @@ const PINNED_ROW: SessionDragPayload = {
   title: 'Pinned session'
 }
 
+const ARCHIVED_ROW: SessionDragPayload = {
+  archived: true,
+  id: 'live-3',
+  pinId: 'root-3',
+  pinned: false,
+  profile: 'default',
+  title: 'Archived session'
+}
+
+// The real zone predicates: Pinned takes fresh rows, Sessions takes rows it
+// can unpin or restore, Archived takes anything not already archived.
+const PINNED_ZONE = (flags: SessionDragFlags) => !flags.pinned && !flags.archived
+const SESSIONS_ZONE = (flags: SessionDragFlags) => flags.pinned || flags.archived
+const ARCHIVED_ZONE = (flags: SessionDragFlags) => !flags.archived
+
 function Probe({
-  acceptPinned,
+  accepts,
   onDropSession
 }: {
-  acceptPinned: boolean
+  accepts: (flags: SessionDragFlags) => boolean
   onDropSession: (session: SessionDragPayload) => void
 }) {
-  const { active, dropHandlers } = useSessionDropZone({ acceptPinned, onDropSession })
+  const { active, dropHandlers } = useSessionDropZone({ accepts, onDropSession })
 
   return (
     <div data-active={active ? 'true' : 'false'} data-testid="zone" {...dropHandlers}>
@@ -93,6 +111,7 @@ describe('writeSessionDrag / readSessionDrag pin metadata', () => {
     })
 
     expect(readSessionDrag(transfer)).toEqual({
+      archived: false,
       id: 'legacy-1',
       pinId: 'legacy-1',
       pinned: false,
@@ -100,12 +119,19 @@ describe('writeSessionDrag / readSessionDrag pin metadata', () => {
       title: 'Old payload'
     })
   })
+
+  it('flags Archived-section drags as a readable type', () => {
+    const transfer = sessionTransfer(ARCHIVED_ROW)
+
+    expect(Array.from(transfer.types)).toContain(HERMES_SESSION_ARCHIVED_MIME)
+    expect(readSessionDrag(transfer)).toEqual(ARCHIVED_ROW)
+  })
 })
 
 describe('useSessionDropZone', () => {
-  it('accepts an unpinned row drag when acceptPinned=false and drops it', () => {
+  it('accepts an unpinned row drag in the Pinned zone and drops it', () => {
     const onDropSession = vi.fn()
-    render(<Probe acceptPinned={false} onDropSession={onDropSession} />)
+    render(<Probe accepts={PINNED_ZONE} onDropSession={onDropSession} />)
     const zone = screen.getByTestId('zone')
     const transfer = sessionTransfer(UNPINNED_ROW)
 
@@ -121,9 +147,9 @@ describe('useSessionDropZone', () => {
     expect(zone.dataset.active).toBe('false')
   })
 
-  it('accepts a pinned row drag when acceptPinned=true and drops it', () => {
+  it('accepts a pinned row drag in the Sessions zone and drops it', () => {
     const onDropSession = vi.fn()
-    render(<Probe acceptPinned onDropSession={onDropSession} />)
+    render(<Probe accepts={SESSIONS_ZONE} onDropSession={onDropSession} />)
     const zone = screen.getByTestId('zone')
     const transfer = sessionTransfer(PINNED_ROW)
 
@@ -134,9 +160,46 @@ describe('useSessionDropZone', () => {
     expect(onDropSession).toHaveBeenCalledWith(PINNED_ROW, expect.objectContaining({ type: 'drop' }))
   })
 
+  it('restores an archived row dropped on the Sessions zone, and keeps it out of Pinned', () => {
+    const onDropSession = vi.fn()
+    const { unmount } = render(<Probe accepts={SESSIONS_ZONE} onDropSession={onDropSession} />)
+    const sessionsZone = screen.getByTestId('zone')
+    const transfer = sessionTransfer(ARCHIVED_ROW)
+
+    fireEvent.dragEnter(sessionsZone, { dataTransfer: transfer })
+    expect(sessionsZone.dataset.active).toBe('true')
+
+    fireEvent.drop(sessionsZone, { dataTransfer: transfer })
+    expect(onDropSession).toHaveBeenCalledWith(ARCHIVED_ROW, expect.objectContaining({ type: 'drop' }))
+    unmount()
+
+    // The Pinned zone must never light up for an archived drag — a pin can't
+    // resolve an archived row.
+    const onPinnedDrop = vi.fn()
+    render(<Probe accepts={PINNED_ZONE} onDropSession={onPinnedDrop} />)
+    const pinnedZone = screen.getByTestId('zone')
+
+    fireEvent.dragEnter(pinnedZone, { dataTransfer: sessionTransfer(ARCHIVED_ROW) })
+    expect(pinnedZone.dataset.active).toBe('false')
+  })
+
+  it('archives a live row dropped on the Archived zone but ignores archived rows there', () => {
+    const onDropSession = vi.fn()
+    render(<Probe accepts={ARCHIVED_ZONE} onDropSession={onDropSession} />)
+    const zone = screen.getByTestId('zone')
+
+    fireEvent.dragEnter(zone, { dataTransfer: sessionTransfer(PINNED_ROW) })
+    expect(zone.dataset.active).toBe('true')
+    fireEvent.drop(zone, { dataTransfer: sessionTransfer(PINNED_ROW) })
+    expect(onDropSession).toHaveBeenCalledWith(PINNED_ROW, expect.objectContaining({ type: 'drop' }))
+
+    fireEvent.dragEnter(zone, { dataTransfer: sessionTransfer(ARCHIVED_ROW) })
+    expect(zone.dataset.active).toBe('false')
+  })
+
   it('ignores drags whose pin-state it would not act on', () => {
     const onDropSession = vi.fn()
-    render(<Probe acceptPinned={false} onDropSession={onDropSession} />)
+    render(<Probe accepts={PINNED_ZONE} onDropSession={onDropSession} />)
     const zone = screen.getByTestId('zone')
     const transfer = sessionTransfer(PINNED_ROW)
 
@@ -152,7 +215,7 @@ describe('useSessionDropZone', () => {
 
   it('ignores non-session drags entirely', () => {
     const onDropSession = vi.fn()
-    render(<Probe acceptPinned={false} onDropSession={onDropSession} />)
+    render(<Probe accepts={PINNED_ZONE} onDropSession={onDropSession} />)
     const zone = screen.getByTestId('zone')
     const transfer = fakeTransfer({ 'text/plain': 'not a session' })
 
@@ -164,7 +227,7 @@ describe('useSessionDropZone', () => {
   })
 
   it('keeps the highlight while moving across nested children', () => {
-    render(<Probe acceptPinned={false} onDropSession={vi.fn()} />)
+    render(<Probe accepts={PINNED_ZONE} onDropSession={vi.fn()} />)
     const zone = screen.getByTestId('zone')
     const child = screen.getByTestId('zone-child')
     const transfer = sessionTransfer(UNPINNED_ROW)
@@ -179,7 +242,7 @@ describe('useSessionDropZone', () => {
   })
 
   it('does not wedge after stray leave events from unaccepted drags', () => {
-    render(<Probe acceptPinned={false} onDropSession={vi.fn()} />)
+    render(<Probe accepts={PINNED_ZONE} onDropSession={vi.fn()} />)
     const zone = screen.getByTestId('zone')
     const pinned = sessionTransfer(PINNED_ROW)
 

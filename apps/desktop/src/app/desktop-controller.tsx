@@ -21,9 +21,12 @@ import {
 } from '../lib/session-source'
 import { refreshCronJobs } from '../store/cron'
 import {
+  $archivedSessionsLimit,
   $panesFlipped,
   $pinnedSessionIds,
   $sessionsLimit,
+  $sidebarArchivedOpen,
+  bumpArchivedSessionsLimit,
   bumpSessionsLimit,
   FILE_BROWSER_DEFAULT_WIDTH,
   FILE_BROWSER_MAX_WIDTH,
@@ -45,6 +48,7 @@ import {
 } from '../store/profile'
 import {
   $activeSessionId,
+  $archivedSessions,
   $currentCwd,
   $freshDraftReady,
   $gatewayState,
@@ -56,6 +60,9 @@ import {
   mergeSessionPage,
   MESSAGING_SECTION_LIMIT,
   sessionPinId,
+  setArchivedSessions,
+  setArchivedSessionsLoading,
+  setArchivedSessionsTotal,
   setAwaitingResponse,
   setBusy,
   setCronSessions,
@@ -328,6 +335,54 @@ export function DesktopController() {
     setMessagingPlatformTotals(prev => ({ ...prev, [platform]: Math.max(total, incoming.length) }))
   }, [])
 
+  // Archived slice (sidebar Archived section). Cheap by default: while the
+  // section has never been expanded this only resolves the TOTAL (limit-1
+  // probe) so the header count is honest; once the user has expanded it (or a
+  // force is requested) it fetches the full page at the current pager limit.
+  // Cron rows are excluded — scheduler history isn't restorable user work and
+  // would bury the sessions someone deliberately archived.
+  const archivedPageFetchedRef = useRef(false)
+
+  const refreshArchivedSessions = useCallback(async (options?: { force?: boolean }) => {
+    const wantPage = Boolean(options?.force) || archivedPageFetchedRef.current || $sidebarArchivedOpen.get()
+
+    setArchivedSessionsLoading(true)
+
+    try {
+      const scope = $profileScope.get()
+      const profile = scope === ALL_PROFILES ? 'all' : scope
+      const limit = wantPage ? $archivedSessionsLimit.get() : 1
+
+      const result = await listAllProfileSessions(limit, 0, 'only', 'recent', profile, {
+        excludeSources: ['cron']
+      })
+
+      const total = Math.max(typeof result.total === 'number' ? result.total : result.sessions.length, 0)
+
+      if (wantPage) {
+        archivedPageFetchedRef.current = true
+        setArchivedSessions(result.sessions)
+        setArchivedSessionsTotal(Math.max(total, result.sessions.length))
+      } else {
+        // Count probe only — leave optimistically-archived rows alone.
+        setArchivedSessionsTotal(Math.max(total, $archivedSessions.get().length))
+      }
+    } catch {
+      // Non-fatal: the section keeps its last-known rows/count.
+    } finally {
+      setArchivedSessionsLoading(false)
+    }
+  }, [])
+
+  const ensureArchivedLoaded = useCallback(() => {
+    void refreshArchivedSessions({ force: true })
+  }, [refreshArchivedSessions])
+
+  const loadMoreArchivedSessions = useCallback(() => {
+    bumpArchivedSessionsLimit()
+    void refreshArchivedSessions({ force: true })
+  }, [refreshArchivedSessions])
+
   const refreshSessions = useCallback(async () => {
     const requestId = refreshSessionsRequestRef.current + 1
     refreshSessionsRequestRef.current = requestId
@@ -397,7 +452,8 @@ export function DesktopController() {
 
     void refreshCronSessions()
     void refreshMessagingSessions()
-  }, [refreshCronSessions, refreshMessagingSessions])
+    void refreshArchivedSessions()
+  }, [refreshArchivedSessions, refreshCronSessions, refreshMessagingSessions])
 
   const loadMoreSessions = useCallback(() => {
     bumpSessionsLimit()
@@ -572,12 +628,15 @@ export function DesktopController() {
   const {
     archiveAllSessions,
     archiveSession,
+    archiveSessionsBulk,
     branchCurrentSession,
     createBackendSessionForSend,
     createSessionOnDevice,
+    deleteSessionsBulk,
     openSettings,
     openPresenceSession,
     removeSession,
+    restoreSessionsBulk,
     resumeSession,
     selectSidebarItem,
     startFreshSessionDraft
@@ -766,14 +825,20 @@ export function DesktopController() {
       currentView={currentView}
       onArchiveAllSessions={() => archiveAllSessions().then(() => refreshSessions())}
       onArchiveSession={sessionId => void archiveSession(sessionId)}
+      onArchiveSessions={sessionIds => archiveSessionsBulk(sessionIds)}
       onCreateOnDevice={endpoint => void createSessionOnDevice(endpoint)}
       onDeleteSession={sessionId => void removeSession(sessionId)}
+      onDeleteSessions={sessionIds => deleteSessionsBulk(sessionIds)}
+      onEnsureArchivedLoaded={ensureArchivedLoaded}
+      onLoadMoreArchived={loadMoreArchivedSessions}
       onLoadMoreMessaging={loadMoreMessagingForPlatform}
       onLoadMoreProfileSessions={loadMoreSessionsForProfile}
       onLoadMoreSessions={loadMoreSessions}
       onManageCronJob={() => navigate(CRON_ROUTE)}
       onNavigate={selectSidebarItem}
       onNewSessionInWorkspace={startSessionInWorkspace}
+      onRestoreSession={sessionId => void restoreSessionsBulk([sessionId])}
+      onRestoreSessions={sessionIds => restoreSessionsBulk(sessionIds)}
       onResumeSession={sessionId => navigate(sessionRoute(sessionId))}
       onTriggerCronJob={jobId => void triggerCronJob(jobId).then(() => refreshCronJobs())}
     />

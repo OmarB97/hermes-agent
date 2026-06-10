@@ -29,6 +29,19 @@ export interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
   dragHandleProps?: React.HTMLAttributes<HTMLElement>
   /** Presence record for this session (from another device) — indicates live/active state. */
   presence?: SessionPresenceRecord
+  /** Row renders in the Archived section: menus swap Archive→Restore, pin
+   * gestures are disabled (a pin can't resolve an archived row), and the drag
+   * payload carries the archived marker so drop zones can offer "restore". */
+  archived?: boolean
+  onRestore?: () => void
+  /** Row participates in its section's multi-select. */
+  selectable?: boolean
+  /** ≥1 row in THIS section is selected → clicks toggle membership instead of
+   * resuming, and the leading slot becomes a checkbox. */
+  selectionActive?: boolean
+  /** This row is in the current selection. */
+  checked?: boolean
+  onToggleSelect?: (mode: 'range' | 'single') => void
 }
 
 const AGE_TICKS: ReadonlyArray<[number, 'ageDay' | 'ageHour' | 'ageMin']> = [
@@ -62,6 +75,12 @@ export function SidebarSessionRow({
   reorderable = false,
   dragging = false,
   dragHandleProps,
+  archived = false,
+  onRestore,
+  selectable = false,
+  selectionActive = false,
+  checked = false,
+  onToggleSelect,
   className,
   style,
   ref,
@@ -77,11 +96,19 @@ export function SidebarSessionRow({
   // session is waiting on the user.
   const needsInput = useStore($attentionSessionIds).includes(session.id)
 
+  const toggleSelect = (mode: 'range' | 'single') => {
+    triggerHaptic('selection')
+    onToggleSelect?.(mode)
+  }
+
   return (
     <SessionContextMenu
+      archived={archived}
       onArchive={onArchive}
       onDelete={onDelete}
       onPin={onPin}
+      onRestore={onRestore}
+      onSelect={selectable && onToggleSelect ? () => toggleSelect('single') : undefined}
       pinned={isPinned}
       profile={session.profile}
       sessionId={session.id}
@@ -90,14 +117,16 @@ export function SidebarSessionRow({
       <div
         className={cn(
           'group relative grid min-h-[1.625rem] cursor-pointer grid-cols-[minmax(0,1fr)_auto] items-center rounded-md transition-colors duration-100 ease-out hover:bg-(--ui-row-hover-background) hover:transition-none',
-          isSelected && 'bg-(--ui-row-active-background)',
+          (isSelected || checked) && 'bg-(--ui-row-active-background)',
           isWorking && 'text-foreground',
           dragging && 'z-10 cursor-grabbing opacity-60 shadow-sm',
           className
         )}
+        data-selected={checked ? 'true' : undefined}
         data-session-id={session.id}
         data-working={isWorking ? 'true' : undefined}
         draggable
+        onDoubleClick={selectionActive ? () => onResume() : undefined}
         onDragStart={event => {
           // Reorder drags belong to dnd-kit (the grab handle) — cancel the
           // native drag so the two DnD systems don't fight.
@@ -108,6 +137,7 @@ export function SidebarSessionRow({
           }
 
           writeSessionDrag(event.dataTransfer, {
+            archived,
             id: session.id,
             pinId: sessionPinId(session),
             pinned: isPinned,
@@ -123,9 +153,41 @@ export function SidebarSessionRow({
         <button
           className="z-0 flex min-w-0 items-center gap-1.5 bg-transparent py-0.5 pl-2 pr-2 text-left"
           onClick={event => {
+            // While this section has an active selection, the row is a
+            // checklist entry: plain/⌘ click toggles membership, shift-click
+            // extends the range, double-click still resumes. Existing gestures
+            // (shift=pin, ⌘=new window) come back the moment selection clears.
+            if (selectionActive && onToggleSelect) {
+              event.preventDefault()
+              event.stopPropagation()
+              toggleSelect(event.shiftKey ? 'range' : 'single')
+
+              return
+            }
+
+            // ⌥-click starts a selection from a clean slate.
+            if (event.altKey && selectable && onToggleSelect) {
+              event.preventDefault()
+              event.stopPropagation()
+              toggleSelect('single')
+
+              return
+            }
+
             if (event.shiftKey) {
               event.preventDefault()
               event.stopPropagation()
+
+              // Pins can't resolve an archived row, so in the Archived section
+              // shift-click starts a selection instead of pinning.
+              if (archived) {
+                if (selectable && onToggleSelect) {
+                  toggleSelect('single')
+                }
+
+                return
+              }
+
               triggerHaptic('selection')
               onPin()
 
@@ -149,7 +211,23 @@ export function SidebarSessionRow({
           }}
           type="button"
         >
-          {reorderable ? (
+          {selectionActive ? (
+            // Selection mode: the dot/grabber column becomes the checkbox, so
+            // rows don't shift horizontally when a selection starts (same
+            // w-3.5 slot the other leading affordances use).
+            <span aria-checked={checked} className="grid w-3.5 shrink-0 place-items-center" role="checkbox">
+              <span
+                className={cn(
+                  'grid size-3 place-items-center rounded-[3px] border transition-colors',
+                  checked
+                    ? 'border-foreground/80 bg-foreground/90 text-(--ui-sidebar-surface-background,var(--background))'
+                    : 'border-(--ui-stroke-secondary) bg-transparent'
+                )}
+              >
+                {checked && <Codicon name="check" size="0.5rem" />}
+              </span>
+            </span>
+          ) : reorderable ? (
             <span
               {...dragHandleProps}
               aria-label={handleLabel}
@@ -219,9 +297,12 @@ export function SidebarSessionRow({
           </span>
           <div className="absolute inset-y-0 right-1 grid place-items-center">
             <SessionActionsMenu
+              archived={archived}
               onArchive={onArchive}
               onDelete={onDelete}
               onPin={onPin}
+              onRestore={onRestore}
+              onSelect={selectable && onToggleSelect ? () => toggleSelect('single') : undefined}
               pinned={isPinned}
               profile={session.profile}
               sessionId={session.id}

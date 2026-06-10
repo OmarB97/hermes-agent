@@ -862,6 +862,26 @@ export interface Translations {
     loading: string
     loadMore: string
     loadCount: (step: number) => string
+    archived: string
+    archivedEmpty: string
+    bulk: {
+      selectedCount: (count: number) => string
+      pin: string
+      unpin: string
+      archive: string
+      restore: string
+      delete: string
+      clearSelection: string
+      deleteDialogTitle: (count: number) => string
+      deleteDialogDesc: string
+      deleteConfirm: string
+      archivedToast: (count: number) => string
+      restoredToast: (count: number) => string
+      deletedToast: (count: number) => string
+      archiveFailed: (count: number) => string
+      restoreFailed: (count: number) => string
+      deleteFailed: (count: number) => string
+    }
     row: {
       pin: string
       unpin: string
@@ -870,6 +890,8 @@ export interface Translations {
       shareToCloud: string
       rename: string
       archive: string
+      restore: string
+      select: string
       newWindow: string
       copyIdFailed: string
       actionsFor: (title: string) => string

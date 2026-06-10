@@ -167,6 +167,13 @@ export const $messagingTruncated = atom<boolean>(false)
 // huge default profile doesn't keep "Load more" visible while browsing a small
 // one. Empty for single-profile users (fall back to $sessionsTotal).
 export const $sessionProfileTotals = atom<Record<string, number>>({})
+// Archived conversations, fetched as their own slice (archived='only') for the
+// sidebar's collapsed Archived section. Rows load lazily on first expand; the
+// boot refresh only resolves the TOTAL (cheap limit-1 probe) so the section
+// header can show an honest count without paying for rows nobody opened.
+export const $archivedSessions = atom<SessionInfo[]>([])
+export const $archivedSessionsTotal = atom<number>(0)
+export const $archivedSessionsLoading = atom(false)
 export const $sessionsLoading = atom(true)
 export const $workingSessionIds = atom<string[]>([])
 export const $activeSessionId = atom<string | null>(null)
@@ -246,6 +253,36 @@ export const setMessagingPlatformTotals = (next: Updater<Record<string, number>>
 export const setMessagingTruncated = (next: Updater<boolean>) => updateAtom($messagingTruncated, next)
 export const setSessionProfileTotals = (next: Updater<Record<string, number>>) =>
   updateAtom($sessionProfileTotals, next)
+export const setArchivedSessions = (next: Updater<SessionInfo[]>) => updateAtom($archivedSessions, next)
+export const setArchivedSessionsTotal = (next: Updater<number>) => updateAtom($archivedSessionsTotal, next)
+export const setArchivedSessionsLoading = (next: Updater<boolean>) => updateAtom($archivedSessionsLoading, next)
+
+/** Shift one profile's listable-count by `delta`, clamped at zero. Only known
+ *  keys move: when the aggregator hasn't reported a profile yet, the sidebar
+ *  already falls back to the loaded row count, so inventing an entry here
+ *  would replace an honest fallback with a guess. */
+export const adjustSessionProfileTotal = (profileKey: string, delta: number) =>
+  $sessionProfileTotals.set(
+    profileKey in $sessionProfileTotals.get()
+      ? {
+          ...$sessionProfileTotals.get(),
+          [profileKey]: Math.max(0, ($sessionProfileTotals.get()[profileKey] ?? 0) + delta)
+        }
+      : $sessionProfileTotals.get()
+  )
+
+/** Same contract as {@link adjustSessionProfileTotal} for a messaging
+ *  platform's resolved total: adjust only once a per-platform fetch has
+ *  established the real number. */
+export const adjustMessagingPlatformTotal = (sourceId: string, delta: number) =>
+  $messagingPlatformTotals.set(
+    sourceId in $messagingPlatformTotals.get()
+      ? {
+          ...$messagingPlatformTotals.get(),
+          [sourceId]: Math.max(0, ($messagingPlatformTotals.get()[sourceId] ?? 0) + delta)
+        }
+      : $messagingPlatformTotals.get()
+  )
 export const setSessionsLoading = (next: Updater<boolean>) => updateAtom($sessionsLoading, next)
 export const setWorkingSessionIds = (next: Updater<string[]>) => updateAtom($workingSessionIds, next)
 export const setActiveSessionId = (next: Updater<string | null>) => updateAtom($activeSessionId, next)
@@ -374,6 +411,17 @@ function markSessionSettled(sessionId: string) {
 
 function clearSessionSettled(sessionId: string) {
   settledSessionExpiry.delete(sessionId)
+}
+
+/** Shield a row from the next refresh's page-merge eviction for the settle
+ *  grace window. A just-restored (unarchived) conversation usually has old
+ *  activity timestamps, so it sits outside the recency page the next refresh
+ *  fetches — without a grace entry, mergeSessionPage() would evict the row the
+ *  user just brought back while they're looking at it. */
+export function shieldSessionFromMerge(sessionId: string) {
+  if (sessionId) {
+    markSessionSettled(sessionId)
+  }
 }
 
 /** Stored ids of sessions whose turn ended within the grace window. Prunes

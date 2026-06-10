@@ -18,6 +18,12 @@ interface SessionRowCommonProps {
   onDelete: () => void
   onPin: () => void
   onResume: () => void
+  archived?: boolean
+  onRestore?: () => void
+  selectable?: boolean
+  selectionActive?: boolean
+  checked?: boolean
+  onToggleSelect?: (mode: 'range' | 'single') => void
 }
 
 interface VirtualSessionListProps {
@@ -33,6 +39,14 @@ interface VirtualSessionListProps {
   workingSessionIdSet: Set<string>
   /** Presence lookup map — flags rows live on another device/client. */
   presenceBySession?: Map<string, SessionPresenceRecord>
+  /** Rows belong to the Archived section (restore instead of archive). */
+  archived?: boolean
+  onRestoreSession?: (sessionId: string) => void
+  /** Multi-select wiring, provided by the owning section. */
+  selectable?: boolean
+  selectionActive?: boolean
+  selectedIds?: ReadonlySet<string>
+  onToggleSelect?: (sessionId: string, mode: 'range' | 'single') => void
 }
 
 const ROW_ESTIMATE_PX = 28
@@ -49,7 +63,13 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
   sessions,
   sortable,
   workingSessionIdSet,
-  presenceBySession
+  presenceBySession,
+  archived = false,
+  onRestoreSession,
+  selectable = false,
+  selectionActive = false,
+  selectedIds,
+  onToggleSelect
 }) => {
   const scrollerRef = useRef<HTMLDivElement | null>(null)
   const ids = useMemo(() => sessions.map(s => s.id), [sessions])
@@ -77,13 +97,19 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
     }
 
     const commonProps: SessionRowCommonProps = {
+      archived,
+      checked: selectedIds?.has(session.id) ?? false,
       isPinned: pinned,
       isSelected: session.id === activeSessionId,
       isWorking: workingSessionIdSet.has(session.id),
       onArchive: () => onArchiveSession(session.id),
       onDelete: () => onDeleteSession(session.id),
       onPin: () => onTogglePin(sessionPinId(session)),
-      onResume: () => onResumeSession(session.id)
+      onRestore: onRestoreSession ? () => onRestoreSession(session.id) : undefined,
+      onResume: () => onResumeSession(session.id),
+      onToggleSelect: onToggleSelect ? mode => onToggleSelect(session.id, mode) : undefined,
+      selectable,
+      selectionActive
     }
 
     const presence = presenceBySession?.get(session.id)

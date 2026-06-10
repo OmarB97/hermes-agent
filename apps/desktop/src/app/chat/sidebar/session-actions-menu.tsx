@@ -29,9 +29,15 @@ interface SessionActions {
   title: string
   pinned?: boolean
   profile?: string
+  /** Archived-section rows: swap Archive→Restore and drop the pin/rename
+   * entries that don't apply to a row living in cold storage. */
+  archived?: boolean
   onPin?: () => void
   onArchive?: () => void
+  onRestore?: () => void
   onDelete?: () => void
+  /** Adds this row to its section's multi-select. */
+  onSelect?: () => void
 }
 
 type MenuItem = typeof DropdownMenuItem | typeof ContextMenuItem
@@ -45,92 +51,141 @@ interface ItemSpec {
   variant?: 'destructive'
 }
 
-function useSessionActions({ sessionId, title, pinned = false, profile, onPin, onArchive, onDelete }: SessionActions) {
+function useSessionActions({
+  sessionId,
+  title,
+  pinned = false,
+  profile,
+  archived = false,
+  onPin,
+  onArchive,
+  onRestore,
+  onDelete,
+  onSelect
+}: SessionActions) {
   const { t } = useI18n()
   const r = t.sidebar.row
   const [renameOpen, setRenameOpen] = useState(false)
 
-  const items: ItemSpec[] = [
-    {
-      disabled: !onPin,
-      icon: 'pin',
-      label: pinned ? r.unpin : r.pin,
-      onSelect: () => {
-        triggerHaptic('selection')
-        onPin?.()
-      }
-    },
-    {
-      disabled: !sessionId,
-      icon: 'copy',
-      label: r.copyId,
-      onSelect: event => {
-        event.preventDefault()
-        triggerHaptic('selection')
-        void writeClipboardText(sessionId).catch(err => notifyError(err, r.copyIdFailed))
-      }
-    },
-    ...(canOpenSessionWindow()
-      ? [
-          {
-            disabled: !sessionId,
-            icon: 'link-external',
-            label: r.newWindow,
-            onSelect: () => {
-              triggerHaptic('selection')
-              void openSessionInNewWindow(sessionId)
-            }
+  const selectItem: ItemSpec[] = onSelect
+    ? [
+        {
+          disabled: !sessionId,
+          icon: 'checklist',
+          label: r.select,
+          onSelect: () => {
+            onSelect()
           }
-        ]
-      : []),
-    {
-      disabled: !sessionId,
-      icon: 'cloud-upload',
-      label: r.shareToCloud,
-      onSelect: () => {
-        triggerHaptic('selection')
-        void shareSessionToCloud(sessionId)
-      }
+        }
+      ]
+    : []
+
+  const deleteItem: ItemSpec = {
+    className: 'text-destructive focus:text-destructive',
+    disabled: !onDelete,
+    icon: 'trash',
+    label: t.common.delete,
+    onSelect: () => {
+      triggerHaptic('warning')
+      onDelete?.()
     },
-    {
-      disabled: !sessionId,
-      icon: 'cloud-download',
-      label: r.export,
-      onSelect: () => {
-        triggerHaptic('selection')
-        void exportSession(sessionId, { title })
-      }
-    },
-    {
-      disabled: !sessionId,
-      icon: 'edit',
-      label: r.rename,
-      onSelect: () => {
-        triggerHaptic('selection')
-        setRenameOpen(true)
-      }
-    },
-    {
-      disabled: !onArchive,
-      icon: 'archive',
-      label: r.archive,
-      onSelect: () => {
-        triggerHaptic('selection')
-        onArchive?.()
-      }
-    },
-    {
-      className: 'text-destructive focus:text-destructive',
-      disabled: !onDelete,
-      icon: 'trash',
-      label: t.common.delete,
-      onSelect: () => {
-        triggerHaptic('warning')
-        onDelete?.()
-      },
-      variant: 'destructive'
+    variant: 'destructive'
+  }
+
+  const copyIdItem: ItemSpec = {
+    disabled: !sessionId,
+    icon: 'copy',
+    label: r.copyId,
+    onSelect: event => {
+      event.preventDefault()
+      triggerHaptic('selection')
+      void writeClipboardText(sessionId).catch(err => notifyError(err, r.copyIdFailed))
     }
-  ]
+  }
+
+  const shareToCloudItem: ItemSpec = {
+    disabled: !sessionId,
+    icon: 'cloud-upload',
+    label: r.shareToCloud,
+    onSelect: () => {
+      triggerHaptic('selection')
+      void shareSessionToCloud(sessionId)
+    }
+  }
+
+  const exportItem: ItemSpec = {
+    disabled: !sessionId,
+    icon: 'cloud-download',
+    label: r.export,
+    onSelect: () => {
+      triggerHaptic('selection')
+      void exportSession(sessionId, { title })
+    }
+  }
+
+  const items: ItemSpec[] = archived
+    ? [
+        ...selectItem,
+        {
+          disabled: !onRestore,
+          icon: 'history',
+          label: r.restore,
+          onSelect: () => {
+            triggerHaptic('selection')
+            onRestore?.()
+          }
+        },
+        copyIdItem,
+        exportItem,
+        deleteItem
+      ]
+    : [
+        ...selectItem,
+        {
+          disabled: !onPin,
+          icon: 'pin',
+          label: pinned ? r.unpin : r.pin,
+          onSelect: () => {
+            triggerHaptic('selection')
+            onPin?.()
+          }
+        },
+        copyIdItem,
+        ...(canOpenSessionWindow()
+          ? [
+              {
+                disabled: !sessionId,
+                icon: 'link-external',
+                label: r.newWindow,
+                onSelect: () => {
+                  triggerHaptic('selection')
+                  void openSessionInNewWindow(sessionId)
+                }
+              }
+            ]
+          : []),
+        shareToCloudItem,
+        exportItem,
+        {
+          disabled: !sessionId,
+          icon: 'edit',
+          label: r.rename,
+          onSelect: () => {
+            triggerHaptic('selection')
+            setRenameOpen(true)
+          }
+        },
+        {
+          disabled: !onArchive,
+          icon: 'archive',
+          label: r.archive,
+          onSelect: () => {
+            triggerHaptic('selection')
+            onArchive?.()
+          }
+        },
+        deleteItem
+      ]
 
   const renderItems = (Item: MenuItem) =>
     items.map(({ className, disabled, icon, label, onSelect, variant }) => (

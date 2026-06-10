@@ -24,6 +24,7 @@ const SIDEBAR_PINNED_STORAGE_KEY = 'hermes.desktop.pinnedSessions'
 const SIDEBAR_AGENTS_GROUPED_STORAGE_KEY = 'hermes.desktop.agentsGroupedByWorkspace'
 const PANES_FLIPPED_STORAGE_KEY = 'hermes.desktop.panesFlipped'
 const SIDEBAR_CRON_OPEN_STORAGE_KEY = 'hermes.desktop.sidebarCronOpen'
+const SIDEBAR_ARCHIVED_OPEN_STORAGE_KEY = 'hermes.desktop.sidebarArchivedOpen'
 const SIDEBAR_MESSAGING_OPEN_STORAGE_KEY = 'hermes.desktop.sidebarMessagingOpen'
 const SIDEBAR_SESSION_ORDER_STORAGE_KEY = 'hermes.desktop.sessionOrder'
 const SIDEBAR_WORKSPACE_ORDER_STORAGE_KEY = 'hermes.desktop.workspaceOrder'
@@ -64,6 +65,11 @@ export const $sidebarOverlayMounted = atom(false)
 export const $sidebarSessionOrderIds = atom(storedStringArray(SIDEBAR_SESSION_ORDER_STORAGE_KEY))
 export const $sidebarWorkspaceOrderIds = atom(storedStringArray(SIDEBAR_WORKSPACE_ORDER_STORAGE_KEY))
 export const $sidebarCronOpen = atom(storedBoolean(SIDEBAR_CRON_OPEN_STORAGE_KEY, false))
+// Archived section: collapsed by default — it's cold storage, not the working
+// set — but the expanded state persists so reopening the app doesn't re-bury a
+// list the user works from.
+export const $sidebarArchivedOpen = atom(storedBoolean(SIDEBAR_ARCHIVED_OPEN_STORAGE_KEY, false))
+export const $archivedSessionsLimit = atom(SIDEBAR_SESSIONS_PAGE_SIZE)
 // Messaging platform sections collapse by default (they can be numerous and
 // tall). We persist the ids the user has *explicitly expanded*, so the default
 // stays collapsed unless they've opened a platform before.
@@ -77,6 +83,7 @@ export const $sessionsLimit = atom(SIDEBAR_SESSIONS_PAGE_SIZE)
 
 $pinnedSessionIds.subscribe(ids => persistStringArray(SIDEBAR_PINNED_STORAGE_KEY, [...ids]))
 $sidebarCronOpen.subscribe(open => persistBoolean(SIDEBAR_CRON_OPEN_STORAGE_KEY, open))
+$sidebarArchivedOpen.subscribe(open => persistBoolean(SIDEBAR_ARCHIVED_OPEN_STORAGE_KEY, open))
 $sidebarMessagingOpenIds.subscribe(ids => persistStringArray(SIDEBAR_MESSAGING_OPEN_STORAGE_KEY, [...ids]))
 $sidebarSessionOrderIds.subscribe(ids => persistStringArray(SIDEBAR_SESSION_ORDER_STORAGE_KEY, [...ids]))
 $sidebarWorkspaceOrderIds.subscribe(ids => persistStringArray(SIDEBAR_WORKSPACE_ORDER_STORAGE_KEY, [...ids]))
@@ -138,6 +145,14 @@ export function setSidebarRecentsOpen(open: boolean) {
 
 export function setSidebarCronOpen(open: boolean) {
   $sidebarCronOpen.set(open)
+}
+
+export function setSidebarArchivedOpen(open: boolean) {
+  $sidebarArchivedOpen.set(open)
+}
+
+export function bumpArchivedSessionsLimit(step: number = SIDEBAR_SESSIONS_PAGE_SIZE) {
+  $archivedSessionsLimit.set($archivedSessionsLimit.get() + Math.max(1, Math.floor(step)))
 }
 
 export function toggleSidebarMessagingOpen(sourceId: string) {

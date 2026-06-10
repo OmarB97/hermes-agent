@@ -61,6 +61,17 @@ import type {
 
 import { NEW_CHAT_ROUTE, sessionRoute, SETTINGS_ROUTE } from '../../routes'
 import type { ClientSessionState, SidebarNavItem } from '../../types'
+import {
+  archiveStoredSessions,
+  deleteStoredSessions,
+  dropArchivedSessionRow,
+  hideStoredSession,
+  isSessionGoneError,
+  recordSessionArchived,
+  restoreArchivedSessions
+} from '../session-bulk-actions'
+
+export { isSessionGoneError } from '../session-bulk-actions'
 
 // Announce THIS device as a viewer when attaching to a session so co-viewers on
 // other devices see it in the channel roster (channels Phase 3). Unlike
@@ -71,16 +82,6 @@ function viewerDeviceParams(): { viewer_device?: string } {
   const name = $localDeviceName.get()
 
   return name ? { viewer_device: name } : {}
-}
-
-// A delete that fails with 404 "Session not found" means the row is ALREADY
-// gone server-side — deleted on another device, or a remote profile's session
-// this device only remembers via a pin. That outcome is success for the user's
-// intent, not an error to roll back.
-export function isSessionGoneError(err: unknown): boolean {
-  const message = err instanceof Error ? err.message : String(err)
-
-  return /session not found/i.test(message)
 }
 
 interface SessionActionsOptions {
@@ -473,10 +474,12 @@ export function useSessionActions({
       try {
         await ensureGatewayForEndpoint(target)
         const cwd = $currentCwd.get().trim() || workspaceCwdForNewSession()
+
         const created = await requestGateway<SessionCreateResponse>('session.create', {
           cols: 96,
           ...(cwd && { cwd })
         })
+
         const stored = created.stored_session_id ?? null
 
         // The user navigated away while the peer was dialing — don't yank them
@@ -992,7 +995,13 @@ export function useSessionActions({
     async (storedSessionId: string) => {
       clearNotifications()
 
-      const removed = $sessions.get().find(s => s.id === storedSessionId)
+      // Slice-aware optimistic hide: removes the row from whichever list it
+      // lives in (recents, a messaging platform, cron, or Archived) and keeps
+      // that list's totals honest — including the per-profile totals the
+      // scoped "Load N more" footer reads, so deleting can't strand a phantom
+      // page the way the old flat $sessions filter did.
+      const hidden = hideStoredSession(storedSessionId)
+      const removed = hidden?.session
       const wasSelected = selectedStoredSessionId === storedSessionId
       const closingRuntimeId = wasSelected ? activeSessionId : null
       const previousMessages = $messages.get()
@@ -1001,10 +1010,6 @@ export function useSessionActions({
       // live tip after compression. Drop both so the pin can't linger.
       const removedPinId = removed ? sessionPinId(removed) : storedSessionId
 
-      setSessions(prev => prev.filter(s => s.id !== storedSessionId))
-      // Keep $sessionsTotal in sync so the sidebar's "Load N more" footer
-      // doesn't keep claiming the removed row is still on the server.
-      setSessionsTotal(prev => Math.max(0, prev - 1))
       $pinnedSessionIds.set(previousPinned.filter(id => id !== storedSessionId && id !== removedPinId))
 
       // Tear down before awaiting so the route effect can't resume the
@@ -1034,11 +1039,7 @@ export function useSessionActions({
           return
         }
 
-        if (removed) {
-          setSessions(prev => [removed, ...prev])
-          setSessionsTotal(prev => prev + 1)
-        }
-
+        hidden?.undo()
         $pinnedSessionIds.set(previousPinned)
 
         if (wasSelected) {
@@ -1084,20 +1085,22 @@ export function useSessionActions({
     async (storedSessionId: string) => {
       clearNotifications()
 
-      const archived = $sessions.get().find(s => s.id === storedSessionId)
+      // Soft-hide: slice-aware removal keeps whichever section listed the row
+      // honest (recents totals, per-profile totals, messaging platform totals)
+      // so archiving can't leave a phantom "Load 1 more" behind.
+      const hidden = hideStoredSession(storedSessionId)
+      const archived = hidden?.session
       const wasSelected = selectedStoredSessionId === storedSessionId
       const previousPinned = $pinnedSessionIds.get()
       // Pins are keyed on the durable lineage-root id; the stored id may be the
       // live tip after compression. Drop both so the pin can't linger.
       const archivedPinId = archived ? sessionPinId(archived) : storedSessionId
 
-      // Soft-hide: drop from the sidebar immediately, keep the data.
-      setSessions(prev => prev.filter(s => s.id !== storedSessionId))
-      // Archived sessions are hidden by the listSessions(min_messages=1) query
-      // on the next refresh, so they count as "removed" for the load-more
-      // footer math.
-      setSessionsTotal(prev => Math.max(0, prev - 1))
       $pinnedSessionIds.set(previousPinned.filter(id => id !== storedSessionId && id !== archivedPinId))
+
+      if (archived) {
+        recordSessionArchived(archived)
+      }
 
       if (wasSelected) {
         startFreshSessionDraft(true)
@@ -1107,16 +1110,61 @@ export function useSessionActions({
         await setSessionArchived(storedSessionId, true, archived?.profile)
         notify({ durationMs: 2_000, kind: 'success', message: copy.archived })
       } catch (err) {
-        if (archived) {
-          setSessions(prev => [archived, ...prev.filter(s => s.id !== storedSessionId)])
-          setSessionsTotal(prev => prev + 1)
-        }
-
+        dropArchivedSessionRow(storedSessionId)
+        hidden?.undo()
         $pinnedSessionIds.set(previousPinned)
         notifyError(err, copy.archiveFailed)
       }
     },
     [copy, selectedStoredSessionId, startFreshSessionDraft]
+  )
+
+  // Bulk verbs for the sidebar's multi-select action bar. Optimistic updates,
+  // per-row rollback, and the rollup toasts live in session-bulk-actions; this
+  // layer only contributes the open-chat teardown the store module can't know
+  // about (fresh draft + runtime close when the active chat is in the set).
+  const archiveSessionsBulk = useCallback(
+    (sessionIds: string[]) => {
+      clearNotifications()
+
+      return archiveStoredSessions(sessionIds, {
+        onAfterHide: () => {
+          if (selectedStoredSessionId && sessionIds.includes(selectedStoredSessionId)) {
+            startFreshSessionDraft(true)
+          }
+        }
+      })
+    },
+    [selectedStoredSessionId, startFreshSessionDraft]
+  )
+
+  const restoreSessionsBulk = useCallback((sessionIds: string[]) => {
+    clearNotifications()
+
+    return restoreArchivedSessions(sessionIds)
+  }, [])
+
+  const deleteSessionsBulk = useCallback(
+    (sessionIds: string[]) => {
+      clearNotifications()
+
+      return deleteStoredSessions(sessionIds, {
+        onAfterHide: async () => {
+          if (!selectedStoredSessionId || !sessionIds.includes(selectedStoredSessionId)) {
+            return
+          }
+
+          const closingRuntimeId = activeSessionId
+          startFreshSessionDraft(true)
+
+          if (closingRuntimeId) {
+            await requestGateway('session.close', { session_id: closingRuntimeId }).catch(() => undefined)
+            clearQueuedPrompts(closingRuntimeId)
+          }
+        }
+      })
+    },
+    [activeSessionId, requestGateway, selectedStoredSessionId, startFreshSessionDraft]
   )
 
   const archiveAllSessions = useCallback(async () => {
@@ -1159,13 +1207,16 @@ export function useSessionActions({
   return {
     archiveAllSessions,
     archiveSession,
+    archiveSessionsBulk,
     branchCurrentSession,
     closeSettings,
     createBackendSessionForSend,
     createSessionOnDevice,
+    deleteSessionsBulk,
     openSettings,
     openPresenceSession,
     removeSession,
+    restoreSessionsBulk,
     resumeSession,
     selectSidebarItem,
     startFreshSessionDraft
