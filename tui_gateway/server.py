@@ -485,6 +485,18 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
     # unregistering the notifier and closing the in-process agent.
 
 
+def _attach_worker(sid: str, session: dict, worker) -> None:
+    """Store worker on session iff sid still maps to it, else close it — a
+    concurrent teardown already popped the session and would orphan the
+    worker. Closes the create/close race at every slash-worker spawn site."""
+    with _sessions_lock:
+        if _sessions.get(sid) is session:
+            session["slash_worker"] = worker
+            return
+    worker.close()
+
+
+
 def _ws_session_is_orphaned(session: dict | None) -> bool:
     """True if a WS session has no live transport and no in-flight turn.
 
@@ -1045,6 +1057,30 @@ def _git_branch_for_cwd(cwd: str) -> str:
         return ""
 
 
+def _terminal_task_cwd(session: dict | None) -> str:
+    """Return the cwd that terminal_tool should use for this TUI session.
+
+    ``_completion_cwd`` validates paths on the host so file completion does not
+    point at nonsense.  Non-local terminal backends are different: their cwd is
+    inside the target environment, so an SSH path like /home/user/workspace may
+    not exist on the local macOS host but is still the correct execution cwd.
+    """
+    backend = (os.environ.get("TERMINAL_ENV") or "").strip().lower()
+    if backend and backend != "local":
+        raw = os.environ.get("TERMINAL_CWD", "").strip()
+        if not raw:
+            try:
+                terminal_cfg = _load_cfg().get("terminal", {})
+                if isinstance(terminal_cfg, dict):
+                    raw = str(terminal_cfg.get("cwd") or "").strip()
+            except Exception:
+                raw = ""
+        if raw and raw not in {".", "auto", "cwd"}:
+            return raw
+
+    return _session_cwd(session)
+
+
 def _session_cwd(session: dict | None) -> str:
     if session and session.get("cwd"):
         return str(session["cwd"])
@@ -1058,7 +1094,7 @@ def _register_session_cwd(session: dict | None) -> None:
         from tools.terminal_tool import register_task_env_overrides
 
         register_task_env_overrides(
-            session["session_key"], {"cwd": _session_cwd(session)}
+            session["session_key"], {"cwd": _terminal_task_cwd(session)}
         )
     except Exception:
         pass
@@ -1605,7 +1641,7 @@ def _tool_progress_enabled(sid: str) -> bool:
     return _session_tool_progress_mode(sid) != "off"
 
 
-def _restart_slash_worker(session: dict):
+def _restart_slash_worker(sid: str, session: dict):
     worker = session.get("slash_worker")
     if worker:
         try:
@@ -1613,12 +1649,18 @@ def _restart_slash_worker(session: dict):
         except Exception:
             pass
     try:
-        session["slash_worker"] = _SlashWorker(
+        new_worker = _SlashWorker(
             session["session_key"],
             getattr(session.get("agent"), "model", _resolve_model()),
         )
     except Exception:
         session["slash_worker"] = None
+        return
+    # Route through the same store-iff-still-mapped guard as the spawn sites:
+    # the post-turn restart runs as `running` flips false, exactly when a
+    # close_on_disconnect reap can pop this session — a bare store would orphan
+    # the fresh worker (it self-heals only on gateway exit via the watchdog).
+    _attach_worker(sid, session, new_worker)
 
 
 def _persist_model_switch(result) -> None:
@@ -1731,7 +1773,7 @@ def _apply_model_switch(
             base_url=result.base_url,
             api_mode=result.api_mode,
         )
-        _restart_slash_worker(session)
+        _restart_slash_worker(sid, session)
         _emit("session.info", sid, _session_info(agent, session))
 
     os.environ["HERMES_MODEL"] = result.new_model
@@ -1882,7 +1924,7 @@ def _sync_session_key_after_compress(
         session["pending_title"] = None
     if restart_slash_worker:
         try:
-            _restart_slash_worker(session)
+            _restart_slash_worker(sid, session)
         except Exception:
             pass
 
@@ -2801,7 +2843,7 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
         session["history_version"] = int(session.get("history_version", 0)) + 1
     info = _session_info(new_agent, session)
     _emit("session.info", sid, info)
-    _restart_slash_worker(session)
+    _restart_slash_worker(sid, session)
     return info
 
 
@@ -3687,7 +3729,6 @@ def _session_live_item(sid: str, session: dict, current_sid: str = "") -> dict:
         "message_count": len(history),
         "model": str(getattr(agent, "model", "") or _resolve_model()),
         "preview": preview,
-        "session_id": sid,
         "session_key": key,
         "started_at": float(session.get("created_at") or now),
         "status": status,
@@ -3812,12 +3853,25 @@ def _(rid, params: dict) -> dict:
     except Exception as e:
         return _err(rid, 5036, f"could not enumerate active sessions: {e}")
 
+    # Liveness filter (#38950): a session whose teardown has begun (``_finalized``)
+    # is dead — its agent/worker are being released and it is no longer
+    # attachable — but it can briefly remain in ``_sessions`` until the reaper
+    # pops it. Counting these inflated the footer's "N sessions" count. We do
+    # NOT filter on the WS-detached drop sentinel: a detached session is still
+    # attachable via a quick reconnect / session.resume until the grace-reap
+    # finalizes it, and a standalone ``hermes --tui`` session legitimately rides
+    # the real stdio transport and must stay visible.
     # Keep the natural creation/insertion order from ``_sessions``.  The
     # frontend marks the focused session with ``current``; it should not jump to
     # the top just because the user switched to it.
-    rows = [_session_live_item(sid, session, current) for sid, session in snapshot]
+    rows = [
+        _session_live_item(sid, session, current)
+        for sid, session in snapshot
+        if not session.get("_finalized")
+    ]
     for sid, session in snapshot:
-        _publish_session_presence(sid, session)
+        if not session.get("_finalized"):
+            _publish_session_presence(sid, session)
     return _ok(rid, {"sessions": rows})
 
 
