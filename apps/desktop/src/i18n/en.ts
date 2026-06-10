@@ -1124,6 +1124,7 @@ export const en: Translations = {
       unpin: 'Unpin',
       copyId: 'Copy ID',
       export: 'Export',
+      shareToCloud: 'Share to cloud',
       rename: 'Rename',
       archive: 'Archive',
       newWindow: 'New window',

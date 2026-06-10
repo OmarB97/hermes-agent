@@ -17,6 +17,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigge
 import { Input } from '@/components/ui/input'
 import { renameSession } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { shareSessionToCloud } from '@/lib/cloud-share'
 import { triggerHaptic } from '@/lib/haptics'
 import { exportSession } from '@/lib/session-export'
 import { notify, notifyError } from '@/store/notifications'
@@ -82,6 +83,15 @@ function useSessionActions({ sessionId, title, pinned = false, profile, onPin, o
           }
         ]
       : []),
+    {
+      disabled: !sessionId,
+      icon: 'cloud-upload',
+      label: r.shareToCloud,
+      onSelect: () => {
+        triggerHaptic('selection')
+        void shareSessionToCloud(sessionId)
+      }
+    },
     {
       disabled: !sessionId,
       icon: 'cloud-download',

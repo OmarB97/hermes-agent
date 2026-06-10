@@ -867,6 +867,7 @@ export interface Translations {
       unpin: string
       copyId: string
       export: string
+      shareToCloud: string
       rename: string
       archive: string
       newWindow: string

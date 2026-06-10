@@ -1269,6 +1269,7 @@ export const zh: Translations = {
       unpin: '取消置顶',
       copyId: '复制 ID',
       export: '导出',
+      shareToCloud: '分享到云端',
       rename: '重命名',
       archive: '归档',
       newWindow: '新窗口',

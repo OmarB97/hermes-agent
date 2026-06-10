@@ -4024,6 +4024,90 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"participants": _session_participants_payload(session)})
 
 
+def _cloud_share_key(params: dict) -> str:
+    """Resolve the STORED session key from either a runtime sid or a stored id.
+
+    Cloud sharing reads the message log straight from state.db, so the session
+    does not need to be live — a runtime id maps through its session_key, and
+    anything else is treated as the stored key itself.
+    """
+    sid = str(params.get("session_id") or "")
+    live = _sessions.get(sid)
+    if live is not None:
+        return str(live.get("session_key") or sid)
+    return sid
+
+
+@method("session.cloud_share")
+def _(rid, params: dict) -> dict:
+    """Share this session to meshboard-cloud (channels slice 4.0).
+
+    Promotes the stored session to a cloud channel (idempotent) and starts the
+    background pusher that tails the local message log into it. Strictly
+    opt-in: refused outright unless the operator configured HERMES_CLOUD_TOKEN
+    — the zero-dependency core never dials the cloud on its own.
+    """
+    from tui_gateway import cloud_channels
+
+    if not cloud_channels.cloud_enabled():
+        return _err(rid, 4030, "cloud sharing is not configured (set HERMES_CLOUD_TOKEN)")
+    key = _cloud_share_key(params)
+    db = _get_db()
+    if db is None or not key:
+        return _err(rid, 5000, "session store unavailable")
+
+    meta: dict = {}
+    try:
+        meta = db.get_session(key) or {}
+    except Exception:
+        pass
+    if not meta:
+        return _err(rid, 4007, "session not found")
+
+    try:
+        from hermes_constants import get_device_name
+
+        device = get_device_name() or ""
+    except Exception:
+        device = ""
+
+    try:
+        result = cloud_channels.share_session(
+            db_path=str(db.db_path),
+            session_key=key,
+            device_name=device,
+            title=str(meta.get("title") or ""),
+            model=str(meta.get("model") or ""),
+        )
+    except Exception as e:
+        return _err(rid, 5040, f"cloud share failed: {e}")
+    return _ok(rid, result)
+
+
+@method("session.cloud_status")
+def _(rid, params: dict) -> dict:
+    """Report whether this session is being pushed to a cloud channel."""
+    from tui_gateway import cloud_channels
+
+    key = _cloud_share_key(params)
+    status = cloud_channels.shared_status(key)
+    return _ok(rid, {
+        "configured": cloud_channels.cloud_enabled(),
+        "shared": status is not None,
+        **(status or {}),
+    })
+
+
+@method("session.cloud_unshare")
+def _(rid, params: dict) -> dict:
+    """Stop pushing this session to the cloud (the cloud log is kept;
+    deleting it is an explicit cloud-side operation)."""
+    from tui_gateway import cloud_channels
+
+    key = _cloud_share_key(params)
+    return _ok(rid, {"stopped": cloud_channels.unshare_session(key)})
+
+
 @method("session.delete")
 def _(rid, params: dict) -> dict:
     """Delete a stored session and its on-disk transcript files.

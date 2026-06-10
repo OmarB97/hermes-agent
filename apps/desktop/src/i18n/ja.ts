@@ -1199,6 +1199,7 @@ export const ja = defineLocale({
       unpin: 'ピン留めを解除',
       copyId: 'ID をコピー',
       export: 'エクスポート',
+      shareToCloud: 'クラウドに共有',
       rename: '名前を変更',
       archive: 'アーカイブ',
       newWindow: '新しいウィンドウ',
