@@ -8771,9 +8771,37 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
                 check=False,
             )
             if merge_result.returncode != 0:
-                # Merge conflict or other error — don't corrupt the fork
+                # A failed merge leaves the working tree mid-merge with
+                # conflict markers, which breaks the CLI itself (main.py
+                # won't parse) and every later update stage. Abort to
+                # restore a clean tree before continuing.
+                merge_in_progress = (
+                    subprocess.run(
+                        git_cmd + ["rev-parse", "-q", "--verify", "MERGE_HEAD"],
+                        cwd=cwd,
+                        capture_output=True,
+                        check=False,
+                    ).returncode
+                    == 0
+                )
+                tree_restored = True
+                if merge_in_progress:
+                    tree_restored = (
+                        subprocess.run(
+                            git_cmd + ["merge", "--abort"],
+                            cwd=cwd,
+                            capture_output=True,
+                            check=False,
+                        ).returncode
+                        == 0
+                    )
                 print("  ✗ Merge failed (conflict). Skipping upstream sync.")
-                print("  Resolve manually: cd ~/.hermes/hermes-agent && git merge upstream/main")
+                if tree_restored:
+                    print("  Working tree restored. To sync manually:")
+                    print("    cd ~/.hermes/hermes-agent && git merge upstream/main")
+                else:
+                    print("  ⚠ Could not abort the merge — working tree may be broken. Inspect with:")
+                    print("    cd ~/.hermes/hermes-agent && git status")
                 return
 
             # Push the merged result to origin/main
