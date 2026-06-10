@@ -216,12 +216,30 @@ sys.stdout = sys.stderr
 _stdio_transport = StdioTransport(lambda: _real_stdout, _stdout_lock)
 
 
+class _DropTransport:
+    """Detached WS sink: keep sessions resumable without writing stale frames."""
+
+    def write(self, obj: dict) -> bool:
+        return False
+
+    def close(self) -> None:
+        return None
+
+
+# Detached websocket sessions use a drop sink instead of stdio. Desktop embeds
+# the gateway in-process and captures stdout into logs, so stale JSON-RPC frames
+# must not fall through there while the session waits for resume or reap.
+_detached_ws_transport = _DropTransport()
+
+
 def _session_has_live_transport(session: dict | None) -> bool:
     if not session or session.get("_finalized"):
         return False
     transport = session.get("transport")
     if isinstance(transport, FanoutTransport):
         return transport.has_transports(excluding={id(_stdio_transport)})
+    if transport is _detached_ws_transport:
+        return False
     return transport is not None and transport is not _stdio_transport
 
 
@@ -234,7 +252,7 @@ def _attach_session_transport(session: dict | None, transport: Transport | None)
     if isinstance(current, FanoutTransport):
         current.attach(transport)
         return
-    if current is None or current is _stdio_transport:
+    if current is None or current is _stdio_transport or current is _detached_ws_transport:
         session["transport"] = transport
         return
     fanout = FanoutTransport(current)
@@ -247,11 +265,14 @@ def _detach_session_transport(session: dict | None, transport: Transport | None)
         return False
     current = session.get("transport")
     if current is transport:
-        session["transport"] = _stdio_transport
+        # Last client gone: park on the drop sentinel (NOT real stdio) so the
+        # desktop's in-process gateway doesn't leak stale frames to stdout and
+        # the WS-orphan reaper can recognize the session as detached.
+        session["transport"] = _detached_ws_transport
         return True
     if isinstance(current, FanoutTransport) and current.detach(transport):
         if not current.has_transports():
-            session["transport"] = _stdio_transport
+            session["transport"] = _detached_ws_transport
         return True
     return False
 
@@ -417,18 +438,35 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         except Exception:
             pass
 
+    # Close the slash-worker subprocess as part of finalize itself, not just
+    # in the callers. Defense-in-depth: every session-end path goes through
+    # _finalize_session (it's the single ``_finalized``-guarded chokepoint), so
+    # folding worker cleanup in here means a future code path that calls
+    # _finalize_session directly — without the surrounding _teardown_session /
+    # _shutdown_sessions worker.close() — can't reintroduce the #38095 leak.
+    # Idempotent: _SlashWorker.close() is poll()-guarded, so the explicit
+    # close() still in those callers is harmless.
+    try:
+        worker = session.get("slash_worker")
+        if worker:
+            worker.close()
+    except Exception:
+        pass
 
-def _teardown_session(session: dict | None) -> None:
+
+def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") -> None:
     """Fully tear down a session: finalize, unregister, close agent + worker.
 
-    Shared by ``session.close`` and the orphaned-WS-session reaper so the
-    slash-worker subprocess is always closed exactly once via the same path.
-    Idempotent: the ``_finalized`` guard in ``_finalize_session`` and the
-    ``poll()`` guard in ``_SlashWorker.close`` make repeat calls harmless.
+    Shared by ``session.close`` and the orphaned-WS-session reaper. The
+    slash-worker subprocess is closed inside ``_finalize_session`` (the single
+    finalize chokepoint); this still unregisters the approval notifier and
+    closes the in-process agent. Idempotent: the ``_finalized`` guard in
+    ``_finalize_session`` and the ``poll()`` guard in ``_SlashWorker.close``
+    make repeat calls harmless.
     """
     if not session:
         return
-    _finalize_session(session)
+    _finalize_session(session, end_reason=end_reason)
     try:
         from tools.approval import unregister_gateway_notify
 
@@ -441,12 +479,10 @@ def _teardown_session(session: dict | None) -> None:
             agent.close()
     except Exception:
         pass
-    try:
-        worker = session.get("slash_worker")
-        if worker:
-            worker.close()
-    except Exception:
-        pass
+    # NOTE: the slash-worker is closed inside _finalize_session (the single
+    # _finalized-guarded chokepoint), exactly once. We deliberately do NOT
+    # re-close it here — _teardown_session's job beyond finalize is
+    # unregistering the notifier and closing the in-process agent.
 
 
 def _ws_session_is_orphaned(session: dict | None) -> bool:
@@ -465,6 +501,20 @@ def _ws_session_is_orphaned(session: dict | None) -> bool:
     return not _session_has_live_transport(session)
 
 
+def _close_session_by_id(sid: str, *, end_reason: str = "tui_close") -> bool:
+    """Single idempotent teardown for one session: pop it under the sessions
+    lock, then finalize, unregister notify, close agent + slash worker via the
+    shared ``_teardown_session`` path. Returns True iff it closed a live
+    session. The ``_finalized`` / worker ``_closed`` guards make concurrent or
+    repeat calls (e.g. session.close racing the WS-orphan reaper) harmless."""
+    with _sessions_lock:
+        session = _sessions.pop(sid, None)
+    if session is None:
+        return False
+    _teardown_session(session, end_reason=end_reason)
+    return True
+
+
 def _schedule_ws_orphan_reap(sid: str) -> None:
     """After a grace window, reap session ``sid`` iff it's still orphaned.
 
@@ -476,19 +526,58 @@ def _schedule_ws_orphan_reap(sid: str) -> None:
         return
 
     def _reap() -> None:
+        # Serialize the orphan re-check against session.resume (which re-binds a
+        # live transport under _session_resume_lock and would make this session
+        # non-orphaned). The actual pop + teardown then goes through the shared
+        # _close_session_by_id funnel so the dict mutation happens under
+        # _sessions_lock — consistent with every other _sessions mutator.
         with _session_resume_lock:
-            session = _sessions.get(sid)
-            if not _ws_session_is_orphaned(session):
+            if not _ws_session_is_orphaned(_sessions.get(sid)):
                 return
-            _sessions.pop(sid, None)
-        try:
-            _teardown_session(session)
-        except Exception:
-            pass
+            _close_session_by_id(sid, end_reason="ws_orphan_reap")
 
     timer = threading.Timer(_WS_ORPHAN_REAP_GRACE_S, _reap)
     timer.daemon = True
     timer.start()
+
+
+def _close_sessions_for_transport(
+    transport, *, end_reason: str = "ws_disconnect"
+) -> tuple[int, int]:
+    """On transport disconnect, reap the sessions that opted into
+    close_on_disconnect (sidecar/dashboard) immediately via the unified
+    ``_close_session_by_id`` path, and park the rest on the drop sentinel so
+    later emits don't hit a dead socket.
+
+    Fanout-aware: a session co-viewed through other live clients only loses
+    this one transport and is otherwise untouched — reap/park decisions apply
+    solely to sessions whose LAST live transport just detached. Non-flagged
+    detached sessions are handed to the grace-windowed WS-orphan reaper
+    (``_schedule_ws_orphan_reap``): a quick reconnect / session.resume that
+    re-binds a live transport cancels the reap. This is the single
+    WS-disconnect teardown entry point.
+
+    Returns ``(reaped, detached)`` counts for disconnect-path observability."""
+    reaped = 0
+    detached = 0
+    for sid in _detach_transport_from_sessions(transport):
+        with _sessions_lock:
+            session = _sessions.get(sid)
+        if session is None:
+            continue
+        # Other live clients remain attached through the fanout — not detached.
+        if _session_has_live_transport(session):
+            continue
+        if session.get("close_on_disconnect"):
+            _close_session_by_id(sid, end_reason=end_reason)
+            reaped += 1
+        else:
+            detached += 1
+            try:
+                _schedule_ws_orphan_reap(sid)
+            except Exception:
+                pass
+    return reaped, detached
 
 
 def _shutdown_sessions() -> None:
