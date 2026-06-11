@@ -21,7 +21,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import platform
 import sqlite3
+import subprocess
 import threading
 import urllib.error
 import urllib.parse
@@ -42,7 +44,29 @@ def cloud_api() -> str:
 
 
 def cloud_token() -> str:
-    return (os.environ.get("HERMES_CLOUD_TOKEN") or "").strip()
+    token = (os.environ.get("HERMES_CLOUD_TOKEN") or "").strip()
+    if token:
+        return token
+    return _launchctl_cloud_token()
+
+
+def _launchctl_cloud_token() -> str:
+    if platform.system() != "Darwin":
+        return ""
+    try:
+        proc = subprocess.run(
+            ["launchctl", "getenv", "HERMES_CLOUD_TOKEN"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=1.0,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return (proc.stdout or "").strip()
 
 
 def cloud_enabled() -> bool:

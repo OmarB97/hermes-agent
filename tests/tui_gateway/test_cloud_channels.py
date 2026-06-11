@@ -5,6 +5,7 @@ against a real sqlite file — no network (the cloud call is monkeypatched).
 """
 
 import sqlite3
+import subprocess
 
 import pytest
 
@@ -301,6 +302,37 @@ def test_push_once_survives_cloud_errors_without_moving_the_watermark(message_db
 
 def test_cloud_enabled_requires_explicit_opt_in(monkeypatch):
     monkeypatch.delenv("HERMES_CLOUD_TOKEN", raising=False)
+    monkeypatch.setattr(cloud_channels.platform, "system", lambda: "Linux")
     assert cloud_channels.cloud_enabled() is False
     monkeypatch.setenv("HERMES_CLOUD_TOKEN", "mb_test")
     assert cloud_channels.cloud_enabled() is True
+
+
+def test_cloud_token_uses_macos_launchctl_when_process_env_is_stale(monkeypatch):
+    monkeypatch.delenv("HERMES_CLOUD_TOKEN", raising=False)
+    monkeypatch.setattr(cloud_channels.platform, "system", lambda: "Darwin")
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return subprocess.CompletedProcess(cmd, 0, stdout=" mb_launchctl \n")
+
+    monkeypatch.setattr(cloud_channels.subprocess, "run", fake_run)
+
+    assert cloud_channels.cloud_token() == "mb_launchctl"
+    assert cloud_channels.cloud_enabled() is True
+    assert calls[0][0] == ["launchctl", "getenv", "HERMES_CLOUD_TOKEN"]
+    assert calls[0][1]["stderr"] is subprocess.DEVNULL
+
+
+def test_cloud_token_prefers_process_env_over_launchctl(monkeypatch):
+    monkeypatch.setenv("HERMES_CLOUD_TOKEN", "mb_process")
+    monkeypatch.setattr(cloud_channels.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(
+        cloud_channels.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("launchctl should not run")),
+    )
+
+    assert cloud_channels.cloud_token() == "mb_process"
