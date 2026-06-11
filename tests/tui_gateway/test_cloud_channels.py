@@ -74,6 +74,21 @@ def test_invite_member_falls_back_to_read_for_unknown_permissions(monkeypatch):
     assert bodies == [{"email": "ada@example.com", "permission": "read"}]
 
 
+def test_list_members_gets_channel_members(monkeypatch):
+    sent = []
+
+    def fake_request(method, path, body=None, timeout=15.0):
+        sent.append((method, path, body))
+        return {"members": [{"account_id": "acct_1", "permission": "read"}], "count": 1}
+
+    monkeypatch.setattr(cloud_channels, "_request", fake_request)
+
+    result = cloud_channels.list_members("chan/1")
+
+    assert result["count"] == 1
+    assert sent == [("GET", "/v1/channels/chan%2F1/members", None)]
+
+
 @pytest.fixture()
 def message_db(tmp_path):
     path = tmp_path / "state.db"

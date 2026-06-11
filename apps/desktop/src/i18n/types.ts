@@ -890,6 +890,7 @@ export interface Translations {
       shareToCloud: string
       copyCloudId: string
       inviteToCloud: string
+      cloudMembers: string
       rename: string
       archive: string
       restore: string
@@ -910,6 +911,10 @@ export interface Translations {
       inviteCloudDesc: string
       inviteEmailPlaceholder: string
       inviteCreate: string
+      cloudMembersTitle: string
+      cloudMembersDesc: string
+      cloudMembersEmpty: string
+      cloudMembersRefresh: string
       untitledPlaceholder: string
       ageNow: string
       ageDay: string

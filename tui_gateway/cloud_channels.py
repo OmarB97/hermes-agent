@@ -104,6 +104,12 @@ def invite_member(channel_id: str, email: str, permission: str = "read") -> dict
     })
 
 
+def list_members(channel_id: str) -> dict:
+    """Return the current cloud-channel membership view."""
+    channel = urllib.parse.quote(str(channel_id), safe="")
+    return _request("GET", f"/v1/channels/{channel}/members")
+
+
 def rows_to_batch(rows: list[dict], device_name: str) -> list[dict]:
     """Map local ``messages`` rows to the cloud push shape.
 

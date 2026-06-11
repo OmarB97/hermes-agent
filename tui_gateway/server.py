@@ -4123,6 +4123,26 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, result)
 
 
+@method("session.cloud_members")
+def _(rid, params: dict) -> dict:
+    """List members for an already-shared cloud channel."""
+    from tui_gateway import cloud_channels
+
+    if not cloud_channels.cloud_enabled():
+        return _err(rid, 4030, "cloud sharing is not configured (set HERMES_CLOUD_TOKEN)")
+
+    key = _cloud_share_key(params)
+    status = cloud_channels.shared_status(key)
+    if not status or not status.get("channel_id"):
+        return _err(rid, 4008, "session is not shared to cloud")
+
+    try:
+        result = cloud_channels.list_members(str(status["channel_id"]))
+    except Exception as e:
+        return _err(rid, 5040, f"cloud members failed: {e}")
+    return _ok(rid, result)
+
+
 @method("session.cloud_unshare")
 def _(rid, params: dict) -> dict:
     """Stop pushing this session to the cloud (the cloud log is kept;
