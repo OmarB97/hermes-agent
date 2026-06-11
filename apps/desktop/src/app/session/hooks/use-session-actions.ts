@@ -7,6 +7,12 @@ import { useI18n } from '@/i18n'
 import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
 import { embeddedImageUrls, textWithoutEmbeddedImages } from '@/lib/embedded-images'
+import {
+  type BackendInFlightTurn,
+  type InFlightRecoveryResult,
+  mergeBackendInFlightTurn,
+  recoverInFlightTurnJournal
+} from '@/lib/inflight-turn-journal'
 import { sessionArchivePreserveIds } from '@/lib/session-eligibility'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { clearComposerAttachments, clearComposerDraft } from '@/store/composer'
@@ -348,6 +354,36 @@ function applyStoredSessionPreviewRuntimeInfo(stored: { model?: null | string } 
   setCurrentFastMode(false)
   setYoloActive(false)
   setCurrentPersonality('')
+}
+
+function noInFlightRecovery(messages: ChatMessage[]): InFlightRecoveryResult {
+  return {
+    applied: false,
+    caughtUp: false,
+    messages,
+    streamId: null,
+    turnStartedAt: null
+  }
+}
+
+function recoverResumeInFlight(
+  storedSessionId: null | string,
+  baseMessages: ChatMessage[],
+  backendInFlight: BackendInFlightTurn | null | undefined,
+  keepPending: boolean
+): InFlightRecoveryResult {
+  const backend = mergeBackendInFlightTurn(baseMessages, backendInFlight, { keepPending })
+  const local = recoverInFlightTurnJournal(storedSessionId, backend.messages, { keepPending })
+
+  if (local.applied) {
+    return local
+  }
+
+  if (backend.applied) {
+    return backend
+  }
+
+  return local.caughtUp ? local : noInFlightRecovery(baseMessages)
 }
 
 export function useSessionActions({
@@ -700,6 +736,9 @@ export function useSessionActions({
         }))
       }
 
+      let resumedTurnStillRunning = false
+      let resumedTurnAwaitingResponse = false
+
       try {
         // Load the local snapshot first, then ask the gateway to resume.
         // Previously these raced:
@@ -716,7 +755,8 @@ export function useSessionActions({
           const storedMessages = await getSessionMessages(storedSessionId, sessionProfile)
 
           if (isCurrentResume()) {
-            localSnapshot = preserveLocalAssistantErrors(toChatMessages(storedMessages.messages), $messages.get())
+            const recovered = recoverInFlightTurnJournal(storedSessionId, toChatMessages(storedMessages.messages))
+            localSnapshot = preserveLocalAssistantErrors(recovered.messages, $messages.get())
 
             if (!chatMessageArraysEquivalent($messages.get(), localSnapshot)) {
               setMessages(localSnapshot)
@@ -741,9 +781,18 @@ export function useSessionActions({
         }
 
         const currentMessages = $messages.get()
+        const resumedRunning = Boolean(resumed.running || resumed.info?.running)
+        const rawResumedMessages = reconcileResumeMessages(toChatMessages(resumed.messages), currentMessages)
+
+        const inFlightRecovery = recoverResumeInFlight(
+          storedSessionId,
+          rawResumedMessages,
+          resumed.inflight,
+          resumedRunning
+        )
 
         const resumedMessages = preserveLocalAssistantErrors(
-          reconcileResumeMessages(toChatMessages(resumed.messages), currentMessages),
+          inFlightRecovery.messages,
           currentMessages
         )
         // Avoid a second visible transcript rebuild on resume/switch.
@@ -756,13 +805,17 @@ export function useSessionActions({
         // snapshot was available.
 
         const preferredMessages =
-          localSnapshot.length > 0
-            ? localSnapshot
+          inFlightRecovery.applied || inFlightRecovery.caughtUp
+            ? resumedMessages
+            : localSnapshot.length > 0
+              ? localSnapshot
             : chatMessageArraysEquivalent(currentMessages, resumedMessages)
               ? currentMessages
               : resumedMessages
 
         const messagesForView = preserveLocalAssistantErrors(preferredMessages, currentMessages)
+        resumedTurnStillRunning = resumedRunning
+        resumedTurnAwaitingResponse = resumedRunning && !inFlightRecovery.applied
 
         setActiveSessionId(resumed.session_id)
         activeSessionIdRef.current = resumed.session_id
@@ -776,8 +829,16 @@ export function useSessionActions({
             ...state,
             ...(runtimeInfo ?? {}),
             messages: messagesForView,
-            busy: false,
-            awaitingResponse: false
+            busy: resumedRunning,
+            awaitingResponse: resumedRunning && !inFlightRecovery.applied,
+            sawAssistantPayload: inFlightRecovery.applied ? true : state.sawAssistantPayload,
+            streamId: resumedRunning && inFlightRecovery.applied ? inFlightRecovery.streamId : null,
+            turnStartedAt:
+              resumedRunning && inFlightRecovery.applied
+                ? (inFlightRecovery.turnStartedAt ?? Date.now())
+                : resumedRunning
+                  ? (state.turnStartedAt ?? Date.now())
+                  : null
           }),
           storedSessionId
         )
@@ -794,13 +855,14 @@ export function useSessionActions({
           return
         }
 
-        setMessages(preserveLocalAssistantErrors(toChatMessages(fallback.messages), $messages.get()))
+        const recovered = recoverInFlightTurnJournal(storedSessionId, toChatMessages(fallback.messages))
+        setMessages(preserveLocalAssistantErrors(recovered.messages, $messages.get()))
         notifyError(err, copy.resumeFailed)
       } finally {
         if (isCurrentResume()) {
-          busyRef.current = false
-          setBusy(false)
-          setAwaitingResponse(false)
+          busyRef.current = resumedTurnStillRunning
+          setBusy(resumedTurnStillRunning)
+          setAwaitingResponse(resumedTurnAwaitingResponse)
         }
       }
     },
@@ -832,6 +894,9 @@ export function useSessionActions({
 
       const isCurrentOpen = () =>
         resumeRequestRef.current === requestId && selectedStoredSessionIdRef.current === storedTarget
+
+      let openedTurnStillRunning = false
+      let openedTurnAwaitingResponse = false
 
       try {
         await ensureGatewayProfile(routeProfile)
@@ -872,8 +937,19 @@ export function useSessionActions({
         }
 
         const routedSessionId = opened.session_key?.trim() || storedTarget
-        const openedMessages = toChatMessages(opened.messages || [])
+        const openedRunning = Boolean(opened.running || opened.info?.running)
+
+        const inFlightRecovery = recoverResumeInFlight(
+          routedSessionId,
+          toChatMessages(opened.messages || []),
+          opened.inflight,
+          openedRunning
+        )
+
+        const openedMessages = inFlightRecovery.messages
         const runtimeInfo = applyRuntimeInfo(opened.info)
+        openedTurnStillRunning = openedRunning
+        openedTurnAwaitingResponse = openedRunning && !inFlightRecovery.applied
 
         runtimeIdByStoredSessionIdRef.current.set(routedSessionId, opened.session_id)
         setSelectedStoredSessionId(routedSessionId)
@@ -887,9 +963,17 @@ export function useSessionActions({
           state => ({
             ...state,
             ...(runtimeInfo ?? {}),
-            awaitingResponse: false,
-            busy: false,
-            messages: openedMessages
+            awaitingResponse: openedTurnAwaitingResponse,
+            busy: openedTurnStillRunning,
+            messages: openedMessages,
+            sawAssistantPayload: inFlightRecovery.applied ? true : state.sawAssistantPayload,
+            streamId: openedTurnStillRunning && inFlightRecovery.applied ? inFlightRecovery.streamId : null,
+            turnStartedAt:
+              openedTurnStillRunning && inFlightRecovery.applied
+                ? (inFlightRecovery.turnStartedAt ?? Date.now())
+                : openedTurnStillRunning
+                  ? (state.turnStartedAt ?? Date.now())
+                  : null
           }),
           routedSessionId
         )
@@ -900,9 +984,9 @@ export function useSessionActions({
         }
       } finally {
         if (isCurrentOpen()) {
-          busyRef.current = false
-          setBusy(false)
-          setAwaitingResponse(false)
+          busyRef.current = openedTurnStillRunning
+          setBusy(openedTurnStillRunning)
+          setAwaitingResponse(openedTurnAwaitingResponse)
         }
       }
     },

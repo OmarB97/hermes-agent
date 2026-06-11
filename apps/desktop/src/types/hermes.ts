@@ -380,12 +380,20 @@ export interface SessionMessagesResponse {
 }
 
 export interface SessionResumeResponse {
+  inflight?: null | SessionInFlightTurn
   info?: SessionRuntimeInfo
   message_count: number
   messages: SessionMessage[]
   resumed?: string
+  running?: boolean
   session_id: string
   session_key?: string
+}
+
+export interface SessionInFlightTurn {
+  assistant?: string
+  streaming?: boolean
+  user?: string
 }
 
 export interface SessionRuntimeInfo {
