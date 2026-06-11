@@ -26,7 +26,7 @@ export interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
   onResume: () => void
   reorderable?: boolean
   dragging?: boolean
-  dragHandleProps?: React.HTMLAttributes<HTMLElement>
+  dropIndicator?: 'after' | 'before'
   /** Presence record for this session (from another device) — indicates live/active state. */
   presence?: SessionPresenceRecord
   /** Row renders in the Archived section: menus swap Archive→Restore, pin
@@ -74,7 +74,7 @@ export function SidebarSessionRow({
   presence,
   reorderable = false,
   dragging = false,
-  dragHandleProps,
+  dropIndicator,
   archived = false,
   onRestore,
   selectable = false,
@@ -90,7 +90,6 @@ export function SidebarSessionRow({
   const r = t.sidebar.row
   const title = sessionTitle(session)
   const age = formatAge(session.last_active || session.started_at, r)
-  const handleLabel = `Reorder ${title}`
   // Subscribe per-row (the leaf) instead of drilling a set through the list —
   // the atom is tiny and rarely non-empty. True when a clarify prompt in this
   // session is waiting on the user.
@@ -117,25 +116,23 @@ export function SidebarSessionRow({
       <div
         className={cn(
           'group relative grid min-h-[1.625rem] cursor-pointer grid-cols-[minmax(0,1fr)_auto] items-center rounded-md transition-colors duration-100 ease-out hover:bg-(--ui-row-hover-background) hover:transition-none',
+          reorderable && 'active:cursor-grabbing',
           (isSelected || checked) && 'bg-(--ui-row-active-background)',
           isWorking && 'text-foreground',
           dragging && 'z-10 cursor-grabbing opacity-60 shadow-sm',
+          dropIndicator === 'before' &&
+            "before:absolute before:inset-x-1 before:top-[-0.1875rem] before:z-20 before:h-0.5 before:rounded-full before:bg-(--ui-accent-secondary) before:content-['']",
+          dropIndicator === 'after' &&
+            "after:absolute after:inset-x-1 after:bottom-[-0.1875rem] after:z-20 after:h-0.5 after:rounded-full after:bg-(--ui-accent-secondary) after:content-['']",
           className
         )}
+        data-drop-indicator={dropIndicator}
         data-selected={checked ? 'true' : undefined}
         data-session-id={session.id}
         data-working={isWorking ? 'true' : undefined}
         draggable
         onDoubleClick={selectionActive ? () => onResume() : undefined}
         onDragStart={event => {
-          // Reorder drags belong to dnd-kit (the grab handle) — cancel the
-          // native drag so the two DnD systems don't fight.
-          if ((event.target as HTMLElement).closest('[data-reorder-handle]')) {
-            event.preventDefault()
-
-            return
-          }
-
           writeSessionDrag(event.dataTransfer, {
             archived,
             id: session.id,
@@ -222,7 +219,7 @@ export function SidebarSessionRow({
           type="button"
         >
           {selectionActive ? (
-            // Selection mode: the dot/grabber column becomes the checkbox, so
+            // Selection mode: the leading dot column becomes the checkbox, so
             // rows don't shift horizontally when a selection starts (same
             // w-3.5 slot the other leading affordances use).
             <span aria-checked={checked} className="grid w-3.5 shrink-0 place-items-center" role="checkbox">
@@ -236,38 +233,6 @@ export function SidebarSessionRow({
               >
                 {checked && <Codicon name="check" size="0.5rem" />}
               </span>
-            </span>
-          ) : reorderable ? (
-            <span
-              {...dragHandleProps}
-              aria-label={handleLabel}
-              className={cn(
-                // Scope the dot↔grabber swap to a local group so the grabber
-                // only reveals when hovering/focusing the handle itself, not
-                // anywhere on the row. Width MUST match the non-reorderable dot
-                // column (w-3.5) so rows don't shift horizontally when reorder is
-                // toggled (e.g. scoped → ALL-profiles view).
-                'group/handle relative -my-0.5 grid w-3.5 shrink-0 cursor-grab touch-none place-items-center self-stretch overflow-hidden active:cursor-grabbing',
-                // The quest-glow box-shadow extends past the dot; let it bleed
-                // out instead of being clipped by this handle's overflow-hidden.
-                needsInput && 'overflow-visible'
-              )}
-              data-reorder-handle
-              onClick={event => event.stopPropagation()}
-            >
-              <SidebarRowDot
-                className="transition-opacity group-hover/handle:opacity-0 group-focus-within/handle:opacity-0"
-                isWorking={isWorking}
-                needsInput={needsInput}
-              />
-              <Codicon
-                className={cn(
-                  'absolute text-(--ui-text-quaternary) opacity-0 transition-opacity group-hover/handle:opacity-80 group-focus-within/handle:opacity-80 hover:text-(--ui-text-secondary)',
-                  dragging && 'text-(--ui-text-secondary) opacity-100'
-                )}
-                name="grabber"
-                size="0.75rem"
-              />
             </span>
           ) : (
             <span

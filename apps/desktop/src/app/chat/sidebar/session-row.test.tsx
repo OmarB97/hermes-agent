@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { readSessionDrag } from '@/app/chat/composer/inline-refs'
 import type { SessionInfo } from '@/types/hermes'
 
 import { SidebarSessionRow, type SidebarSessionRowProps } from './session-row'
@@ -56,6 +57,22 @@ function renderRow(over: Partial<SidebarSessionRowProps> = {}) {
   const rowButton = utils.container.querySelector('[data-session-id] button') as HTMLButtonElement
 
   return { ...utils, handlers, rowButton }
+}
+
+function fakeTransfer(data: Record<string, string> = {}) {
+  const store = { ...data }
+
+  return {
+    dropEffect: 'none',
+    effectAllowed: 'uninitialized',
+    getData: (type: string) => store[type] ?? '',
+    setData: (type: string, value: string) => {
+      store[type] = value
+    },
+    get types() {
+      return Object.keys(store)
+    }
+  } as unknown as DataTransfer
 }
 
 afterEach(cleanup)
@@ -152,5 +169,30 @@ describe('SidebarSessionRow gestures', () => {
 
     expect(checkbox).toBeTruthy()
     expect(checkbox?.getAttribute('aria-checked')).toBe('true')
+  })
+
+  it('starts a session drag from the row body without rendering a separate reorder handle', () => {
+    const { container, rowButton } = renderRow({ isPinned: true, reorderable: true })
+    const transfer = fakeTransfer()
+
+    expect(container.querySelector('[data-reorder-handle]')).toBeNull()
+
+    fireEvent.dragStart(rowButton, { dataTransfer: transfer })
+
+    expect(readSessionDrag(transfer)).toMatchObject({
+      archived: false,
+      id: 's1',
+      pinId: 's1',
+      pinned: true,
+      profile: 'default',
+      title: 'Test session'
+    })
+  })
+
+  it('marks the row edge that will receive a drop', () => {
+    const { container } = renderRow({ dropIndicator: 'before' })
+    const row = container.querySelector('[data-session-id]')
+
+    expect(row?.getAttribute('data-drop-indicator')).toBe('before')
   })
 })

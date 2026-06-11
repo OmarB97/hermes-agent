@@ -1,7 +1,5 @@
-import { SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable'
-import { CSS } from '@dnd-kit/utilities'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { type FC, useCallback, useMemo, useRef } from 'react'
+import { type FC, useRef } from 'react'
 
 import type { SessionInfo } from '@/hermes'
 import { cn } from '@/lib/utils'
@@ -9,6 +7,7 @@ import { sessionPinId } from '@/store/session'
 import type { SessionPresenceRecord } from '@/types/hermes'
 
 import { SidebarSessionRow } from './session-row'
+import type { SessionDropAnchor } from './use-session-drop-zone'
 
 interface SessionRowCommonProps {
   isPinned: boolean
@@ -23,6 +22,7 @@ interface SessionRowCommonProps {
   selectable?: boolean
   selectionActive?: boolean
   checked?: boolean
+  dropIndicator?: 'after' | 'before'
   onToggleSelect?: (mode: 'range' | 'single') => void
 }
 
@@ -34,9 +34,10 @@ interface VirtualSessionListProps {
   onResumeSession: (sessionId: string) => void
   onTogglePin: (sessionId: string) => void
   pinned: boolean
+  reorderable?: boolean
   sessions: SessionInfo[]
-  sortable: boolean
   workingSessionIdSet: Set<string>
+  dropAnchor?: null | SessionDropAnchor
   /** Presence lookup map — flags rows live on another device/client. */
   presenceBySession?: Map<string, SessionPresenceRecord>
   /** Rows belong to the Archived section (restore instead of archive). */
@@ -60,9 +61,10 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
   onResumeSession,
   onTogglePin,
   pinned,
+  reorderable = false,
   sessions,
-  sortable,
   workingSessionIdSet,
+  dropAnchor,
   presenceBySession,
   archived = false,
   onRestoreSession,
@@ -72,7 +74,6 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
   onToggleSelect
 }) => {
   const scrollerRef = useRef<HTMLDivElement | null>(null)
-  const ids = useMemo(() => sessions.map(s => s.id), [sessions])
 
   const virtualizer = useVirtualizer({
     count: sessions.length,
@@ -99,6 +100,7 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
     const commonProps: SessionRowCommonProps = {
       archived,
       checked: selectedIds?.has(session.id) ?? false,
+      dropIndicator: dropAnchor?.sessionId === session.id ? (dropAnchor.before ? 'before' : 'after') : undefined,
       isPinned: pinned,
       isSelected: session.id === activeSessionId,
       isWorking: workingSessionIdSet.has(session.id),
@@ -114,22 +116,14 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
 
     const presence = presenceBySession?.get(session.id)
 
-    return sortable ? (
-      <VirtualSortableRow
-        index={virtualItem.index}
-        key={session.id}
-        measureRef={virtualizer.measureElement}
-        presence={presence}
-        rowProps={commonProps}
-        session={session}
-      />
-    ) : (
+    return (
       <SidebarSessionRow
         {...commonProps}
         data-index={virtualItem.index}
         key={session.id}
         presence={presence}
         ref={virtualizer.measureElement}
+        reorderable={reorderable}
         session={session}
       />
     )
@@ -143,48 +137,5 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
     </div>
   )
 
-  return sortable ? (
-    <SortableContext items={ids} strategy={verticalListSortingStrategy}>
-      {list}
-    </SortableContext>
-  ) : (
-    list
-  )
-}
-
-interface VirtualSortableRowProps {
-  index: number
-  measureRef: (node: Element | null) => void
-  rowProps: SessionRowCommonProps
-  session: SessionInfo
-  presence?: SessionPresenceRecord
-}
-
-function VirtualSortableRow({ index, measureRef, rowProps, session, presence }: VirtualSortableRowProps) {
-  const { attributes, isDragging, listeners, setNodeRef, transform, transition } = useSortable({ id: session.id })
-
-  // Merge dnd-kit's setNodeRef with the virtualizer's measureElement so
-  // the row participates in both DnD hit-testing and TanStack height
-  // measurement.
-  const refMerged = useCallback(
-    (node: HTMLDivElement | null) => {
-      setNodeRef(node)
-      measureRef(node)
-    },
-    [measureRef, setNodeRef]
-  )
-
-  return (
-    <SidebarSessionRow
-      {...rowProps}
-      data-index={index}
-      dragging={isDragging}
-      dragHandleProps={{ ...attributes, ...listeners }}
-      presence={presence}
-      ref={refMerged}
-      reorderable
-      session={session}
-      style={{ transform: CSS.Transform.toString(transform), transition }}
-    />
-  )
+  return list
 }

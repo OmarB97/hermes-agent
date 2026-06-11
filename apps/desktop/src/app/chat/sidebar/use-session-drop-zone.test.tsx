@@ -11,7 +11,12 @@ import {
   writeSessionDrag
 } from '@/app/chat/composer/inline-refs'
 
-import { type SessionDragFlags, sessionDropAnchor, useSessionDropZone } from './use-session-drop-zone'
+import {
+  placeSessionIdAtAnchor,
+  type SessionDragFlags,
+  sessionDropAnchor,
+  useSessionDropZone
+} from './use-session-drop-zone'
 
 // jsdom has no DataTransfer; a plain object with the same surface is enough
 // for both the writer (setData/effectAllowed) and the zone (types/getData).
@@ -65,8 +70,7 @@ const ARCHIVED_ROW: SessionDragPayload = {
   title: 'Archived session'
 }
 
-// The real zone predicates: Pinned takes fresh rows, Sessions takes rows it
-// can unpin or restore, Archived takes anything not already archived.
+// Representative zone predicates for the reusable hook.
 const PINNED_ZONE = (flags: SessionDragFlags) => !flags.pinned && !flags.archived
 const SESSIONS_ZONE = (flags: SessionDragFlags) => flags.pinned || flags.archived
 const ARCHIVED_ZONE = (flags: SessionDragFlags) => !flags.archived
@@ -306,5 +310,40 @@ describe('sessionDropAnchor', () => {
     document.body.appendChild(header)
 
     expect(sessionDropAnchor(dropEventAt(header, 10))).toBeNull()
+  })
+})
+
+describe('placeSessionIdAtAnchor', () => {
+  it('moves an existing id before the anchor', () => {
+    expect(placeSessionIdAtAnchor(['a', 'b', 'c', 'd'], 'c', { before: true, sessionId: 'a' })).toEqual([
+      'c',
+      'a',
+      'b',
+      'd'
+    ])
+  })
+
+  it('moves an existing id after the anchor', () => {
+    expect(placeSessionIdAtAnchor(['a', 'b', 'c', 'd'], 'a', { before: false, sessionId: 'c' })).toEqual([
+      'b',
+      'c',
+      'a',
+      'd'
+    ])
+  })
+
+  it('inserts a cross-section id at the exact anchor position', () => {
+    expect(placeSessionIdAtAnchor(['a', 'b', 'c'], 'pinned-row', { before: true, sessionId: 'b' })).toEqual([
+      'a',
+      'pinned-row',
+      'b',
+      'c'
+    ])
+  })
+
+  it('returns null for self-drops, missing anchors, and missing anchor ids', () => {
+    expect(placeSessionIdAtAnchor(['a', 'b'], 'a', { before: true, sessionId: 'a' })).toBeNull()
+    expect(placeSessionIdAtAnchor(['a', 'b'], 'c', null)).toBeNull()
+    expect(placeSessionIdAtAnchor(['a', 'b'], 'c', { before: false, sessionId: 'missing' })).toBeNull()
   })
 })

@@ -64,7 +64,6 @@ import {
   $sidebarSessionOrderIds,
   $sidebarWorkspaceOrderIds,
   pinSession,
-  reorderPinnedSession,
   SESSION_SEARCH_FOCUS_EVENT,
   setSidebarAgentsGrouped,
   setSidebarArchivedOpen,
@@ -118,7 +117,12 @@ import { SidebarRemoteSessionsSection } from './remote-sessions-section'
 import { SidebarCount, SidebarSectionHeader } from './section-header'
 import { SelectionActionBar } from './selection-action-bar'
 import { SidebarSessionRow } from './session-row'
-import { sessionDropAnchor, useSessionDropZone } from './use-session-drop-zone'
+import {
+  placeSessionIdAtAnchor,
+  sessionDropAnchor,
+  type SessionDropAnchor,
+  useSessionDropZone
+} from './use-session-drop-zone'
 import { VirtualSessionList } from './virtual-session-list'
 
 const VIRTUALIZE_THRESHOLD = 25
@@ -211,6 +215,13 @@ function reconcileOrderIds(currentIds: string[], orderIds: string[]): string[] {
 
 function sameIds(left: string[], right: string[]) {
   return left.length === right.length && left.every((item, index) => item === right[index])
+}
+
+function dropIndicatorFor(
+  sessionId: string,
+  anchor: null | SessionDropAnchor | undefined
+): 'after' | 'before' | undefined {
+  return anchor?.sessionId === sessionId ? (anchor.before ? 'before' : 'after') : undefined
 }
 
 const baseName = (path: string) =>
@@ -477,52 +488,59 @@ export function ChatSidebar({
 
   const pinnedRealIdSet = useMemo(() => new Set(pinnedSessions.map(s => s.id)), [pinnedSessions])
 
-  // Row bodies are native-draggable (the same drag that drops a session into
-  // the composer), so Pinned/Sessions accept that drag directly: drop a row on
-  // Pinned to pin it, drop a pinned row on Sessions to unpin — no context menu
-  // round-trip. Drops land at the pointer position (anchor row under the
-  // pointer; header/empty space falls back to the end / recency slot), and the
-  // target section auto-opens so the landed row is visible even when it was
-  // collapsed.
+  // Whole session rows are native-draggable (the same drag that drops a
+  // session into the composer), so Pinned/Sessions accept that drag directly:
+  // same-section drops reorder, cross-section drops pin/unpin/restore, and
+  // row-edge anchors choose the exact insertion position. Header/empty-space
+  // drops keep the old fallback behavior.
   const pinnedDropZone = useSessionDropZone({
     // Archived rows can't pin — the Pinned section resolves pins against the
     // live (unarchived) slices, so accepting one would pin into the void.
-    accepts: flags => !flags.pinned && !flags.archived,
+    accepts: flags => !flags.archived,
     onDropSession: (payload, event) => {
       // Translate the anchor row into an index in the RAW pinned-id store:
       // rendered rows can be a subset of stored ids (a pin whose session
       // isn't loaded renders nothing), so indexOf the anchor's durable pin id
       // rather than trusting the rendered position.
       const anchor = sessionDropAnchor(event)
+      const payloadPinId = payload.pinId ?? payload.id
       let index: number | undefined
 
       if (anchor) {
         const anchorSession = sessionByAnyId.get(anchor.sessionId)
         const anchorPinId = anchorSession ? sessionPinId(anchorSession) : anchor.sessionId
-        const at = pinnedSessionIds.indexOf(anchorPinId)
 
-        if (at >= 0) {
-          index = anchor.before ? at : at + 1
+        const nextPinnedIds = placeSessionIdAtAnchor(pinnedSessionIds, payloadPinId, {
+          before: anchor.before,
+          sessionId: anchorPinId
+        })
+
+        if (nextPinnedIds) {
+          index = nextPinnedIds.indexOf(payloadPinId)
+        } else if (anchorPinId === payloadPinId) {
+          setSidebarPinsOpen(true)
+
+          return
         }
       }
 
-      pinSession(payload.pinId ?? payload.id, index)
+      pinSession(payloadPinId, index)
       setSidebarPinsOpen(true)
     }
   })
 
   const sessionsDropZone = useSessionDropZone({
-    // Pinned rows drop here to unpin; Archived rows drop here to restore.
-    accepts: flags => flags.pinned || flags.archived,
+    // Any session row can land in Sessions: pinned rows unpin, archived rows
+    // restore, and already-live rows reorder by the row edge under the pointer.
+    accepts: () => true,
     onDropSession: (payload, event) => {
+      const anchor = sessionDropAnchor(event)
+
       if (payload.archived) {
         onRestoreSession?.(payload.id)
-        setSidebarRecentsOpen(true)
-
-        return
+      } else if (payload.pinned) {
+        unpinSession(payload.pinId ?? payload.id)
       }
-
-      unpinSession(payload.pinId ?? payload.id)
 
       // Positional drop applies only to the flat list — grouped and
       // ALL-profiles views derive row order themselves. With no usable anchor
@@ -530,16 +548,21 @@ export function ChatSidebar({
       // reconciled yet) the id is simply left out of the saved order and the
       // reconcile effect surfaces it at the top, the pre-positional behavior.
       if (!showAllProfiles && !agentsGrouped) {
-        const anchor = sessionDropAnchor(event)
+        const nextOrder = placeSessionIdAtAnchor(
+          reconcileOrderIds(
+            agentSessions.map(s => s.id),
+            agentOrderIds
+          ),
+          payload.id,
+          anchor
+        )
 
-        if (anchor && anchor.sessionId !== payload.id) {
-          const ids = agentOrderIds.filter(id => id !== payload.id)
-          const at = ids.indexOf(anchor.sessionId)
+        if (nextOrder) {
+          setSidebarSessionOrderIds(nextOrder)
+        } else if (anchor?.sessionId === payload.id) {
+          setSidebarRecentsOpen(true)
 
-          if (at >= 0) {
-            ids.splice(anchor.before ? at : at + 1, 0, payload.id)
-            setSidebarSessionOrderIds(ids)
-          }
+          return
         }
       }
 
@@ -890,23 +913,6 @@ export function ChatSidebar({
 
   const showSessionSections = showSessionSkeletons || sortedSessions.length > 0
 
-  const handlePinnedDragEnd = ({ active, over }: DragEndEvent) => {
-    if (!over || active.id === over.id) {
-      return
-    }
-
-    const newIndex = pinnedSessions.findIndex(s => s.id === String(over.id))
-
-    if (newIndex < 0) {
-      return
-    }
-
-    // Sortable ids are live session ids; the pinned store is keyed by durable
-    // (lineage-root) ids, so translate before reordering.
-    const dragged = sessionByAnyId.get(String(active.id))
-    reorderPinnedSession(dragged ? sessionPinId(dragged) : String(active.id), newIndex)
-  }
-
   const handleAgentDragEnd = ({ active, over }: DragEndEvent) => {
     if (!over || active.id === over.id) {
       return
@@ -930,19 +936,6 @@ export function ChatSidebar({
 
       return
     }
-
-    if (activeGroup || overGroup) {
-      return
-    }
-
-    const oldIdx = agentSessions.findIndex(s => s.id === activeId)
-    const newIdx = agentSessions.findIndex(s => s.id === overId)
-
-    if (oldIdx < 0 || newIdx < 0) {
-      return
-    }
-
-    setSidebarSessionOrderIds(arrayMove(agentSessions, oldIdx, newIdx).map(s => s.id))
   }
 
   return (
@@ -1073,6 +1066,7 @@ export function ChatSidebar({
             contentClassName="flex min-h-10 shrink-0 flex-col gap-px rounded-lg pb-2 pt-1"
             dndSensors={dndSensors}
             dropActive={pinnedDropZone.active}
+            dropAnchor={pinnedDropZone.anchor}
             dropHandlers={pinnedDropZone.dropHandlers}
             emptyState={<SidebarPinnedEmptyState />}
             label={s.pinned}
@@ -1080,7 +1074,6 @@ export function ChatSidebar({
             onArchiveSessions={onArchiveSessions}
             onDeleteSession={onDeleteSession}
             onDeleteSessions={onDeleteSessions}
-            onReorder={handlePinnedDragEnd}
             onRestoreSessions={onRestoreSessions}
             onResumeSession={onResumeSession}
             onToggle={() => setSidebarPinsOpen(!pinsOpen)}
@@ -1090,7 +1083,6 @@ export function ChatSidebar({
             rootClassName="shrink-0 p-0 pb-1"
             sectionKey="pinned"
             sessions={pinnedSessions}
-            sortable={pinnedSessions.length > 1}
             workingSessionIdSet={workingSessionIdSet}
           />
         )}
@@ -1106,6 +1098,7 @@ export function ChatSidebar({
             )}
             dndSensors={dndSensors}
             dropActive={sessionsDropZone.active}
+            dropAnchor={sessionsDropZone.anchor}
             dropHandlers={sessionsDropZone.dropHandlers}
             emptyState={showSessionSkeletons ? <SidebarSessionSkeletons /> : <SidebarAllPinnedState />}
             footer={
@@ -1491,6 +1484,7 @@ interface SidebarSessionsSectionProps {
   /** Native session-drag drop target (drag-to-pin/unpin): true while an
    * acceptable row drag hovers the section. */
   dropActive?: boolean
+  dropAnchor?: null | SessionDropAnchor
   dropHandlers?: ReturnType<typeof useSessionDropZone>['dropHandlers']
 }
 
@@ -1526,11 +1520,13 @@ function SidebarSessionsSection({
   onReorder,
   dndSensors,
   dropActive = false,
+  dropAnchor,
   dropHandlers
 }: SidebarSessionsSectionProps) {
   const hasGroupedSessions = Boolean(groups?.some(group => group.sessions.length > 0))
   const showEmptyState = forceEmptyState || (!hasGroupedSessions && sessions.length === 0)
   const dndActive = sortable && !!onReorder
+  const groupDndActive = dndActive && Boolean(groups?.length)
 
   // One subscription per SECTION (not per row): rows receive plain props, so
   // only sections re-render as the selection changes.
@@ -1569,6 +1565,7 @@ function SidebarSessionsSection({
     const rowProps = {
       archived: archivedRows,
       checked: selectedIdSet?.has(session.id) ?? false,
+      dropIndicator: dropIndicatorFor(session.id, dropAnchor),
       isPinned: pinned,
       isSelected: session.id === activeSessionId,
       isWorking: workingSessionIdSet.has(session.id),
@@ -1583,63 +1580,37 @@ function SidebarSessionsSection({
       session
     }
 
-    return sortable ? (
-      <SortableSidebarSessionRow key={session.id} {...rowProps} />
-    ) : (
-      <SidebarSessionRow key={session.id} {...rowProps} />
-    )
+    return <SidebarSessionRow key={session.id} {...rowProps} reorderable={sortable} />
   }
 
   const renderRows = (items: SessionInfo[]) => items.map(renderRow)
 
-  const renderSessionList = (items: SessionInfo[]) =>
-    dndActive ? (
-      <SortableContext items={items.map(s => s.id)} strategy={verticalListSortingStrategy}>
-        {renderRows(items)}
-      </SortableContext>
-    ) : (
-      renderRows(items)
-    )
-
-  const renderNestedSessionList = (items: SessionInfo[]) =>
-    dndActive ? (
-      <DndContext collisionDetection={closestCenter} onDragEnd={onReorder} sensors={dndSensors}>
-        <SortableContext items={items.map(s => s.id)} strategy={verticalListSortingStrategy}>
-          {renderRows(items)}
-        </SortableContext>
-      </DndContext>
-    ) : (
-      renderRows(items)
-    )
-
   const flatVirtualized = !showEmptyState && !groups?.length && sessions.length >= VIRTUALIZE_THRESHOLD
 
   let inner: React.ReactNode
-  let bodyOwnsDndContext = dndActive && !showEmptyState
 
   if (showEmptyState) {
     inner = emptyState
-    bodyOwnsDndContext = false
   } else if (groups?.length) {
     const groupNodes = groups.map(group =>
-      dndActive ? (
+      groupDndActive ? (
         <SortableSidebarWorkspaceGroup
           group={group}
           key={group.id}
           onNewSession={onNewSessionInWorkspace}
-          renderRows={renderNestedSessionList}
+          renderRows={renderRows}
         />
       ) : (
         <SidebarWorkspaceGroup
           group={group}
           key={group.id}
           onNewSession={onNewSessionInWorkspace}
-          renderRows={renderSessionList}
+          renderRows={renderRows}
         />
       )
     )
 
-    inner = dndActive ? (
+    inner = groupDndActive ? (
       <DndContext collisionDetection={closestCenter} onDragEnd={onReorder} sensors={dndSensors}>
         <SortableContext items={groups.map(g => groupDndId(g.id))} strategy={verticalListSortingStrategy}>
           {groupNodes}
@@ -1648,12 +1619,12 @@ function SidebarSessionsSection({
     ) : (
       groupNodes
     )
-    bodyOwnsDndContext = false
   } else if (flatVirtualized) {
     inner = (
       <VirtualSessionList
         activeSessionId={activeSessionId}
         archived={archivedRows}
+        dropAnchor={dropAnchor}
         onArchiveSession={onArchiveSession}
         onDeleteSession={onDeleteSession}
         onRestoreSession={onRestoreSession}
@@ -1661,25 +1632,17 @@ function SidebarSessionsSection({
         onTogglePin={onTogglePin}
         onToggleSelect={sectionKey ? handleToggleSelect : undefined}
         pinned={pinned}
+        reorderable={sortable}
         selectable={selectable}
         selectedIds={selectedIdSet}
         selectionActive={selectionActive}
         sessions={sessions}
-        sortable={sortable}
         workingSessionIdSet={workingSessionIdSet}
       />
     )
   } else {
-    inner = renderSessionList(sessions)
+    inner = renderRows(sessions)
   }
-
-  const body = bodyOwnsDndContext ? (
-    <DndContext collisionDetection={closestCenter} onDragEnd={onReorder} sensors={dndSensors}>
-      {inner}
-    </DndContext>
-  ) : (
-    inner
-  )
 
   // The virtualizer owns its own scroller, so suppress the wrapper's overflow
   // to avoid a double scroll container.
@@ -1717,7 +1680,7 @@ function SidebarSessionsSection({
       )}
       {open && (
         <SidebarGroupContent className={resolvedContentClassName}>
-          {body}
+          {inner}
           {footer}
         </SidebarGroupContent>
       )}
@@ -1883,25 +1846,4 @@ interface SortableWorkspaceProps {
 
 function SortableSidebarWorkspaceGroup(props: SortableWorkspaceProps) {
   return <SidebarWorkspaceGroup {...props} {...useSortableBindings(groupDndId(props.group.id))} />
-}
-
-interface SortableSessionRowProps {
-  session: SessionInfo
-  isPinned: boolean
-  isSelected: boolean
-  isWorking: boolean
-  onArchive: () => void
-  onDelete: () => void
-  onPin: () => void
-  onResume: () => void
-  archived?: boolean
-  checked?: boolean
-  onRestore?: () => void
-  onToggleSelect?: (mode: 'range' | 'single') => void
-  selectable?: boolean
-  selectionActive?: boolean
-}
-
-function SortableSidebarSessionRow(props: SortableSessionRowProps) {
-  return <SidebarSessionRow {...props} {...useSortableBindings(props.session.id)} />
 }

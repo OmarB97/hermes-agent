@@ -16,9 +16,8 @@ export interface SessionDragFlags {
 }
 
 interface SessionDropZoneOptions {
-  /** Which drags this zone acts on — e.g. Pinned takes unpinned+unarchived
-   * rows, Sessions takes pinned (unpin) or archived (restore) rows, Archived
-   * takes anything not already archived. */
+  /** Which drags this zone acts on. Pinned/Sessions/Archived each choose their
+   * own policy based on the drag's pinned/archived flags. */
   accepts: (flags: SessionDragFlags) => boolean
   /** The drop event rides along so handlers can resolve the drop position
    * (see {@link sessionDropAnchor}). */
@@ -30,6 +29,27 @@ export interface SessionDropAnchor {
   sessionId: string
   /** True when the pointer sat in the row's top half → insert before it. */
   before: boolean
+}
+
+export function placeSessionIdAtAnchor(
+  ids: readonly string[],
+  movingId: string,
+  anchor: null | SessionDropAnchor
+): null | string[] {
+  if (!anchor || anchor.sessionId === movingId) {
+    return null
+  }
+
+  const next = ids.filter(id => id !== movingId)
+  const at = next.indexOf(anchor.sessionId)
+
+  if (at < 0) {
+    return null
+  }
+
+  next.splice(anchor.before ? at : at + 1, 0, movingId)
+
+  return next
 }
 
 /**
@@ -52,9 +72,9 @@ export function sessionDropAnchor(event: ReactDragEvent): null | SessionDropAnch
 }
 
 /**
- * Native drop target for sidebar session rows — the row body's drag already
- * carries `application/x-hermes-session`, so dropping it on the Pinned /
- * Sessions section headers-or-bodies pins and unpins without the context menu.
+ * Native drop target for sidebar session rows — the whole row drag already
+ * carries `application/x-hermes-session`, so sections can pin, unpin, restore,
+ * archive, or reorder without a separate handle.
  *
  * A zone only engages for drags it would act on (Pinned accepts unpinned rows,
  * Sessions accepts pinned rows); other drags never preventDefault, so the
@@ -65,6 +85,7 @@ export function sessionDropAnchor(event: ReactDragEvent): null | SessionDropAnch
  */
 export function useSessionDropZone({ accepts: acceptsFlags, onDropSession }: SessionDropZoneOptions) {
   const [active, setActive] = useState(false)
+  const [anchor, setAnchor] = useState<null | SessionDropAnchor>(null)
   const depth = useRef(0)
 
   const accepts = useCallback(
@@ -80,6 +101,7 @@ export function useSessionDropZone({ accepts: acceptsFlags, onDropSession }: Ses
   const reset = useCallback(() => {
     depth.current = 0
     setActive(false)
+    setAnchor(null)
   }, [])
 
   const onDragEnter = useCallback(
@@ -91,6 +113,7 @@ export function useSessionDropZone({ accepts: acceptsFlags, onDropSession }: Ses
       event.preventDefault()
       depth.current += 1
       setActive(true)
+      setAnchor(sessionDropAnchor(event))
     },
     [accepts]
   )
@@ -105,6 +128,7 @@ export function useSessionDropZone({ accepts: acceptsFlags, onDropSession }: Ses
       // The row drag advertises effectAllowed='copy' (for composer drops);
       // anything else here would cancel the drop.
       event.dataTransfer.dropEffect = 'copy'
+      setAnchor(sessionDropAnchor(event))
     },
     [accepts]
   )
@@ -137,6 +161,7 @@ export function useSessionDropZone({ accepts: acceptsFlags, onDropSession }: Ses
   )
 
   return {
+    anchor,
     active,
     dropHandlers: { onDragEnter, onDragLeave, onDragOver, onDrop }
   }
