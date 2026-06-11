@@ -4153,6 +4153,40 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"stopped": cloud_channels.unshare_session(key)})
 
 
+@method("cloud.accept_invite")
+def _(rid, params: dict) -> dict:
+    """Accept a cloud-channel invite for the configured cloud account."""
+    from tui_gateway import cloud_channels
+
+    if not cloud_channels.cloud_enabled():
+        return _err(rid, 4030, "cloud sharing is not configured (set HERMES_CLOUD_TOKEN)")
+
+    token = str(params.get("token") or "").strip()
+    if not token:
+        return _err(rid, 4006, "token required")
+
+    try:
+        result = cloud_channels.accept_invite(token)
+    except Exception as e:
+        return _err(rid, 5040, f"cloud invite accept failed: {e}")
+    return _ok(rid, result)
+
+
+@method("cloud.channels")
+def _(rid, params: dict) -> dict:
+    """List owned and joined cloud channels for the configured cloud account."""
+    from tui_gateway import cloud_channels
+
+    if not cloud_channels.cloud_enabled():
+        return _err(rid, 4030, "cloud sharing is not configured (set HERMES_CLOUD_TOKEN)")
+
+    try:
+        result = cloud_channels.list_channels()
+    except Exception as e:
+        return _err(rid, 5040, f"cloud channels failed: {e}")
+    return _ok(rid, result)
+
+
 @method("session.delete")
 def _(rid, params: dict) -> dict:
     """Delete a stored session and its on-disk transcript files.

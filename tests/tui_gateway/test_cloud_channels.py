@@ -89,6 +89,36 @@ def test_list_members_gets_channel_members(monkeypatch):
     assert sent == [("GET", "/v1/channels/chan%2F1/members", None)]
 
 
+def test_accept_invite_posts_token_to_accept_endpoint(monkeypatch):
+    sent = []
+
+    def fake_request(method, path, body=None, timeout=15.0):
+        sent.append((method, path, body))
+        return {"ok": True, "channel_id": "chan_1", "permission": "read"}
+
+    monkeypatch.setattr(cloud_channels, "_request", fake_request)
+
+    result = cloud_channels.accept_invite("tok/1")
+
+    assert result["channel_id"] == "chan_1"
+    assert sent == [("POST", "/v1/channels/invites/accept?token=tok%2F1", None)]
+
+
+def test_list_channels_gets_owned_and_joined_channels(monkeypatch):
+    sent = []
+
+    def fake_request(method, path, body=None, timeout=15.0):
+        sent.append((method, path, body))
+        return {"channels": [{"id": "chan_1", "your_permission": "admin"}], "count": 1}
+
+    monkeypatch.setattr(cloud_channels, "_request", fake_request)
+
+    result = cloud_channels.list_channels()
+
+    assert result["count"] == 1
+    assert sent == [("GET", "/v1/channels", None)]
+
+
 @pytest.fixture()
 def message_db(tmp_path):
     path = tmp_path / "state.db"

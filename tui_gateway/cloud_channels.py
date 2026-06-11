@@ -110,6 +110,20 @@ def list_members(channel_id: str) -> dict:
     return _request("GET", f"/v1/channels/{channel}/members")
 
 
+def accept_invite(token: str) -> dict:
+    """Redeem a cloud-channel invite token for the configured account."""
+    invite_token = str(token or "").strip()
+    if not invite_token:
+        raise ValueError("token required")
+    query = urllib.parse.urlencode({"token": invite_token})
+    return _request("POST", f"/v1/channels/invites/accept?{query}")
+
+
+def list_channels() -> dict:
+    """Return owned and joined cloud channels for the configured account."""
+    return _request("GET", "/v1/channels")
+
+
 def rows_to_batch(rows: list[dict], device_name: str) -> list[dict]:
     """Map local ``messages`` rows to the cloud push shape.
 

@@ -20,6 +20,34 @@ interface CloudInviteResult {
   permission?: string
 }
 
+export interface CloudChannel {
+  created_at?: string | null
+  history_floor_seq?: number | null
+  id: string
+  is_owner?: boolean
+  last_seq?: number | null
+  model?: string | null
+  origin_device_id?: string | null
+  origin_session_key?: string | null
+  source?: string | null
+  status?: string | null
+  title?: string | null
+  updated_at?: string | null
+  visibility?: string | null
+  your_permission?: string | null
+}
+
+interface CloudChannelsResult {
+  channels?: CloudChannel[]
+  count?: number
+}
+
+interface CloudAcceptInviteResult {
+  channel_id?: string
+  ok?: boolean
+  permission?: string
+}
+
 export interface CloudChannelMember {
   account_id: string
   display_name?: string | null
@@ -206,6 +234,89 @@ export async function loadCloudChannelMembers(sessionId: string): Promise<CloudM
     }
 
     notifyError(err, 'Could not load cloud members')
+
+    return null
+  }
+}
+
+export async function loadCloudChannels(): Promise<CloudChannel[] | null> {
+  const gateway = activeGateway()
+
+  if (!gateway) {
+    notify({ kind: 'error', title: 'Cloud channels', message: 'Not connected yet - try again in a moment.' })
+
+    return null
+  }
+
+  try {
+    const result = await gateway.request<CloudChannelsResult>('cloud.channels', {})
+
+    return result.channels ?? []
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+
+    if (/not configured/i.test(message)) {
+      notify({
+        kind: 'error',
+        title: "Cloud sharing isn't set up",
+        message: 'Add your cloud token (HERMES_CLOUD_TOKEN) where the gateway runs, then try again.'
+      })
+
+      return null
+    }
+
+    notifyError(err, 'Could not load cloud channels')
+
+    return null
+  }
+}
+
+export async function acceptCloudChannelInvite(token: string): Promise<CloudAcceptInviteResult | null> {
+  const gateway = activeGateway()
+  const trimmed = token.trim()
+
+  if (!gateway) {
+    notify({ kind: 'error', title: 'Accept cloud invite', message: 'Not connected yet - try again in a moment.' })
+
+    return null
+  }
+
+  if (!trimmed) {
+    notify({ kind: 'error', title: 'Accept cloud invite', message: 'Invite token is required.' })
+
+    return null
+  }
+
+  try {
+    const result = await gateway.request<CloudAcceptInviteResult>('cloud.accept_invite', { token: trimmed })
+
+    notify({
+      kind: 'success',
+      title: 'Cloud invite accepted',
+      message: result.channel_id ? `Joined ${result.channel_id}.` : 'Cloud channel joined.'
+    })
+
+    return result
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+
+    if (/not configured/i.test(message)) {
+      notify({
+        kind: 'error',
+        title: "Cloud sharing isn't set up",
+        message: 'Add your cloud token (HERMES_CLOUD_TOKEN) where the gateway runs, then try again.'
+      })
+
+      return null
+    }
+
+    if (/invalid|already used|expired/i.test(message)) {
+      notify({ kind: 'error', title: 'Accept cloud invite', message: 'This invite is invalid, used, or expired.' })
+
+      return null
+    }
+
+    notifyError(err, 'Could not accept the cloud invite')
 
     return null
   }

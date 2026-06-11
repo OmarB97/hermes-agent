@@ -853,6 +853,21 @@ export interface Translations {
     archiveAllSubmitting: string
     archiveAllChecked: (count: number) => string
     archiveAllNone: string
+    cloudChannelsTitle: string
+    cloudChannelsDesc: string
+    cloudInviteTokenAria: string
+    cloudInviteTokenPlaceholder: string
+    cloudInviteAccept: string
+    cloudInviteAccepting: string
+    cloudChannelsListTitle: string
+    cloudChannelsLoading: string
+    cloudChannelsEmpty: string
+    cloudChannelsRefresh: string
+    cloudChannelsRefreshing: string
+    cloudChannelsClose: string
+    cloudChannelsOwner: string
+    cloudChannelsRead: string
+    cloudChannelsSeq: (seq: string) => string
     allPinned: string
     shiftClickHint: string
     noWorkspace: string
