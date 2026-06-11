@@ -28,7 +28,7 @@ COPILOT_EDITOR_VERSION = "vscode/1.104.1"
 COPILOT_REASONING_EFFORTS_GPT5 = ["minimal", "low", "medium", "high"]
 COPILOT_REASONING_EFFORTS_O_SERIES = ["low", "medium", "high"]
 
-_MODEL_LISTING_METADATA_KEYS = ("router_backend", "router_host", "router_hosts")
+_MODEL_LISTING_METADATA_KEYS = ("router_backend", "router_host", "router_hosts", "description")
 _LAST_API_MODEL_METADATA_BY_BASE_URL: dict[str, dict[str, dict[str, Any]]] = {}
 
 
