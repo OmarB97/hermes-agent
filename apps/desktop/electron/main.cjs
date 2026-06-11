@@ -2563,6 +2563,17 @@ function fetchJson(url, token, options = {}) {
       return
     }
 
+    let settled = false
+    let timeoutTimer = null
+    const timeoutError = () => new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`)
+    const finish = (fn, value) => {
+      if (settled) return
+      settled = true
+      if (timeoutTimer) clearTimeout(timeoutTimer)
+      fn(value)
+    }
+    const fail = error => finish(reject, error)
+    const succeed = value => finish(resolve, value)
     const req = client.request(
       parsed,
       {
@@ -2575,16 +2586,17 @@ function fetchJson(url, token, options = {}) {
       },
       res => {
         const chunks = []
-        res.on('error', reject)
+        res.on('error', fail)
         res.on('data', chunk => chunks.push(chunk))
         res.on('end', () => {
+          if (settled) return
           const text = Buffer.concat(chunks).toString('utf8')
           if ((res.statusCode || 500) >= 400) {
-            reject(new Error(`${res.statusCode}: ${text || res.statusMessage}`))
+            fail(new Error(`${res.statusCode}: ${text || res.statusMessage}`))
             return
           }
           if (!text) {
-            resolve(null)
+            succeed(null)
             return
           }
           // A 2xx response whose body is HTML means the request fell through
@@ -2594,7 +2606,7 @@ function fetchJson(url, token, options = {}) {
           const looksHtml = /^\s*<(?:!doctype|html)/i.test(text)
           const contentType = String(res.headers['content-type'] || '')
           if (looksHtml || contentType.includes('text/html')) {
-            reject(
+            fail(
               new Error(
                 `Expected JSON from ${url} but got HTML (status ${res.statusCode}). ` +
                   'The endpoint is likely missing on the Hermes backend.'
@@ -2603,18 +2615,24 @@ function fetchJson(url, token, options = {}) {
             return
           }
           try {
-            resolve(JSON.parse(text))
+            succeed(JSON.parse(text))
           } catch {
-            reject(new Error(`Invalid JSON from ${url} (status ${res.statusCode}): ${text.slice(0, 200)}`))
+            fail(new Error(`Invalid JSON from ${url} (status ${res.statusCode}): ${text.slice(0, 200)}`))
           }
         })
       }
     )
 
-    req.on('error', reject)
-    req.setTimeout(timeoutMs, () => {
-      req.destroy(new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`))
-    })
+    const abortForTimeout = () => {
+      const error = timeoutError()
+      req.destroy(error)
+      fail(error)
+    }
+    // ClientRequest#setTimeout only covers the assigned socket's idle timeout;
+    // keep a wall-clock guard too so DNS/pre-connect hangs honor timeoutMs.
+    timeoutTimer = setTimeout(abortForTimeout, timeoutMs)
+    req.on('error', fail)
+    req.setTimeout(timeoutMs, abortForTimeout)
     if (body) req.write(body)
     req.end()
   })
@@ -2643,6 +2661,17 @@ function fetchPublicJson(url, options = {}) {
       return
     }
 
+    let settled = false
+    let timeoutTimer = null
+    const timeoutError = () => new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`)
+    const finish = (fn, value) => {
+      if (settled) return
+      settled = true
+      if (timeoutTimer) clearTimeout(timeoutTimer)
+      fn(value)
+    }
+    const fail = error => finish(reject, error)
+    const succeed = value => finish(resolve, value)
     const req = client.request(
       parsed,
       {
@@ -2656,19 +2685,20 @@ function fetchPublicJson(url, options = {}) {
         const chunks = []
         res.on('data', chunk => chunks.push(chunk))
         res.on('end', () => {
+          if (settled) return
           const text = Buffer.concat(chunks).toString('utf8')
           if ((res.statusCode || 500) >= 400) {
-            reject(new Error(`${res.statusCode}: ${text || res.statusMessage}`))
+            fail(new Error(`${res.statusCode}: ${text || res.statusMessage}`))
             return
           }
           if (!text) {
-            resolve(null)
+            succeed(null)
             return
           }
           const looksHtml = /^\s*<(?:!doctype|html)/i.test(text)
           const contentType = String(res.headers['content-type'] || '')
           if (looksHtml || contentType.includes('text/html')) {
-            reject(
+            fail(
               new Error(
                 `Expected JSON from ${url} but got HTML (status ${res.statusCode}). ` +
                   'The endpoint is likely missing on the Hermes backend.'
@@ -2677,18 +2707,24 @@ function fetchPublicJson(url, options = {}) {
             return
           }
           try {
-            resolve(JSON.parse(text))
+            succeed(JSON.parse(text))
           } catch {
-            reject(new Error(`Invalid JSON from ${url} (status ${res.statusCode}): ${text.slice(0, 200)}`))
+            fail(new Error(`Invalid JSON from ${url} (status ${res.statusCode}): ${text.slice(0, 200)}`))
           }
         })
       }
     )
 
-    req.on('error', reject)
-    req.setTimeout(timeoutMs, () => {
-      req.destroy(new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`))
-    })
+    const abortForTimeout = () => {
+      const error = timeoutError()
+      req.destroy(error)
+      fail(error)
+    }
+    // ClientRequest#setTimeout only covers the assigned socket's idle timeout;
+    // keep a wall-clock guard too so DNS/pre-connect hangs honor timeoutMs.
+    timeoutTimer = setTimeout(abortForTimeout, timeoutMs)
+    req.on('error', fail)
+    req.setTimeout(timeoutMs, abortForTimeout)
     if (body) req.write(body)
     req.end()
   })
