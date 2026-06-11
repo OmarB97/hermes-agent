@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { routerHostSummary } from './model-metadata'
+import { modelDescription, routerHostSummary } from './model-metadata'
 
 describe('routerHostSummary', () => {
   it('returns null when a model has no router metadata', () => {
@@ -47,5 +47,50 @@ describe('routerHostSummary', () => {
 
     expect(summary?.label).toBe('ko-mac +1')
     expect(summary?.title).toContain('ko-mac, ko-taro')
+  })
+})
+
+describe('modelDescription', () => {
+  it('returns the trimmed blurb when present', () => {
+    expect(
+      modelDescription(
+        {
+          name: 'AI-Router',
+          slug: 'custom:ai-router',
+          models: ['auto'],
+          model_metadata: { auto: { description: '  Picks the best model for each request.  ' } }
+        },
+        'auto'
+      )
+    ).toBe('Picks the best model for each request.')
+  })
+
+  it('returns null when metadata or the blurb is missing', () => {
+    expect(modelDescription({ name: 'AI-Router', slug: 'custom:ai-router', models: ['m'] }, 'm')).toBeNull()
+    expect(
+      modelDescription(
+        {
+          name: 'AI-Router',
+          slug: 'custom:ai-router',
+          models: ['m'],
+          model_metadata: { m: { router_host: 'ko-mac' } }
+        },
+        'm'
+      )
+    ).toBeNull()
+  })
+
+  it('returns null for a whitespace-only blurb', () => {
+    expect(
+      modelDescription(
+        {
+          name: 'AI-Router',
+          slug: 'custom:ai-router',
+          models: ['m'],
+          model_metadata: { m: { description: '   ' } }
+        },
+        'm'
+      )
+    ).toBeNull()
   })
 })

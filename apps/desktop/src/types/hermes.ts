@@ -253,6 +253,8 @@ export interface ModelMetadata {
   router_backend?: string
   router_host?: string
   router_hosts?: string[]
+  /** Short human blurb for the model, surfaced in the picker row. */
+  description?: string
 }
 
 export interface ModelOptionsResponse {
