@@ -17,7 +17,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigge
 import { Input } from '@/components/ui/input'
 import { renameSession } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { shareSessionToCloud } from '@/lib/cloud-share'
+import { copyCloudChannelId, shareSessionToCloud } from '@/lib/cloud-share'
 import { triggerHaptic } from '@/lib/haptics'
 import { exportSession } from '@/lib/session-export'
 import { notify, notifyError } from '@/store/notifications'
@@ -113,6 +113,17 @@ function useSessionActions({
     }
   }
 
+  const copyCloudIdItem: ItemSpec = {
+    disabled: !sessionId,
+    icon: 'copy',
+    label: r.copyCloudId,
+    onSelect: event => {
+      event.preventDefault()
+      triggerHaptic('selection')
+      void copyCloudChannelId(sessionId)
+    }
+  }
+
   const exportItem: ItemSpec = {
     disabled: !sessionId,
     icon: 'cloud-download',
@@ -165,6 +176,7 @@ function useSessionActions({
             ]
           : []),
         shareToCloudItem,
+        copyCloudIdItem,
         exportItem,
         {
           disabled: !sessionId,

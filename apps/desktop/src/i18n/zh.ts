@@ -1290,6 +1290,7 @@ export const zh: Translations = {
       copyId: '复制 ID',
       export: '导出',
       shareToCloud: '分享到云端',
+      copyCloudId: '复制云端 ID',
       rename: '重命名',
       archive: '归档',
       restore: '恢复',

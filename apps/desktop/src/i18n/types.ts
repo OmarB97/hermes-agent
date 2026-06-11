@@ -888,6 +888,7 @@ export interface Translations {
       copyId: string
       export: string
       shareToCloud: string
+      copyCloudId: string
       rename: string
       archive: string
       restore: string
