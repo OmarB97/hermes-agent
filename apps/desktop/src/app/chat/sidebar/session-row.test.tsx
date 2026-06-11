@@ -171,6 +171,24 @@ describe('SidebarSessionRow gestures', () => {
     expect(checkbox?.getAttribute('aria-checked')).toBe('true')
   })
 
+  it('moves the timestamp for a real actions menu open, not lingering pointer focus', () => {
+    const { container } = renderRow()
+    const chrome = container.querySelector('[data-session-row-chrome]') as HTMLElement
+    const timestamp = container.querySelector('[data-session-row-age]') as HTMLElement
+    const actionsButton = container.querySelector('[data-session-row-actions]') as HTMLButtonElement
+
+    expect(timestamp.className).toContain('group-data-[actions-visible=true]:-translate-x-6')
+    expect(timestamp.className).not.toContain('group-focus-within')
+    expect(actionsButton.className).not.toContain('group-focus-within')
+    expect(chrome.getAttribute('data-actions-visible')).toBeNull()
+
+    fireEvent.pointerDown(actionsButton, { button: 0, ctrlKey: false })
+    expect(chrome.getAttribute('data-actions-visible')).toBe('true')
+
+    fireEvent.pointerDown(actionsButton, { button: 0, ctrlKey: false })
+    expect(chrome.getAttribute('data-actions-visible')).toBeNull()
+  })
+
   it('starts a session drag from the row body without rendering a separate reorder handle', () => {
     const onSessionDragEnd = vi.fn()
     const onSessionDragStart = vi.fn()

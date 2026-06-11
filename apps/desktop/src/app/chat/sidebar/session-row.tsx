@@ -1,5 +1,6 @@
 import { useStore } from '@nanostores/react'
 import { motion } from 'motion/react'
+import { useState } from 'react'
 import type * as React from 'react'
 
 import { type SessionDragPayload, writeSessionDrag } from '@/app/chat/composer/inline-refs'
@@ -93,6 +94,9 @@ export function SidebarSessionRow({
   const r = t.sidebar.row
   const title = sessionTitle(session)
   const age = formatAge(session.last_active || session.started_at, r)
+  const [actionsMenuOpen, setActionsMenuOpen] = useState(false)
+  const [actionsKeyboardFocus, setActionsKeyboardFocus] = useState(false)
+  const actionsVisible = actionsMenuOpen || actionsKeyboardFocus
   // Subscribe per-row (the leaf) instead of drilling a set through the list —
   // the atom is tiny and rarely non-empty. True when a clarify prompt in this
   // session is waiting on the user.
@@ -146,7 +150,9 @@ export function SidebarSessionRow({
             dragging && 'z-10 cursor-grabbing opacity-60 shadow-sm',
             className
           )}
+          data-actions-visible={actionsVisible ? 'true' : undefined}
           data-selected={checked ? 'true' : undefined}
+          data-session-row-chrome
           data-working={isWorking ? 'true' : undefined}
           layout="position"
           onDoubleClick={selectionActive ? () => onResume() : undefined}
@@ -257,24 +263,26 @@ export function SidebarSessionRow({
             </span>
           </div>
         </button>
-        {/* Trailing slot: on an IDLE row the timestamp is visible and, on
-            hover/focus, slides left to make room while the 3-dot menu slides
-            in from the right (both on screen at once). On an ACTIVE row the
-            pulsing orange dot on the left already signals "running", so the
-            timestamp is hidden — but its width is still reserved (opacity-0,
-            not unmounted) so the menu lands in the same spot and the row
-            height never shifts. Transform/opacity only — no layout reflow. */}
+        {/* Trailing slot: on an IDLE row the timestamp is visible and slides
+            left only while the row is hovered or the menu/keyboard action is
+            actually visible. Plain pointer focus must not keep it displaced
+            after the menu closes. On an ACTIVE row the pulsing orange dot on
+            the left already signals "running", so the timestamp is hidden —
+            but its width is still reserved (opacity-0, not unmounted) so the
+            menu lands in the same spot and the row height never shifts.
+            Transform/opacity only — no layout reflow. */}
         <div className="relative flex h-full items-center justify-end self-stretch pl-1 pr-1.5">
           <span
             className={cn(
               'pointer-events-none min-w-6 text-right text-[0.625rem] leading-none text-(--ui-text-tertiary) transition-[transform,opacity] duration-150 ease-out',
-              // Slide left by the menu's footprint on hover so the age stays
-              // fully legible beside the revealed 3-dot button.
-              'group-hover:-translate-x-5 group-focus-within:-translate-x-5',
+              // Slide left past the menu's footprint so the age stays fully
+              // legible beside the revealed 3-dot button.
+              'group-hover:-translate-x-6 group-data-[actions-visible=true]:-translate-x-6',
               // Active sessions: the orange dot is the status cue; hide the
               // timestamp (keep its reserved width) for the whole active run.
               isWorking && 'opacity-0'
             )}
+            data-session-row-age
           >
             {age}
           </span>
@@ -290,10 +298,14 @@ export function SidebarSessionRow({
               profile={session.profile}
               sessionId={session.id}
               title={title}
+              onOpenChange={setActionsMenuOpen}
             >
               <Button
                 aria-label={r.actionsFor(title)}
-                className="size-5 translate-x-1 scale-90 rounded-[4px] bg-transparent text-transparent opacity-0 transition-all duration-150 ease-out group-hover:translate-x-0 group-hover:scale-100 group-hover:text-(--ui-text-tertiary) group-hover:opacity-100 group-focus-within:translate-x-0 group-focus-within:scale-100 group-focus-within:opacity-100 hover:bg-(--ui-control-active-background)! hover:text-foreground! focus-visible:bg-(--ui-control-active-background) focus-visible:text-foreground focus-visible:opacity-100 focus-visible:ring-0 data-[state=open]:translate-x-0 data-[state=open]:scale-100 data-[state=open]:bg-(--ui-control-active-background) data-[state=open]:text-foreground data-[state=open]:opacity-100 [&_svg]:size-3.5!"
+                className="size-5 translate-x-1 scale-90 rounded-[4px] bg-transparent text-transparent opacity-0 transition-all duration-150 ease-out group-hover:translate-x-0 group-hover:scale-100 group-hover:text-(--ui-text-tertiary) group-hover:opacity-100 group-data-[actions-visible=true]:translate-x-0 group-data-[actions-visible=true]:scale-100 group-data-[actions-visible=true]:text-(--ui-text-tertiary) group-data-[actions-visible=true]:opacity-100 hover:bg-(--ui-control-active-background)! hover:text-foreground! focus-visible:translate-x-0 focus-visible:scale-100 focus-visible:bg-(--ui-control-active-background) focus-visible:text-foreground focus-visible:opacity-100 focus-visible:ring-0 data-[state=open]:translate-x-0 data-[state=open]:scale-100 data-[state=open]:bg-(--ui-control-active-background) data-[state=open]:text-foreground data-[state=open]:opacity-100 [&_svg]:size-3.5!"
+                data-session-row-actions
+                onBlur={() => setActionsKeyboardFocus(false)}
+                onFocus={event => setActionsKeyboardFocus(event.currentTarget.matches(':focus-visible'))}
                 size="icon"
                 title={r.sessionActions}
                 variant="ghost"
