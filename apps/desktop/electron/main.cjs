@@ -29,6 +29,7 @@ const { runBootstrap } = require('./bootstrap-runner.cjs')
 const { buildSessionWindowUrl, createSessionWindowRegistry } = require('./session-windows.cjs')
 const { canImportHermesCli, verifyHermesCli } = require('./backend-probes.cjs')
 const { probeGatewayWebSocket } = require('./gateway-ws-probe.cjs')
+const { bundleNeedsRebuild } = require('./update-stamp.cjs')
 const { serializeJsonBody, setJsonRequestHeaders } = require('./oauth-net-request.cjs')
 const { fetchMarketplaceThemes, searchMarketplaceThemes } = require('./vscode-marketplace.cjs')
 const {
@@ -1454,17 +1455,9 @@ async function checkUpdates() {
   try {
     currentSha = await runGit(['rev-parse', 'HEAD'], { cwd: updateRoot }).then(r => r.stdout?.trim() || '')
     if (currentSha) {
-      const bundlePath = runningAppBundle()
-      if (bundlePath) {
-        const stampPath = path.join(bundlePath, 'Contents', 'Resources', 'install-stamp.json')
-        if (fileExists(stampPath)) {
-          const stamp = JSON.parse(fs.readFileSync(stampPath, 'utf8'))
-          const stampCommit = String(stamp?.commit || '').trim()
-          if (stampCommit && stampCommit !== currentSha) {
-            rebuildNeeded = true
-          }
-        }
-      }
+      // `runningAppBundle()` currently resolves only packaged macOS .app
+      // bundles; Linux/Windows/dev launches return null and skip this hint.
+      rebuildNeeded = bundleNeedsRebuild(runningAppBundle(), currentSha)
       // Catch local uncommitted edits to desktop source files
       const desktopDiff = await runGit(['diff', '--name-only', 'HEAD', '--', 'apps/desktop/'], { cwd: updateRoot })
       if (desktopDiff.code === 0 && desktopDiff.stdout?.trim().length > 0) {
@@ -1504,21 +1497,7 @@ async function checkUpdates() {
   // rev-parse raced with an external pull — covers the edge where HEAD
   // advanced between our pre-fetch and post-fetch reads.
   if (!rebuildNeeded && currentShaAfter && currentShaAfter !== currentSha) {
-    try {
-      const bundlePath = runningAppBundle()
-      if (bundlePath) {
-        const stampPath = path.join(bundlePath, 'Contents', 'Resources', 'install-stamp.json')
-        if (fileExists(stampPath)) {
-          const stamp = JSON.parse(fs.readFileSync(stampPath, 'utf8'))
-          const stampCommit = String(stamp?.commit || '').trim()
-          if (stampCommit && stampCommit !== currentShaAfter) {
-            rebuildNeeded = true
-          }
-        }
-      }
-    } catch {
-      // Best-effort
-    }
+    rebuildNeeded = bundleNeedsRebuild(runningAppBundle(), currentShaAfter)
   }
 
   const behind = Number.parseInt(countStr, 10) || 0
