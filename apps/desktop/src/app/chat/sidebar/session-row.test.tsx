@@ -193,6 +193,21 @@ describe('SidebarSessionRow gestures', () => {
     expect(handlers.onArchive).not.toHaveBeenCalled()
   })
 
+  it('keeps destructive session deletes adjacent with standard Delete last', async () => {
+    const { rowButton } = renderRow()
+
+    fireEvent.contextMenu(rowButton)
+
+    expect(await screen.findByText('Delete cloud channel')).toBeTruthy()
+
+    const labels = screen
+      .getAllByRole('menuitem')
+      .map(item => item.textContent?.trim())
+      .filter(Boolean)
+
+    expect(labels.slice(-3)).toEqual(['Archive', 'Delete cloud channel', 'Delete'])
+  })
+
   it('moves the timestamp for a real actions menu open, not lingering pointer focus', () => {
     const { container } = renderRow()
     const chrome = container.querySelector('[data-session-row-chrome]') as HTMLElement

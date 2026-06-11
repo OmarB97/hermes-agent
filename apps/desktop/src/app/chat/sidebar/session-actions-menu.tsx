@@ -249,7 +249,6 @@ function useSessionActions({
         shareToCloudItem,
         inviteToCloudItem,
         cloudMembersItem,
-        deleteCloudItem,
         {
           disabled: !onArchive,
           icon: 'archive',
@@ -259,6 +258,7 @@ function useSessionActions({
             onArchive?.()
           }
         },
+        deleteCloudItem,
         deleteItem
       ]
 
