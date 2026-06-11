@@ -1220,6 +1220,7 @@ export const ja = defineLocale({
       copyId: 'ID をコピー',
       export: 'エクスポート',
       shareToCloud: 'クラウドに共有',
+      copyCloudId: 'クラウド ID をコピー',
       rename: '名前を変更',
       archive: 'アーカイブ',
       restore: '復元',

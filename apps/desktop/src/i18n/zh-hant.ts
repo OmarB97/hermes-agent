@@ -1186,6 +1186,7 @@ export const zhHant = defineLocale({
       copyId: '複製 ID',
       export: '匯出',
       shareToCloud: '分享到雲端',
+      copyCloudId: '複製雲端 ID',
       rename: '重新命名',
       archive: '封存',
       restore: '還原',

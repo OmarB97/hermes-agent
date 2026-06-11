@@ -1145,6 +1145,7 @@ export const en: Translations = {
       copyId: 'Copy ID',
       export: 'Export',
       shareToCloud: 'Share to cloud',
+      copyCloudId: 'Copy cloud ID',
       rename: 'Rename',
       archive: 'Archive',
       restore: 'Restore',
