@@ -167,6 +167,17 @@ describe('mergeSessionPage', () => {
 
     expect(merged.map(s => s.id)).toEqual(['tip'])
   })
+
+  it('prefers the live lineage row when a stale incoming segment arrives first', () => {
+    const incoming = [
+      session({ id: 'mid', _lineage_root_id: 'root', last_active: 100 }),
+      session({ id: 'tip', _lineage_root_id: 'root', _lineage_ids: ['root', 'mid', 'tip'], last_active: 200 })
+    ]
+
+    const merged = mergeSessionPage([], incoming, ['mid'])
+
+    expect(merged.map(s => s.id)).toEqual(['tip'])
+  })
 })
 
 describe('workspaceCwdForNewSession', () => {

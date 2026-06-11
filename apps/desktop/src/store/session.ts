@@ -99,17 +99,29 @@ export const sessionAliasIds = (session: Pick<SessionInfo, '_lineage_ids' | '_li
 }
 
 function dedupeSessionsByAlias(sessions: SessionInfo[]): SessionInfo[] {
-  const seen = new Set<string>()
+  const aliasIndex = new Map<string, number>()
   const deduped: SessionInfo[] = []
 
   for (const session of sessions) {
     const aliases = sessionAliasIds(session)
-    if (aliases.some(id => seen.has(id))) {
+    const existingIndex = aliases.map(id => aliasIndex.get(id)).find(index => index !== undefined)
+
+    if (existingIndex !== undefined) {
+      const current = deduped[existingIndex]
+      if (
+        aliases.length > sessionAliasIds(current).length ||
+        (aliases.length === sessionAliasIds(current).length && session.last_active > current.last_active)
+      ) {
+        deduped[existingIndex] = session
+      }
+      for (const id of aliases) {
+        aliasIndex.set(id, existingIndex)
+      }
       continue
     }
 
     for (const id of aliases) {
-      seen.add(id)
+      aliasIndex.set(id, deduped.length)
     }
     deduped.push(session)
   }
