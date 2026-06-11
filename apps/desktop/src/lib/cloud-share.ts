@@ -20,6 +20,23 @@ interface CloudInviteResult {
   permission?: string
 }
 
+export interface CloudChannelMember {
+  account_id: string
+  display_name?: string | null
+  email?: string | null
+  granted_via?: string | null
+  joined_at?: string | null
+  permission?: string | null
+}
+
+export interface CloudMembersResult {
+  channel_id?: string
+  count?: number
+  members?: CloudChannelMember[]
+  owner_account_id?: string
+  your_permission?: string
+}
+
 // "Share to cloud" (channels slice 4.0): promote the session to a cloud
 // channel and start the gateway's background pusher. Self-contained like
 // exportSession so the actions menu can call it without threading a handler
@@ -155,5 +172,41 @@ export async function inviteCloudChannelMember(sessionId: string, email: string)
     notifyError(err, 'Could not create the cloud invite')
 
     return false
+  }
+}
+
+export async function loadCloudChannelMembers(sessionId: string): Promise<CloudMembersResult | null> {
+  const gateway = activeGateway()
+
+  if (!gateway) {
+    notify({ kind: 'error', title: 'Cloud members', message: 'Not connected yet — try again in a moment.' })
+
+    return null
+  }
+
+  try {
+    return await gateway.request<CloudMembersResult>('session.cloud_members', { session_id: sessionId })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+
+    if (/not configured/i.test(message)) {
+      notify({
+        kind: 'error',
+        title: "Cloud sharing isn't set up",
+        message: 'Add your cloud token (HERMES_CLOUD_TOKEN) where the gateway runs, then try again.'
+      })
+
+      return null
+    }
+
+    if (/not shared/i.test(message)) {
+      notify({ kind: 'error', title: 'Cloud members', message: 'Share this chat to the cloud first.' })
+
+      return null
+    }
+
+    notifyError(err, 'Could not load cloud members')
+
+    return null
   }
 }

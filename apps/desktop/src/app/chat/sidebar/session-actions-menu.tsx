@@ -17,7 +17,13 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigge
 import { Input } from '@/components/ui/input'
 import { renameSession } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { copyCloudChannelId, inviteCloudChannelMember, shareSessionToCloud } from '@/lib/cloud-share'
+import {
+  type CloudMembersResult,
+  copyCloudChannelId,
+  inviteCloudChannelMember,
+  loadCloudChannelMembers,
+  shareSessionToCloud
+} from '@/lib/cloud-share'
 import { triggerHaptic } from '@/lib/haptics'
 import { exportSession } from '@/lib/session-export'
 import { notify, notifyError } from '@/store/notifications'
@@ -67,6 +73,7 @@ function useSessionActions({
   const r = t.sidebar.row
   const [renameOpen, setRenameOpen] = useState(false)
   const [inviteOpen, setInviteOpen] = useState(false)
+  const [membersOpen, setMembersOpen] = useState(false)
 
   const selectItem: ItemSpec[] = onSelect
     ? [
@@ -135,6 +142,16 @@ function useSessionActions({
     }
   }
 
+  const cloudMembersItem: ItemSpec = {
+    disabled: !sessionId,
+    icon: 'organization',
+    label: r.cloudMembers,
+    onSelect: () => {
+      triggerHaptic('selection')
+      setMembersOpen(true)
+    }
+  }
+
   const exportItem: ItemSpec = {
     disabled: !sessionId,
     icon: 'cloud-download',
@@ -189,6 +206,7 @@ function useSessionActions({
         shareToCloudItem,
         copyCloudIdItem,
         inviteToCloudItem,
+        cloudMembersItem,
         exportItem,
         {
           disabled: !sessionId,
@@ -233,7 +251,11 @@ function useSessionActions({
     <InviteCloudDialog onOpenChange={setInviteOpen} open={inviteOpen} sessionId={sessionId} />
   )
 
-  return { inviteDialog, renameDialog, renderItems }
+  const membersDialog = (
+    <CloudMembersDialog onOpenChange={setMembersOpen} open={membersOpen} sessionId={sessionId} />
+  )
+
+  return { inviteDialog, membersDialog, renameDialog, renderItems }
 }
 
 interface SessionActionsMenuProps
@@ -243,7 +265,7 @@ interface SessionActionsMenuProps
 
 export function SessionActionsMenu({ children, align = 'end', sideOffset = 6, ...actions }: SessionActionsMenuProps) {
   const { t } = useI18n()
-  const { inviteDialog, renameDialog, renderItems } = useSessionActions(actions)
+  const { inviteDialog, membersDialog, renameDialog, renderItems } = useSessionActions(actions)
 
   return (
     <>
@@ -259,6 +281,7 @@ export function SessionActionsMenu({ children, align = 'end', sideOffset = 6, ..
         </DropdownMenuContent>
       </DropdownMenu>
       {inviteDialog}
+      {membersDialog}
       {renameDialog}
     </>
   )
@@ -270,7 +293,7 @@ interface SessionContextMenuProps extends SessionActions {
 
 export function SessionContextMenu({ children, ...actions }: SessionContextMenuProps) {
   const { t } = useI18n()
-  const { inviteDialog, renameDialog, renderItems } = useSessionActions(actions)
+  const { inviteDialog, membersDialog, renameDialog, renderItems } = useSessionActions(actions)
 
   return (
     <>
@@ -281,8 +304,86 @@ export function SessionContextMenu({ children, ...actions }: SessionContextMenuP
         </ContextMenuContent>
       </ContextMenu>
       {inviteDialog}
+      {membersDialog}
       {renameDialog}
     </>
+  )
+}
+
+interface CloudMembersDialogProps {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  sessionId: string
+}
+
+function CloudMembersDialog({ open, onOpenChange, sessionId }: CloudMembersDialogProps) {
+  const { t } = useI18n()
+  const r = t.sidebar.row
+  const [loading, setLoading] = useState(false)
+  const [result, setResult] = useState<CloudMembersResult | null>(null)
+
+  useEffect(() => {
+    if (!open) {
+      return
+    }
+
+    let active = true
+    setLoading(true)
+    void loadCloudChannelMembers(sessionId)
+      .then(next => {
+        if (active) {
+          setResult(next)
+        }
+      })
+      .finally(() => {
+        if (active) {
+          setLoading(false)
+        }
+      })
+
+    return () => {
+      active = false
+    }
+  }, [open, sessionId])
+
+  const members = result?.members ?? []
+
+  return (
+    <Dialog onOpenChange={onOpenChange} open={open}>
+      <DialogContent className="max-w-md">
+        <DialogHeader>
+          <DialogTitle>{r.cloudMembersTitle}</DialogTitle>
+          <DialogDescription>{r.cloudMembersDesc}</DialogDescription>
+        </DialogHeader>
+        <div className="max-h-72 space-y-2 overflow-y-auto">
+          {loading ? (
+            <div className="text-sm text-muted-foreground">{t.common.loading}</div>
+          ) : members.length === 0 ? (
+            <div className="text-sm text-muted-foreground">{r.cloudMembersEmpty}</div>
+          ) : (
+            members.map(member => (
+              <div className="rounded-md border border-border/70 px-3 py-2" key={member.account_id}>
+                <div className="truncate text-sm font-medium">
+                  {member.display_name || member.email || member.account_id}
+                </div>
+                <div className="mt-0.5 flex items-center gap-2 text-xs text-muted-foreground">
+                  <span>{member.permission || 'read'}</span>
+                  {member.email ? <span className="truncate">{member.email}</span> : null}
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+        <DialogFooter>
+          <Button disabled={loading} onClick={() => onOpenChange(false)} type="button" variant="ghost">
+            {t.common.close}
+          </Button>
+          <Button disabled={loading} onClick={() => void loadCloudChannelMembers(sessionId).then(setResult)} type="button">
+            {r.cloudMembersRefresh}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }
 
