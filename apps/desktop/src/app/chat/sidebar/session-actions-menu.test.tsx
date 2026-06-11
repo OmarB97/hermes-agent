@@ -1,9 +1,10 @@
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type * as React from 'react'
-
-import { cleanup, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { copyTextWithFeedback } from '@/components/ui/copy-button'
 import { I18nProvider } from '@/i18n'
+import { copyCloudChannelId } from '@/lib/cloud-share'
 
 import { SessionActionsMenu } from './session-actions-menu'
 
@@ -14,8 +15,16 @@ vi.mock('@/components/ui/button', () => ({
 vi.mock('@/components/ui/context-menu', () => ({
   ContextMenu: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
   ContextMenuContent: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
-  ContextMenuItem: ({ children, disabled }: { children: React.ReactNode; disabled?: boolean }) => (
-    <button disabled={disabled} role="menuitem" type="button">
+  ContextMenuItem: ({
+    children,
+    disabled,
+    onSelect
+  }: {
+    children: React.ReactNode
+    disabled?: boolean
+    onSelect?: (event: Event) => void
+  }) => (
+    <button disabled={disabled} onClick={event => onSelect?.(event.nativeEvent)} role="menuitem" type="button">
       {children}
     </button>
   ),
@@ -23,7 +32,7 @@ vi.mock('@/components/ui/context-menu', () => ({
 }))
 
 vi.mock('@/components/ui/copy-button', () => ({
-  writeClipboardText: vi.fn().mockResolvedValue(undefined)
+  copyTextWithFeedback: vi.fn().mockResolvedValue(true)
 }))
 
 vi.mock('@/components/ui/dialog', () => ({
@@ -38,8 +47,16 @@ vi.mock('@/components/ui/dialog', () => ({
 vi.mock('@/components/ui/dropdown-menu', () => ({
   DropdownMenu: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
   DropdownMenuContent: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
-  DropdownMenuItem: ({ children, disabled }: { children: React.ReactNode; disabled?: boolean }) => (
-    <button disabled={disabled} role="menuitem" type="button">
+  DropdownMenuItem: ({
+    children,
+    disabled,
+    onSelect
+  }: {
+    children: React.ReactNode
+    disabled?: boolean
+    onSelect?: (event: Event) => void
+  }) => (
+    <button disabled={disabled} onClick={event => onSelect?.(event.nativeEvent)} role="menuitem" type="button">
       {children}
     </button>
   ),
@@ -144,5 +161,38 @@ describe('SessionActionsMenu ordering', () => {
       'Delete cloud channel',
       'Delete'
     ])
+  })
+
+  it('copies the session id with feedback without holding the overflow menu open', async () => {
+    render(
+      <I18nProvider configClient={null}>
+        <SessionActionsMenu sessionId="session-123" title="Demo session">
+          <button type="button">Actions</button>
+        </SessionActionsMenu>
+      </I18nProvider>
+    )
+
+    expect(fireEvent.click(screen.getByRole('menuitem', { name: 'Copy ID' }))).toBe(true)
+
+    await waitFor(() =>
+      expect(copyTextWithFeedback).toHaveBeenCalledWith('session-123', {
+        errorMessage: 'Could not copy session ID',
+        successMessage: 'Copied',
+        successTitle: 'Copy ID'
+      })
+    )
+  })
+
+  it('lets Copy cloud ID close the overflow menu after selection', () => {
+    render(
+      <I18nProvider configClient={null}>
+        <SessionActionsMenu sessionId="session-123" title="Demo session">
+          <button type="button">Actions</button>
+        </SessionActionsMenu>
+      </I18nProvider>
+    )
+
+    expect(fireEvent.click(screen.getByRole('menuitem', { name: 'Copy cloud ID' }))).toBe(true)
+    expect(copyCloudChannelId).toHaveBeenCalledWith('session-123')
   })
 })

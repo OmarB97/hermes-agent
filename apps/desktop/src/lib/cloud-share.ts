@@ -1,4 +1,4 @@
-import { writeClipboardText } from '@/components/ui/copy-button'
+import { copyTextWithFeedback } from '@/components/ui/copy-button'
 import { activeGateway } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
 
@@ -202,8 +202,12 @@ export async function copyCloudChannelId(sessionId: string): Promise<void> {
       return
     }
 
-    await writeClipboardText(result.channel_id)
-    notify({ kind: 'success', title: 'Copied cloud ID', message: result.channel_id })
+    await copyTextWithFeedback(result.channel_id, {
+      errorMessage: 'Could not copy the cloud channel ID',
+      notifyFailure: false,
+      successMessage: result.channel_id,
+      successTitle: 'Copied cloud ID'
+    })
   } catch (err) {
     notifyError(err, 'Could not copy the cloud channel ID')
   }
@@ -263,14 +267,22 @@ export async function inviteCloudChannelMember(sessionId: string, email: string)
     })
 
     if (result.accept_token) {
-      await writeClipboardText(result.accept_token)
+      try {
+        await copyTextWithFeedback(result.accept_token, {
+          errorMessage: 'Could not copy the cloud invite token',
+          successMessage: `Invite ready for ${result.email || trimmed}.`,
+          successTitle: 'Invite token copied'
+        })
+      } catch {
+        return false
+      }
+    } else {
+      notify({
+        kind: 'success',
+        title: 'Cloud invite created',
+        message: `Invite ready for ${result.email || trimmed}.`
+      })
     }
-
-    notify({
-      kind: 'success',
-      title: result.accept_token ? 'Invite token copied' : 'Cloud invite created',
-      message: `Invite ready for ${result.email || trimmed}.`
-    })
 
     return true
   } catch (err) {

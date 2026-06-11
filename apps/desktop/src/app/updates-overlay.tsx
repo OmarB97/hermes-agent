@@ -3,7 +3,7 @@ import { useEffect, useState } from 'react'
 
 import { BrandMark } from '@/components/brand-mark'
 import { Button } from '@/components/ui/button'
-import { writeClipboardText } from '@/components/ui/copy-button'
+import { copyTextWithFeedback } from '@/components/ui/copy-button'
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/components/ui/dialog'
 import { ErrorIcon, ErrorState } from '@/components/ui/error-state'
 import { Loader } from '@/components/ui/loader'
@@ -11,8 +11,8 @@ import type { DesktopUpdateCommit, DesktopUpdateStage, DesktopUpdateStatus } fro
 import { useI18n } from '@/i18n'
 import { buildCommitChangelog, type CommitGroup } from '@/lib/commit-changelog'
 import { AlertCircle, Check, CheckCircle2, Copy, Terminal } from '@/lib/icons'
-import { cn } from '@/lib/utils'
 import { resolveUpdateCopy, type UpdateTarget } from '@/lib/update-copy'
+import { cn } from '@/lib/utils'
 import {
   $backendUpdateApply,
   $backendUpdateChecking,
@@ -282,10 +282,14 @@ function ManualView({ command, onDone }: { command: string; onDone: () => void }
   const [copied, setCopied] = useState(false)
 
   const handleCopy = () => {
-    void writeClipboardText(command).then(() => {
-      setCopied(true)
-      window.setTimeout(() => setCopied(false), 1800)
-    })
+    void copyTextWithFeedback(command, { successMessage: u.copied, successTitle: u.copy })
+      .then(copied => {
+        if (copied) {
+          setCopied(true)
+          window.setTimeout(() => setCopied(false), 1800)
+        }
+      })
+      .catch(() => undefined)
   }
 
   return (
