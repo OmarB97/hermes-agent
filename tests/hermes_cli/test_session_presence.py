@@ -3,6 +3,7 @@ import os
 
 import pytest
 
+from hermes_cli import session_presence as sp
 from hermes_cli.session_presence import (
     clear_session_presence,
     list_session_presence,
@@ -13,6 +14,9 @@ from hermes_cli.session_presence import (
 @pytest.fixture(autouse=True)
 def isolate_presence_env(monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_PRESENCE_DIR", raising=False)
+    sp._presence_cache.clear()
+    yield
+    sp._presence_cache.clear()
 
 
 def test_session_presence_write_list_and_clear(tmp_path, monkeypatch):
@@ -126,3 +130,84 @@ def test_session_presence_dir_env_overrides_hermes_home(tmp_path, monkeypatch):
         "session_id"
     ] == "shared"
     assert not (tmp_path / "ignored" / "session-presence" / "active").exists()
+
+
+def test_session_presence_cache_reuses_parsed_records(tmp_path, monkeypatch):
+    original = sp._read_presence_records
+    calls = 0
+
+    def spy(root):
+        nonlocal calls
+        calls += 1
+        return original(root)
+
+    monkeypatch.setattr(sp, "_read_presence_records", spy)
+    write_session_presence(session_id="cached", hermes_home=tmp_path, now=10.0)
+
+    first_rows = list_session_presence(hermes_home=tmp_path, now=11.0)
+    assert first_rows[0]["session_id"] == "cached"
+    first_rows[0]["session_id"] = "mutated"
+
+    assert list_session_presence(hermes_home=tmp_path, now=12.0)[0]["session_id"] == "cached"
+    assert calls == 1
+
+
+def test_session_presence_cache_invalidates_on_external_file_change(
+    tmp_path, monkeypatch
+):
+    original = sp._read_presence_records
+    calls = 0
+
+    def spy(root):
+        nonlocal calls
+        calls += 1
+        return original(root)
+
+    monkeypatch.setattr(sp, "_read_presence_records", spy)
+    write_session_presence(
+        session_id="first",
+        hermes_home=tmp_path,
+        instance_id="instance-a",
+        now=10.0,
+    )
+    assert list_session_presence(hermes_home=tmp_path, now=11.0)[0]["session_id"] == "first"
+
+    root = tmp_path / "session-presence" / "active"
+    external = {
+        "version": 1,
+        "session_id": "second",
+        "session_key": "second",
+        "updated_at": 12.0,
+        "expires_at": 120.0,
+    }
+    (root / "external.second.json").write_text(json.dumps(external), encoding="utf-8")
+
+    rows = list_session_presence(hermes_home=tmp_path, now=13.0)
+    assert [row["session_id"] for row in rows] == ["second", "first"]
+    assert calls == 2
+
+
+def test_session_presence_cache_rechecks_expiration_for_each_call(
+    tmp_path, monkeypatch
+):
+    original = sp._read_presence_records
+    calls = 0
+
+    def spy(root):
+        nonlocal calls
+        calls += 1
+        return original(root)
+
+    monkeypatch.setattr(sp, "_read_presence_records", spy)
+    write_session_presence(
+        session_id="short-lived",
+        ttl_seconds=5,
+        hermes_home=tmp_path,
+        now=10.0,
+    )
+
+    assert list_session_presence(hermes_home=tmp_path, now=11.0)[0][
+        "session_id"
+    ] == "short-lived"
+    assert list_session_presence(hermes_home=tmp_path, now=20.0) == []
+    assert calls == 1
