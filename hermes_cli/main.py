@@ -8880,14 +8880,17 @@ def _cmd_update_impl(args, gateway_mode: bool):
             logger.debug("Model catalog seed during update failed: %s", e)
 
         # After git pull, source files on disk are newer than cached Python
-        # modules in this process.  Reload hermes_constants so that any lazy
-        # import executed below (skills sync, gateway restart) sees new
-        # attributes like display_hermes_home() added since the last release.
+        # modules in this process.  Reload modules used below so that the
+        # updater does not restart gateways with pre-update launchd/systemd
+        # logic still cached in sys.modules.
         try:
             import importlib
             import hermes_constants as _hc
 
             importlib.reload(_hc)
+            _gateway_mod = sys.modules.get("hermes_cli.gateway")
+            if _gateway_mod is not None:
+                importlib.reload(_gateway_mod)
         except Exception:
             pass  # non-fatal — worst case a lazy import fails gracefully
 
@@ -9549,15 +9552,35 @@ def _cmd_update_impl(args, gateway_mode: bool):
             if is_macos():
                 try:
                     from hermes_cli.gateway import (
+                        launchd_start,
                         launchd_restart,
                         get_launchd_label,
                         get_launchd_plist_path,
                     )
 
                     plist_path = get_launchd_plist_path()
+                    label = get_launchd_label()
+
+                    def _try_launchd_repair(reason: str) -> bool:
+                        try:
+                            print(f"  → {label}: {reason}; repairing launchd job...")
+                            launchd_start()
+                            restarted_services.append(label)
+                            return True
+                        except subprocess.CalledProcessError as e:
+                            stderr = (getattr(e, "stderr", "") or "").strip()
+                            print(f"  ⚠ Gateway launchd repair failed: {stderr}")
+                        except SystemExit as e:
+                            print(
+                                f"  ⚠ Gateway launchd repair exited with code {e.code}"
+                            )
+                        except Exception as e:
+                            print(f"  ⚠ Gateway launchd repair failed: {e}")
+                        return False
+
                     if plist_path.exists():
                         check = subprocess.run(
-                            ["launchctl", "list", get_launchd_label()],
+                            ["launchctl", "list", label],
                             capture_output=True,
                             text=True,
                             timeout=5,
@@ -9565,10 +9588,17 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         if check.returncode == 0:
                             try:
                                 launchd_restart()
-                                restarted_services.append(get_launchd_label())
+                                restarted_services.append(label)
                             except subprocess.CalledProcessError as e:
                                 stderr = (getattr(e, "stderr", "") or "").strip()
                                 print(f"  ⚠ Gateway restart failed: {stderr}")
+                                _try_launchd_repair("restart failed")
+                        else:
+                            detail = (check.stderr or check.stdout or "").strip()
+                            reason = "launchd job is not loaded"
+                            if detail:
+                                reason = f"{reason} ({detail})"
+                            _try_launchd_repair(reason)
                 except (FileNotFoundError, subprocess.TimeoutExpired, ImportError):
                     pass
 

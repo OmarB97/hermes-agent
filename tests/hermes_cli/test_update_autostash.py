@@ -574,6 +574,73 @@ def test_cmd_update_uses_target_branch_tracking_remote(monkeypatch, tmp_path):
     assert ["git", "pull", "--ff-only", "origin", "main"] not in recorded
 
 
+def test_cmd_update_repairs_macos_launchd_when_gateway_job_is_missing(
+    monkeypatch, tmp_path, capsys
+):
+    """A desktop update must repair launchd when the plist exists but the job
+    is not loaded.
+
+    This is the macOS screenshot failure mode: launchctl reports
+    "Could not find service ai.hermes.gateway", then the relaunched desktop
+    times out waiting for the backend.
+    """
+    _setup_update_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None
+    )
+
+    import importlib
+    from hermes_cli import gateway as gateway_cli
+
+    monkeypatch.setattr(importlib, "reload", lambda module: module)
+    monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+    monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+
+    plist_path = tmp_path / "Library" / "LaunchAgents" / "ai.hermes.gateway.plist"
+    plist_path.parent.mkdir(parents=True)
+    plist_path.write_text("<plist />")
+    monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+    monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
+
+    calls = []
+    monkeypatch.setattr(gateway_cli, "launchd_start", lambda: calls.append("start"))
+    monkeypatch.setattr(gateway_cli, "launchd_restart", lambda: calls.append("restart"))
+    monkeypatch.setattr(gateway_cli, "_get_service_pids", lambda: set())
+    monkeypatch.setattr(gateway_cli, "find_gateway_pids", lambda **kwargs: [])
+    monkeypatch.setattr(
+        gateway_cli, "find_profile_gateway_processes", lambda **kwargs: []
+    )
+    monkeypatch.setattr(
+        gateway_cli,
+        "launch_detached_profile_gateway_restart",
+        lambda profile, pid: False,
+    )
+    monkeypatch.setattr(
+        gateway_cli, "_graceful_restart_via_sigusr1", lambda *a, **kw: False
+    )
+    monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda **kwargs: None)
+
+    side_effect, _ = _make_update_side_effect()
+
+    def fake_run(cmd, **kwargs):
+        if cmd == ["launchctl", "list", "ai.hermes.gateway"]:
+            return SimpleNamespace(
+                stdout="",
+                stderr='Could not find service "ai.hermes.gateway"',
+                returncode=113,
+            )
+        return side_effect(cmd, **kwargs)
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+    hermes_main.cmd_update(SimpleNamespace(yes=True))
+
+    assert calls == ["start"]
+    out = capsys.readouterr().out
+    assert "launchd job is not loaded" in out
+    assert "repairing launchd job" in out
+
+
 # ---------------------------------------------------------------------------
 # Non-main branch → auto-checkout main
 # ---------------------------------------------------------------------------

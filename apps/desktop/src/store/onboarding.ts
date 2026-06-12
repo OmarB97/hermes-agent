@@ -492,6 +492,12 @@ export async function refreshOnboarding(ctx: OnboardingContext) {
   const state = $desktopOnboarding.get()
   const reason = runtime.reason || state.reason || DEFAULT_ONBOARDING_REASON
 
+  if (runtime.unavailable) {
+    patch({ reason })
+
+    return false
+  }
+
   writeCachedConfigured(false)
   patch({ configured: false, reason })
 
