@@ -131,6 +131,8 @@ export function SidebarSessionRow({
   // the atom is tiny and rarely non-empty. True when a clarify prompt in this
   // session is waiting on the user.
   const needsInput = useStore($attentionSessionIds).includes(session.id)
+  const titleActive = isSelected || checked || (isWorking && !needsInput)
+  const titleRunning = isWorking && !needsInput
 
   const toggleSelect = (mode: 'range' | 'single') => {
     triggerHaptic('selection')
@@ -173,7 +175,7 @@ export function SidebarSessionRow({
       >
         <motion.div
           className={cn(
-            'group relative grid min-h-[1.625rem] cursor-pointer grid-cols-[minmax(0,1fr)_auto] items-center rounded-md transition-[background-color,color,opacity,box-shadow] duration-100 ease-out hover:bg-(--ui-row-hover-background) hover:transition-none',
+            'group/session-row relative grid min-h-[1.625rem] w-full cursor-pointer grid-cols-[minmax(0,1fr)_auto] items-center rounded-md transition-[background-color,color,opacity,box-shadow] duration-100 ease-out hover:bg-(--ui-row-hover-background) hover:transition-none',
             reorderable && 'active:cursor-grabbing',
             (isSelected || checked) && 'bg-(--ui-row-active-background)',
             isWorking && 'text-foreground',
@@ -292,7 +294,14 @@ export function SidebarSessionRow({
               </span>
             )}
             <div className="min-w-0 flex-1">
-              <span className="block truncate text-[0.8125rem] font-normal text-(--ui-text-secondary) group-hover:text-foreground group-data-[working=true]:text-foreground/90">
+              <span
+                className={cn(
+                  'block truncate text-[0.8125rem] group-hover/session-row:text-foreground',
+                  titleActive ? 'text-foreground' : 'text-(--ui-text-secondary)',
+                  titleRunning ? 'font-medium' : 'font-normal'
+                )}
+                data-session-row-title
+              >
                 {title}
               </span>
             </div>
@@ -311,7 +320,7 @@ export function SidebarSessionRow({
                 'pointer-events-none min-w-6 text-right text-[0.625rem] leading-none text-(--ui-text-tertiary) transition-[transform,opacity] duration-150 ease-out',
                 // Slide left past the menu's footprint so the age stays fully
                 // legible beside the revealed 3-dot button.
-                'group-hover:-translate-x-6 group-data-[actions-visible=true]:-translate-x-6',
+                'group-hover/session-row:-translate-x-6 group-data-[actions-visible=true]/session-row:-translate-x-6',
                 // Active sessions: the orange dot is the status cue; hide the
                 // timestamp (keep its reserved width) for the whole active run.
                 // A clarify-blocked run keeps the timestamp visible because
@@ -338,7 +347,7 @@ export function SidebarSessionRow({
               >
                 <Button
                   aria-label={r.actionsFor(title)}
-                  className="size-5 translate-x-1 scale-90 rounded-[4px] bg-transparent text-transparent opacity-0 transition-all duration-150 ease-out group-hover:translate-x-0 group-hover:scale-100 group-hover:text-(--ui-text-tertiary) group-hover:opacity-100 group-data-[actions-visible=true]:translate-x-0 group-data-[actions-visible=true]:scale-100 group-data-[actions-visible=true]:text-(--ui-text-tertiary) group-data-[actions-visible=true]:opacity-100 hover:bg-(--ui-control-active-background)! hover:text-foreground! focus-visible:translate-x-0 focus-visible:scale-100 focus-visible:bg-(--ui-control-active-background) focus-visible:text-foreground focus-visible:opacity-100 focus-visible:ring-0 data-[state=open]:translate-x-0 data-[state=open]:scale-100 data-[state=open]:bg-(--ui-control-active-background) data-[state=open]:text-foreground data-[state=open]:opacity-100 [&_svg]:size-3.5!"
+                  className="size-5 translate-x-1 scale-90 rounded-[4px] bg-transparent text-transparent opacity-0 transition-all duration-150 ease-out group-hover/session-row:translate-x-0 group-hover/session-row:scale-100 group-hover/session-row:text-(--ui-text-tertiary) group-hover/session-row:opacity-100 group-data-[actions-visible=true]/session-row:translate-x-0 group-data-[actions-visible=true]/session-row:scale-100 group-data-[actions-visible=true]/session-row:text-(--ui-text-tertiary) group-data-[actions-visible=true]/session-row:opacity-100 hover:bg-(--ui-control-active-background)! hover:text-foreground! focus-visible:translate-x-0 focus-visible:scale-100 focus-visible:bg-(--ui-control-active-background) focus-visible:text-foreground focus-visible:opacity-100 focus-visible:ring-0 data-[state=open]:translate-x-0 data-[state=open]:scale-100 data-[state=open]:bg-(--ui-control-active-background) data-[state=open]:text-foreground data-[state=open]:opacity-100 [&_svg]:size-3.5!"
                   data-session-row-actions
                   onBlur={() => setActionsKeyboardFocus(false)}
                   onFocus={event => setActionsKeyboardFocus(event.currentTarget.matches(':focus-visible'))}

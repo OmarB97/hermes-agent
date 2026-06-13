@@ -251,8 +251,11 @@ describe('SidebarSessionRow gestures', () => {
     const timestamp = container.querySelector('[data-session-row-age]') as HTMLElement
     const actionsButton = container.querySelector('[data-session-row-actions]') as HTMLButtonElement
 
-    expect(timestamp.className).toContain('group-data-[actions-visible=true]:-translate-x-6')
+    expect(timestamp.className).toContain('group-data-[actions-visible=true]/session-row:-translate-x-6')
+    expect(timestamp.className).not.toContain('group-hover:-translate-x-6')
     expect(timestamp.className).not.toContain('group-focus-within')
+    expect(actionsButton.className).toContain('group-hover/session-row:opacity-100')
+    expect(actionsButton.className).not.toContain('group-hover:opacity-100')
     expect(actionsButton.className).not.toContain('group-focus-within')
     expect(chrome.getAttribute('data-actions-visible')).toBeNull()
 
@@ -277,6 +280,31 @@ describe('SidebarSessionRow gestures', () => {
 
     expect(timestamp.className).not.toContain('opacity-0')
     expect(waiting.container.querySelector('[aria-label="Needs your input"]')).toBeTruthy()
+  })
+
+  it('uses active title contrast for selected and running rows without styling waiting input as live motion', () => {
+    const selected = renderRow({ isSelected: true })
+    let title = selected.container.querySelector('[data-session-row-title]') as HTMLElement
+
+    expect(title.className).toContain('text-foreground')
+    expect(title.className).toContain('font-normal')
+
+    cleanup()
+
+    const running = renderRow({ isWorking: true })
+    title = running.container.querySelector('[data-session-row-title]') as HTMLElement
+
+    expect(title.className).toContain('text-foreground')
+    expect(title.className).toContain('font-medium')
+
+    cleanup()
+    $attentionSessionIds.set(['s1'])
+
+    const waiting = renderRow({ isWorking: true })
+    title = waiting.container.querySelector('[data-session-row-title]') as HTMLElement
+
+    expect(title.className).toContain('text-(--ui-text-secondary)')
+    expect(title.className).toContain('font-normal')
   })
 
   it('starts a session drag from the row body without rendering a separate reorder handle', () => {
