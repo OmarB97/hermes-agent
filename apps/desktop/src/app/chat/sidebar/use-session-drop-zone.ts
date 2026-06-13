@@ -124,6 +124,10 @@ function rowAnchorFromRect(
   }
 
   if (previous) {
+    if (previous.sessionId === sessionId) {
+      return { before: clientY < rect.top + rect.height / 2, sessionId }
+    }
+
     return previous
   }
 

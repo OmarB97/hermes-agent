@@ -1,5 +1,6 @@
 import {
   closestCenter,
+  type CollisionDetection,
   DndContext,
   type DragEndEvent,
   type DragMoveEvent,
@@ -7,6 +8,7 @@ import {
   type DragStartEvent,
   KeyboardSensor,
   PointerSensor,
+  pointerWithin,
   useSensor,
   useSensors
 } from '@dnd-kit/core'
@@ -168,6 +170,13 @@ const sidebarSessionDndItems = (sessions: readonly SessionInfo[]) => sessions.ma
 // Sidebar reordering is strictly vertical. Keep x auto-scroll disabled so a
 // row dragged near the rail edge never pulls the whole window sideways.
 const sidebarSessionDndAutoScroll = { threshold: { x: 0, y: 0.2 } }
+const sidebarSessionDndTransition = { duration: 150, easing: 'cubic-bezier(0.2, 0, 0, 1)' }
+
+const sidebarSessionCollisionDetection: CollisionDetection = args => {
+  const pointerCollisions = pointerWithin(args)
+
+  return pointerCollisions.length > 0 ? pointerCollisions : closestCenter(args)
+}
 
 // ALL-profiles view: show only the latest N per profile up front to keep the
 // unified list scannable, then reveal/fetch more in N-sized steps on demand.
@@ -279,7 +288,31 @@ function activeSessionDragPayload(event: DragStartEvent | DragMoveEvent | DragEn
   return payload ? (payload as SessionDragPayload) : null
 }
 
-function dndEventClientPoint(event: DragMoveEvent | DragEndEvent): null | { clientX: number; clientY: number } {
+type ClientPoint = { clientX: number; clientY: number }
+
+function eventClientPoint(event: Event): ClientPoint | null {
+  const maybePointer = event as { clientX?: unknown; clientY?: unknown }
+
+  if (typeof maybePointer.clientX === 'number' && typeof maybePointer.clientY === 'number') {
+    return { clientX: maybePointer.clientX, clientY: maybePointer.clientY }
+  }
+
+  const maybeTouch = event as { changedTouches?: TouchList; touches?: TouchList }
+  const touch = maybeTouch.touches?.[0] ?? maybeTouch.changedTouches?.[0]
+
+  return touch ? { clientX: touch.clientX, clientY: touch.clientY } : null
+}
+
+function dndEventClientPoint(event: DragMoveEvent | DragEndEvent): ClientPoint | null {
+  const pointer = eventClientPoint(event.activatorEvent)
+
+  if (pointer) {
+    return {
+      clientX: pointer.clientX + event.delta.x,
+      clientY: pointer.clientY + event.delta.y
+    }
+  }
+
   const rect = event.active.rect.current.translated ?? event.active.rect.current.initial
 
   if (!rect) {
@@ -316,6 +349,28 @@ function sidebarSectionElementFromPoint(clientX: number, clientY: number, moving
   return null
 }
 
+function activeSessionPreviewElementFromPoint(clientX: number, clientY: number, movingSessionId: string) {
+  const elements = document.elementsFromPoint(clientX, clientY)
+
+  for (const element of elements) {
+    if (!(element instanceof HTMLElement)) {
+      continue
+    }
+
+    const row = element.closest('[data-session-id]') as HTMLElement | null
+
+    if (row?.dataset.sessionId === movingSessionId) {
+      return row
+    }
+  }
+
+  return null
+}
+
+function activeSessionPreviewRectFromPoint(clientX: number, clientY: number, movingSessionId: string) {
+  return activeSessionPreviewElementFromPoint(clientX, clientY, movingSessionId)?.getBoundingClientRect() ?? null
+}
+
 function useSortableSessionRowBindings(
   session: SessionInfo,
   { archived, pinned, sectionKey }: { archived: boolean; pinned: boolean; sectionKey?: string }
@@ -331,7 +386,8 @@ function useSortableSessionRowBindings(
       sessionId: session.id,
       sourceSectionKey: sectionKey
     },
-    id: sidebarSessionDndId(session.id)
+    id: sidebarSessionDndId(session.id),
+    transition: sidebarSessionDndTransition
   })
 
   return {
@@ -453,6 +509,7 @@ export function ChatSidebar({
   const [sessionDndTarget, setSessionDndTarget] = useState<null | SidebarSessionDndTarget>(null)
   const [sessionDragOverlayWidth, setSessionDragOverlayWidth] = useState<null | number>(null)
   const sessionDndTargetRef = useRef<null | SidebarSessionDndTarget>(null)
+  const sessionDndPointerRef = useRef<ClientPoint | null>(null)
   const searchInputRef = useRef<HTMLInputElement>(null)
   const trimmedQuery = searchQuery.trim()
 
@@ -565,6 +622,7 @@ export function ChatSidebar({
     setDraggingSessionSourceSection(null)
     setSessionDragOverlayWidth(null)
     sessionDndTargetRef.current = null
+    sessionDndPointerRef.current = null
     setSessionDndTarget(null)
   }, [])
 
@@ -575,6 +633,36 @@ export function ChatSidebar({
   }, [])
 
   const handleSessionDragEnd = useCallback(() => clearSessionDrag(), [clearSessionDrag])
+
+  useEffect(() => {
+    if (draggingSessionMode !== 'pointer') {
+      return
+    }
+
+    const rememberPointer = (event: MouseEvent | PointerEvent | TouchEvent) => {
+      const point = eventClientPoint(event)
+
+      if (point) {
+        sessionDndPointerRef.current = point
+      }
+    }
+
+    window.addEventListener('pointermove', rememberPointer, true)
+    window.addEventListener('pointerup', rememberPointer, true)
+    window.addEventListener('mousemove', rememberPointer, true)
+    window.addEventListener('mouseup', rememberPointer, true)
+    window.addEventListener('touchmove', rememberPointer, true)
+    window.addEventListener('touchend', rememberPointer, true)
+
+    return () => {
+      window.removeEventListener('pointermove', rememberPointer, true)
+      window.removeEventListener('pointerup', rememberPointer, true)
+      window.removeEventListener('mousemove', rememberPointer, true)
+      window.removeEventListener('mouseup', rememberPointer, true)
+      window.removeEventListener('touchmove', rememberPointer, true)
+      window.removeEventListener('touchend', rememberPointer, true)
+    }
+  }, [draggingSessionMode])
 
   // Whole session rows are native-draggable (the same drag that drops a
   // session into the composer), so Pinned/Sessions accept that drag directly:
@@ -979,6 +1067,70 @@ export function ChatSidebar({
     [resolveSessionDropDecision]
   )
 
+  const targetFromSortableOver = useCallback(
+    (
+      payload: SessionDragPayload,
+      event: DragMoveEvent | DragEndEvent,
+      point: null | { clientX: number; clientY: number }
+    ): null | SidebarSessionDndTarget => {
+      const sortableCandidates = [
+        event.over ? { data: event.over.data.current, rect: event.over.rect } : null,
+        ...(event.collisions ?? []).map(collision => ({
+          data: collision.data?.droppableContainer?.data.current,
+          rect: collision.data?.droppableContainer?.rect.current ?? null
+        }))
+      ]
+
+      const activePreviewRect =
+        event.over?.data.current?.sessionId === payload.id
+          ? event.over.rect
+          : point
+            ? activeSessionPreviewRectFromPoint(point.clientX, point.clientY, payload.id)
+            : null
+
+      let activePreviewBefore: boolean | null = null
+
+      if (
+        point &&
+        activePreviewRect &&
+        point.clientY >= activePreviewRect.top &&
+        point.clientY <= activePreviewRect.bottom
+      ) {
+        activePreviewBefore = point.clientY < activePreviewRect.top + activePreviewRect.height / 2
+      }
+
+      for (const candidate of sortableCandidates) {
+        const overSessionId = candidate?.data?.sessionId
+        const sectionKey = candidate?.data?.sourceSectionKey
+
+        if (typeof overSessionId !== 'string' || typeof sectionKey !== 'string' || overSessionId === payload.id) {
+          continue
+        }
+
+        const overRect = candidate?.rect
+        let before = activePreviewBefore ?? event.delta.y < 0
+
+        if (point && overRect && point.clientY >= overRect.top && point.clientY <= overRect.bottom) {
+          before = point.clientY < overRect.top + overRect.height / 2
+        }
+
+        const anchor = {
+          before,
+          sessionId: overSessionId
+        }
+
+        const decision = resolveSessionDropDecision(payload, sectionKey, anchor)
+
+        if (decision.type !== 'none') {
+          return { anchor, sectionKey }
+        }
+      }
+
+      return null
+    },
+    [resolveSessionDropDecision]
+  )
+
   const setCurrentSessionDndTarget = useCallback((target: null | SidebarSessionDndTarget) => {
     sessionDndTargetRef.current = target
     setSessionDndTarget(target)
@@ -987,14 +1139,20 @@ export function ChatSidebar({
   const updateSessionDndTarget = useCallback(
     (event: DragMoveEvent | DragEndEvent) => {
       const payload = activeSessionDragPayload(event)
-      const point = dndEventClientPoint(event)
-      const target = payload && point ? targetFromSessionDndPoint(payload, point.clientX, point.clientY) : null
+      const point = sessionDndPointerRef.current ?? dndEventClientPoint(event)
+      const sortableTarget = payload ? targetFromSortableOver(payload, event, point) : null
+      const sectionTarget = payload && point ? targetFromSessionDndPoint(payload, point.clientX, point.clientY) : null
+
+      const sourceSectionKey = payload?.archived ? 'archived' : payload?.pinned ? 'pinned' : 'sessions'
+
+      const target =
+        sectionTarget && sectionTarget.sectionKey !== sourceSectionKey ? sectionTarget : (sortableTarget ?? sectionTarget)
 
       setCurrentSessionDndTarget(target)
 
       return { payload, target }
     },
-    [setCurrentSessionDndTarget, targetFromSessionDndPoint]
+    [setCurrentSessionDndTarget, targetFromSessionDndPoint, targetFromSortableOver]
   )
 
   const handleSidebarSessionDndStart = useCallback((event: DragStartEvent) => {
@@ -1008,6 +1166,7 @@ export function ChatSidebar({
     setDraggingSessionMode('pointer')
     setDraggingSessionSourceSection((event.active.data.current?.sourceSectionKey as string | undefined) ?? null)
     setSessionDragOverlayWidth(event.active.rect.current.initial?.width ?? null)
+    sessionDndPointerRef.current = eventClientPoint(event.activatorEvent)
     setCurrentSessionDndTarget(null)
   }, [setCurrentSessionDndTarget])
 
@@ -1020,7 +1179,8 @@ export function ChatSidebar({
 
   const handleSidebarSessionDndEnd = useCallback(
     (event: DragEndEvent) => {
-      const { payload, target } = updateSessionDndTarget(event)
+      const payload = activeSessionDragPayload(event)
+      const target = sessionDndTargetRef.current ?? updateSessionDndTarget(event).target
 
       if (payload && target) {
         commitSessionDropDecision(payload, target.sectionKey, target.anchor)
@@ -1205,7 +1365,7 @@ export function ChatSidebar({
         <SidebarContent className="gap-0 overflow-hidden bg-transparent px-2.5">
           <DndContext
             autoScroll={sidebarSessionDndAutoScroll}
-            collisionDetection={closestCenter}
+            collisionDetection={sidebarSessionCollisionDetection}
             onDragCancel={clearSessionDrag}
             onDragEnd={handleSidebarSessionDndEnd}
             onDragMove={handleSidebarSessionDndMove}

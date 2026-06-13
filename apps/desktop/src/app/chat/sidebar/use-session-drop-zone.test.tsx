@@ -404,6 +404,15 @@ describe('sessionDropAnchor', () => {
     expect(sessionDropAnchor(dropEventAt(rowB, 150, root), { previous })).toEqual({ before: false, sessionId: 'b' })
   })
 
+  it('lets an adjacent move switch sides after the same target row midpoint', () => {
+    const root = document.createElement('div')
+    const previous = { before: true, sessionId: 'b' }
+    document.body.appendChild(root)
+    const rowB = rowWithRect('b', 127, 26, root)
+
+    expect(sessionDropAnchor(dropEventAt(rowB, 141, root), { previous })).toEqual({ before: false, sessionId: 'b' })
+  })
+
   it('ignores the dragged row as a hover target so animated previews do not snap back', () => {
     const root = document.createElement('div')
     const previous = { before: false, sessionId: 'a' }
