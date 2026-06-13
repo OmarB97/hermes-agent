@@ -1,8 +1,10 @@
+import { useSortable } from '@dnd-kit/sortable'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { type FC, useRef } from 'react'
+import { type FC, useCallback, useMemo, useRef } from 'react'
 
 import type { SessionDragPayload } from '@/app/chat/composer/inline-refs'
 import type { SessionInfo } from '@/hermes'
+import { sessionTitle } from '@/lib/chat-runtime'
 import { cn } from '@/lib/utils'
 import { sessionPinId } from '@/store/session'
 import type { SessionPresenceRecord } from '@/types/hermes'
@@ -38,6 +40,7 @@ interface SessionRowCommonProps {
 interface VirtualSessionListProps {
   activeSessionId: null | string
   className?: string
+  dropActive?: boolean
   onArchiveSession: (sessionId: string) => void
   onDeleteSession: (sessionId: string) => void
   onResumeSession: (sessionId: string) => void
@@ -59,6 +62,9 @@ interface VirtualSessionListProps {
   selectionActive?: boolean
   selectedSessionIds?: readonly string[]
   selectedIds?: ReadonlySet<string>
+  sectionKey?: string
+  sessionDragEnabled?: boolean
+  sourceSectionKey?: null | string
   onToggleSelect?: (sessionId: string, mode: 'range' | 'single') => void
   onArchiveSessions?: (sessionIds: string[]) => Promise<unknown> | void
   onDeleteSessions?: (sessionIds: string[]) => Promise<unknown> | void
@@ -70,10 +76,25 @@ interface VirtualSessionListProps {
 
 const ROW_ESTIMATE_PX = 28
 const OVERSCAN_ROWS = 12
+const SIDEBAR_SESSION_DND_ID_PREFIX = 'session:'
+
+const sidebarSessionDndId = (id: string) => `${SIDEBAR_SESSION_DND_ID_PREFIX}${id}`
+
+function sessionDragPayloadFor(session: SessionInfo, options: { archived: boolean; pinned: boolean }): SessionDragPayload {
+  return {
+    archived: options.archived,
+    id: session.id,
+    pinId: sessionPinId(session),
+    pinned: options.pinned,
+    profile: session.profile || 'default',
+    title: sessionTitle(session)
+  }
+}
 
 export const VirtualSessionList: FC<VirtualSessionListProps> = ({
   activeSessionId,
   className,
+  dropActive = false,
   onArchiveSession,
   onDeleteSession,
   onResumeSession,
@@ -92,6 +113,9 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
   selectionActive = false,
   selectedSessionIds,
   selectedIds,
+  sectionKey,
+  sessionDragEnabled = false,
+  sourceSectionKey,
   onToggleSelect,
   onArchiveSessions,
   onDeleteSessions,
@@ -155,14 +179,30 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
 
     const presence = presenceBySession?.get(session.id)
 
-    return (
+    const crossSectionPreview =
+      sessionDragEnabled && dropActive && draggingSessionId === session.id && sourceSectionKey !== sectionKey
+
+    return sessionDragEnabled && !crossSectionPreview ? (
+      <VirtualSortableSessionRow
+        archived={archived}
+        commonProps={commonProps}
+        index={virtualItem.index}
+        key={session.id}
+        measureRef={virtualizer.measureElement}
+        pinned={pinned}
+        presence={presence}
+        sectionKey={sectionKey}
+        session={session}
+      />
+    ) : (
       <SidebarSessionRow
         {...commonProps}
         data-index={virtualItem.index}
         key={session.id}
+        nativeDraggable={!crossSectionPreview}
         presence={presence}
         ref={virtualizer.measureElement}
-        reorderable={reorderable}
+        reorderable={reorderable || crossSectionPreview}
         session={session}
       />
     )
@@ -177,4 +217,69 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
   )
 
   return list
+}
+
+interface VirtualSortableSessionRowProps {
+  archived: boolean
+  commonProps: SessionRowCommonProps
+  index: number
+  measureRef: (node: Element | null) => void
+  pinned: boolean
+  presence?: SessionPresenceRecord
+  sectionKey?: string
+  session: SessionInfo
+}
+
+function VirtualSortableSessionRow({
+  archived,
+  commonProps,
+  index,
+  measureRef,
+  pinned,
+  presence,
+  sectionKey,
+  session
+}: VirtualSortableSessionRowProps) {
+  const payload = useMemo(
+    () => sessionDragPayloadFor(session, { archived, pinned }),
+    [archived, pinned, session]
+  )
+
+  const { attributes, isDragging, listeners, setNodeRef, transform, transition } = useSortable({
+    data: {
+      sessionDragPayload: payload,
+      sessionId: session.id,
+      sourceSectionKey: sectionKey
+    },
+    id: sidebarSessionDndId(session.id)
+  })
+
+  const refMerged = useCallback(
+    (node: HTMLDivElement | null) => {
+      setNodeRef(node)
+      measureRef(node)
+    },
+    [measureRef, setNodeRef]
+  )
+
+  return (
+    <SidebarSessionRow
+      {...commonProps}
+      {...attributes}
+      {...listeners}
+      data-index={index}
+      dragging={isDragging}
+      key={session.id}
+      nativeDraggable={false}
+      presence={presence}
+      ref={refMerged}
+      reorderable
+      session={session}
+      style={{
+        transform: transform ? `translate3d(0px, ${transform.y}px, 0)` : undefined,
+        transition: isDragging ? undefined : transition,
+        willChange: isDragging ? 'transform' : undefined
+      }}
+    />
+  )
 }

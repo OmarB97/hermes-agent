@@ -28,6 +28,7 @@ export interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
   onResume: () => void
   reorderable?: boolean
   dragging?: boolean
+  nativeDraggable?: boolean
   onSessionDragEnd?: () => void
   onSessionDragStart?: (payload: SessionDragPayload) => void
   /** Presence record for this session (from another device) — indicates live/active state. */
@@ -85,6 +86,7 @@ export function SidebarSessionRow({
   presence,
   reorderable = false,
   dragging = false,
+  nativeDraggable = !reorderable,
   onSessionDragEnd,
   onSessionDragStart,
   archived = false,
@@ -176,7 +178,12 @@ export function SidebarSessionRow({
       title={title}
     >
       <div
+        className="[-webkit-app-region:no-drag]"
+        data-session-drag-source={nativeDraggable ? true : undefined}
         data-session-id={session.id}
+        draggable={nativeDraggable}
+        onDragEnd={nativeDraggable ? () => onSessionDragEnd?.() : undefined}
+        onDragStart={nativeDraggable ? handleSessionDragStart : undefined}
         ref={ref}
         style={style}
         {...rest}
@@ -193,14 +200,10 @@ export function SidebarSessionRow({
           )}
           data-actions-visible={actionsVisible ? 'true' : undefined}
           data-selected={checked ? 'true' : undefined}
-          data-session-drag-source
           data-session-row-chrome
           data-working={isWorking ? 'true' : undefined}
-          draggable
           layout="position"
           onDoubleClick={selectionActive ? () => onResume() : undefined}
-          onDragEndCapture={() => onSessionDragEnd?.()}
-          onDragStartCapture={handleSessionDragStart}
           transition={{ layout: { duration: 0.16, ease: [0.2, 0, 0, 1] } }}
         >
           {isWorking && !needsInput && <span aria-hidden="true" className="arc-border" />}
@@ -363,6 +366,7 @@ export function SidebarSessionRow({
                   data-session-row-actions
                   onBlur={() => setActionsKeyboardFocus(false)}
                   onFocus={event => setActionsKeyboardFocus(event.currentTarget.matches(':focus-visible'))}
+                  onPointerDown={event => event.stopPropagation()}
                   size="icon"
                   title={r.sessionActions}
                   variant="ghost"

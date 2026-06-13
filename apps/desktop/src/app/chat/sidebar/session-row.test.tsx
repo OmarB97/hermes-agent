@@ -311,15 +311,14 @@ describe('SidebarSessionRow gestures', () => {
     expect(title.className).toContain('font-normal')
   })
 
-  it('starts a session drag from the row body without rendering a separate reorder handle', () => {
+  it('keeps native session drag available on non-reorderable rows', () => {
     const onSessionDragEnd = vi.fn()
     const onSessionDragStart = vi.fn()
 
     const { container, rowButton } = renderRow({
       isPinned: true,
       onSessionDragEnd,
-      onSessionDragStart,
-      reorderable: true
+      onSessionDragStart
     })
 
     const transfer = fakeTransfer()
@@ -329,13 +328,15 @@ describe('SidebarSessionRow gestures', () => {
 
     expect(container.querySelector('[data-reorder-handle]')).toBeNull()
     expect(container.querySelector('[data-drop-indicator]')).toBeNull()
-    expect(dragAnchor.draggable).toBe(false)
-    expect(dragSource.dataset.sessionDragSource).toBe('true')
-    expect(dragSource.draggable).toBe(true)
+    expect(dragAnchor.dataset.sessionDragSource).toBe('true')
+    expect(dragAnchor.draggable).toBe(true)
+    expect(dragAnchor.className).toContain('[-webkit-app-region:no-drag]')
+    expect(dragSource.dataset.sessionDragSource).toBeUndefined()
+    expect(dragSource.draggable).toBe(false)
     expect(dragSource.className).toContain('[-webkit-app-region:no-drag]')
     expect(rowButton.draggable).toBe(false)
 
-    fireEvent.dragStart(dragSource, { dataTransfer: transfer })
+    fireEvent.dragStart(dragAnchor, { dataTransfer: transfer })
 
     expect(readSessionDrag(transfer)).toMatchObject({
       archived: false,
@@ -353,7 +354,7 @@ describe('SidebarSessionRow gestures', () => {
     )
     expect(onSessionDragStart).toHaveBeenCalledTimes(1)
 
-    fireEvent.dragEnd(dragSource)
+    fireEvent.dragEnd(dragAnchor)
     expect(onSessionDragEnd).toHaveBeenCalledTimes(1)
 
     const timestampTransfer = fakeTransfer()
@@ -367,9 +368,40 @@ describe('SidebarSessionRow gestures', () => {
     expect(onSessionDragStart).toHaveBeenCalledTimes(2)
   })
 
+  it('lets pointer-dnd own reorderable rows instead of native HTML5 drag', () => {
+    const onSessionDragEnd = vi.fn()
+    const onSessionDragStart = vi.fn()
+
+    const { container, rowButton } = renderRow({
+      isPinned: true,
+      onSessionDragEnd,
+      onSessionDragStart,
+      reorderable: true
+    })
+
+    const dragAnchor = container.querySelector('[data-session-id]') as HTMLElement
+    const dragSource = container.querySelector('[data-session-row-chrome]') as HTMLElement
+    const transfer = fakeTransfer()
+
+    expect(container.querySelector('[data-reorder-handle]')).toBeNull()
+    expect(dragAnchor.dataset.sessionDragSource).toBeUndefined()
+    expect(dragAnchor.draggable).toBe(false)
+    expect(dragAnchor.className).toContain('[-webkit-app-region:no-drag]')
+    expect(dragSource.dataset.sessionDragSource).toBeUndefined()
+    expect(dragSource.draggable).toBe(false)
+    expect(rowButton.draggable).toBe(false)
+
+    fireEvent.dragStart(dragAnchor, { dataTransfer: transfer })
+    fireEvent.dragEnd(dragAnchor)
+
+    expect(readSessionDrag(transfer)).toBeNull()
+    expect(onSessionDragStart).not.toHaveBeenCalled()
+    expect(onSessionDragEnd).not.toHaveBeenCalled()
+  })
+
   it('does not turn the row actions menu into a session drag source', () => {
     const onSessionDragStart = vi.fn()
-    const { container } = renderRow({ onSessionDragStart, reorderable: true })
+    const { container } = renderRow({ onSessionDragStart })
     const actionsButton = container.querySelector('[data-session-row-actions]') as HTMLButtonElement
     const transfer = fakeTransfer()
     const event = createEvent.dragStart(actionsButton, { dataTransfer: transfer })
