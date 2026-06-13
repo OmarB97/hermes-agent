@@ -192,6 +192,7 @@ export function SidebarSessionRow({
           {isWorking && !needsInput && <span aria-hidden="true" className="arc-border" />}
           <button
             className="z-0 flex min-w-0 items-center gap-1.5 bg-transparent py-0.5 pl-2 pr-2 text-left"
+            draggable
             onClick={event => {
               const canSelect = Boolean(selectable && onToggleSelect)
 

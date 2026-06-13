@@ -294,6 +294,7 @@ describe('SidebarSessionRow gestures', () => {
 
     expect(container.querySelector('[data-reorder-handle]')).toBeNull()
     expect(container.querySelector('[data-drop-indicator]')).toBeNull()
+    expect(rowButton.draggable).toBe(true)
 
     fireEvent.dragStart(rowButton, { dataTransfer: transfer })
 
