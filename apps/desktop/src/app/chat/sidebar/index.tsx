@@ -1815,7 +1815,7 @@ export function ChatSidebar({
               >
                 <SidebarSessionRow
                   archived={Boolean(draggingSession?.archived)}
-                  className="bg-(--ui-sidebar-surface-background) shadow-lg ring-1 ring-(--ui-stroke-tertiary)"
+                  className="bg-(--ui-sidebar-surface-background) shadow-none ring-0"
                   dragging
                   isPinned={Boolean(draggingSession?.pinned)}
                   isSelected={false}
@@ -2237,12 +2237,7 @@ function SidebarSessionsSection({
 
   return (
     <SidebarGroup
-      className={cn(
-        rootClassName,
-        // Light the whole section (header included — drops there count too, even
-        // collapsed) while an acceptable row drag hovers it.
-        dropActive && 'rounded-lg bg-(--ui-control-hover-background)'
-      )}
+      className={rootClassName}
       data-sidebar-session-section={sectionKey}
       {...dropHandlers}
     >
