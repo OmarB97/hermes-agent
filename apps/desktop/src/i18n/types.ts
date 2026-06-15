@@ -877,6 +877,23 @@ export interface Translations {
     results: string
     pinned: string
     sessions: string
+    attention: {
+      title: string
+      kindApproval: string
+      kindClarify: string
+      kindSecret: string
+      kindSudo: string
+      target: (label: string) => string
+      targetAnyMember: string
+      targetOriginator: string
+      targetOwnerAdmin: string
+      targetPrincipal: string
+      targetRole: string
+      targetUnknown: string
+      from: (actor: string) => string
+      fromVia: (actor: string, via: string) => string
+      via: (via: string) => string
+    }
     cronJobs: string
     groupAriaGrouped: string
     groupAriaUngrouped: string

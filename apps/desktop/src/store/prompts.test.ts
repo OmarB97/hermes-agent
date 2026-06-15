@@ -8,6 +8,7 @@ import {
   clearApprovalRequest,
   clearSecretRequest,
   clearSudoRequest,
+  normalizePromptContext,
   setApprovalRequest,
   setSecretRequest,
   setSudoRequest
@@ -58,6 +59,34 @@ describe('approval prompt store', () => {
     setApprovalRequest({ allowPermanent: false, command: 'curl x | bash', description: 'content-security', sessionId: 's1' })
 
     expect($approvalRequest.get()?.allowPermanent).toBe(false)
+  })
+
+  it('carries multi-entity context for shared channel workflows', () => {
+    const context = normalizePromptContext(
+      {
+        mesh_id: 'mesh-ko',
+        org_id: 'org-studios',
+        requested_by: { display_name: 'Khristine', platform: 'external-channel', principal_id: 'principal-k' },
+        requested_via: 'external-channel',
+        target_audience: { kind: 'owner_admin' }
+      },
+      { targetAudience: { kind: 'owner_admin' } }
+    )
+
+    setApprovalRequest({
+      command: 'delete channel',
+      context,
+      description: 'dangerous command',
+      sessionId: 's1'
+    })
+
+    expect($approvalRequest.get()?.context).toMatchObject({
+      meshId: 'mesh-ko',
+      orgId: 'org-studios',
+      requestedBy: { displayName: 'Khristine', platform: 'external-channel', principalId: 'principal-k' },
+      requestedVia: 'external-channel',
+      targetAudience: { kind: 'owner_admin' }
+    })
   })
 })
 
@@ -123,5 +152,27 @@ describe('clearAllPrompts', () => {
 
     $activeSessionId.set('s2')
     expect($approvalRequest.get()?.command).toBe('y')
+  })
+})
+
+describe('normalizePromptContext', () => {
+  it('normalizes platform, principal, and audience aliases', () => {
+    expect(
+      normalizePromptContext({
+        actor: { name: 'Omar', device_id: 'mac', user_id: '42' },
+        audience: 'owner_or_admin',
+        via: 'external-channel'
+      })
+    ).toMatchObject({
+      requestedBy: { displayName: 'Omar', deviceId: 'mac', platformUserId: '42' },
+      requestedVia: 'external-channel',
+      targetAudience: { kind: 'owner_admin' }
+    })
+  })
+
+  it('falls back to a caller-provided audience when the payload is sparse', () => {
+    expect(normalizePromptContext({}, { targetAudience: { kind: 'originator' } })).toEqual({
+      targetAudience: { kind: 'originator' }
+    })
   })
 })

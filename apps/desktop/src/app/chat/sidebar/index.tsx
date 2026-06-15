@@ -37,7 +37,9 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Tip } from '@/components/ui/tooltip'
 import { searchSessions, type SessionInfo, type SessionSearchResult } from '@/hermes'
 import { useWorktreeInfo } from '@/hooks/use-worktree-info'
-import { useI18n } from '@/i18n'
+import { type Translations, useI18n } from '@/i18n'
+import { sessionTitle } from '@/lib/chat-runtime'
+import { triggerHaptic } from '@/lib/haptics'
 import { comboTokens } from '@/lib/keybinds/combo'
 import { profileColor } from '@/lib/profile-color'
 import { sessionMatchesSearch } from '@/lib/session-search'
@@ -81,6 +83,8 @@ import {
   newSessionInProfile,
   normalizeProfileKey
 } from '@/store/profile'
+import { $pendingPromptAttention, type PendingPromptAttention } from '@/store/prompt-attention'
+import type { PromptEntityRef } from '@/store/prompts'
 import {
   $cronSessions,
   $messagingPlatformTotals,
@@ -252,6 +256,23 @@ function sameIds(left: string[], right: string[]) {
   return left.length === right.length && left.every((item, index) => item === right[index])
 }
 
+function entityLabel(entity: PromptEntityRef | undefined): string {
+  if (!entity) {
+    return ''
+  }
+
+  return (
+    entity.displayName ||
+    entity.alias ||
+    entity.principalId ||
+    entity.platformUserId ||
+    entity.deviceId ||
+    entity.platform ||
+    entity.endpoint ||
+    ''
+  )
+}
+
 // FTS results cover sessions that aren't in the loaded page; synthesize a
 // minimal SessionInfo so they render in the same row component (resume works
 // by id; the snippet stands in for the preview).
@@ -347,6 +368,7 @@ export function ChatSidebar({
   const sessionsTotal = useStore($sessionsTotal)
   const sessionProfileTotals = useStore($sessionProfileTotals)
   const workingSessionIds = useStore($workingSessionIds)
+  const pendingPrompts = useStore($pendingPromptAttention)
   const profiles = useStore($profiles)
   const profileScope = useStore($profileScope)
   // Only surface the profile switcher when more than one profile exists, so
@@ -430,10 +452,10 @@ export function ChatSidebar({
   const sessionByAnyId = useMemo(() => {
     const map = new Map<string, SessionInfo>()
 
-    // Cron sessions are listed separately but can still be pinned, so index
-    // them too — otherwise a pinned cron job can't resolve into the Pinned
-    // section. Recents take precedence on id collisions (set last).
-    for (const s of [...cronSessions, ...visibleSessions]) {
+    // Cron and messaging sessions are listed separately but can still need
+    // attention, so index them too. Recents take precedence on id collisions
+    // (set last).
+    for (const s of [...cronSessions, ...messagingSessions, ...visibleSessions]) {
       map.set(s.id, s)
 
       if (s._lineage_root_id && !map.has(s._lineage_root_id)) {
@@ -442,7 +464,7 @@ export function ChatSidebar({
     }
 
     return map
-  }, [visibleSessions, cronSessions])
+  }, [visibleSessions, cronSessions, messagingSessions])
 
   const pinnedSessions = useMemo(() => {
     const seen = new Set<string>()
@@ -461,6 +483,18 @@ export function ChatSidebar({
   }, [pinnedSessionIds, sessionByAnyId])
 
   const pinnedRealIdSet = useMemo(() => new Set(pinnedSessions.map(s => s.id)), [pinnedSessions])
+
+  const pendingPromptRows = useMemo(
+    () =>
+      pendingPrompts
+        .map(prompt => ({
+          prompt,
+          session: prompt.sessionId ? sessionByAnyId.get(prompt.sessionId) : undefined
+        }))
+        .filter((row): row is { prompt: PendingPromptAttention; session: SessionInfo } => Boolean(row.session))
+        .sort((a, b) => sessionTime(b.session) - sessionTime(a.session)),
+    [pendingPrompts, sessionByAnyId]
+  )
 
   // Full-text search across *all* sessions (not just the loaded page) so 699
   // sessions stay findable. Debounced; loaded sessions are matched instantly
@@ -762,7 +796,12 @@ export function ChatSidebar({
 
   const showSessionSkeletons = sessionsLoading && sortedSessions.length === 0
 
-  const showSessionSections = showSessionSkeletons || sortedSessions.length > 0
+  const showSessionSections =
+    showSessionSkeletons ||
+    sortedSessions.length > 0 ||
+    pendingPromptRows.length > 0 ||
+    messagingSessions.length > 0 ||
+    cronJobs.length > 0
 
   // Each reorderable list reports its OWN new id order; persisting is a direct,
   // typed write — no id-prefix sniffing to figure out which level moved.
@@ -908,6 +947,14 @@ export function ChatSidebar({
                 rootClassName="min-h-32 flex-1 overflow-hidden p-0"
                 sessions={searchResults}
                 workingSessionIdSet={workingSessionIdSet}
+              />
+            )}
+
+            {!trimmedQuery && (
+              <SidebarPromptAttentionSection
+                activeSessionId={activeSidebarSessionId}
+                onResumeSession={onResumeSession}
+                prompts={pendingPromptRows}
               />
             )}
 
@@ -1085,6 +1132,132 @@ export function ChatSidebar({
         )}
       </SidebarContent>
     </Sidebar>
+  )
+}
+
+function promptKindLabel(kind: PendingPromptAttention['kind'], copy: Translations['sidebar']['attention']): string {
+  switch (kind) {
+    case 'approval':
+      return copy.kindApproval
+
+    case 'clarify':
+      return copy.kindClarify
+
+    case 'secret':
+      return copy.kindSecret
+
+    case 'sudo':
+      return copy.kindSudo
+  }
+}
+
+function promptAudienceLabel(prompt: PendingPromptAttention, copy: Translations['sidebar']['attention']): string {
+  const audience = prompt.context?.targetAudience
+
+  if (!audience) {
+    return copy.targetUnknown
+  }
+
+  if (audience.label) {
+    return audience.label
+  }
+
+  switch (audience.kind) {
+    case 'any_member':
+      return copy.targetAnyMember
+
+    case 'originator':
+      return copy.targetOriginator
+
+    case 'owner_admin':
+      return copy.targetOwnerAdmin
+
+    case 'principal':
+      return audience.principalIds?.join(', ') || copy.targetPrincipal
+
+    case 'role':
+      return audience.roleIds?.join(', ') || copy.targetRole
+
+    case 'unknown':
+      return copy.targetUnknown
+  }
+}
+
+function promptSourceLabel(prompt: PendingPromptAttention, copy: Translations['sidebar']['attention']): string {
+  const actor = entityLabel(prompt.context?.requestedBy)
+  const via = prompt.context?.requestedVia
+  const source = actor && via ? copy.fromVia(actor, via) : actor ? copy.from(actor) : via ? copy.via(via) : ''
+  const scope = [prompt.context?.orgId, prompt.context?.meshId].filter(Boolean).join(' / ')
+
+  return [source, scope].filter(Boolean).join(' · ')
+}
+
+function SidebarPromptAttentionSection({
+  activeSessionId,
+  onResumeSession,
+  prompts
+}: {
+  activeSessionId: null | string
+  onResumeSession: (sessionId: string) => void
+  prompts: { prompt: PendingPromptAttention; session: SessionInfo }[]
+}) {
+  const { t } = useI18n()
+  const copy = t.sidebar.attention
+
+  if (prompts.length === 0) {
+    return null
+  }
+
+  return (
+    <SidebarGroup className="shrink-0 p-0 pb-1">
+      <SidebarSectionHeader label={copy.title} meta={String(prompts.length)} onToggle={() => undefined} open />
+      <div className={cn('flex max-h-40 flex-col gap-px rounded-lg pb-2 pt-1', GROUP_BODY)}>
+        {prompts.map(({ prompt, session }) => {
+          const selected = session.id === activeSessionId
+          const source = promptSourceLabel(prompt, copy)
+
+          return (
+            <button
+              className={cn(
+                'group grid min-h-[2.375rem] w-full grid-cols-[auto_minmax(0,1fr)] items-start gap-1.5 rounded-md bg-transparent py-1 pl-2 pr-2 text-left transition-colors duration-100 ease-out hover:bg-(--ui-row-hover-background) hover:text-foreground hover:transition-none',
+                selected && 'bg-(--ui-row-active-background)'
+              )}
+              key={prompt.id}
+              onClick={() => {
+                triggerHaptic('selection')
+                onResumeSession(session.id)
+              }}
+              type="button"
+            >
+              <span
+                aria-hidden
+                className="mt-1 grid size-4 shrink-0 place-items-center rounded-[4px] bg-amber-500/10 text-amber-500"
+              >
+                <Codicon name="bell" size="0.75rem" />
+              </span>
+              <span className="grid min-w-0 gap-0.5">
+                <span className="flex min-w-0 items-center gap-1.5">
+                  <span className="min-w-0 truncate text-[0.75rem] font-medium text-foreground/90">
+                    {sessionTitle(session)}
+                  </span>
+                  <span className="shrink-0 rounded-[3px] bg-amber-500/10 px-1 py-0.5 text-[0.5625rem] font-medium leading-none text-amber-500">
+                    {promptKindLabel(prompt.kind, copy)}
+                  </span>
+                </span>
+                <span className="truncate text-[0.6875rem] leading-tight text-(--ui-text-tertiary)">
+                  {copy.target(promptAudienceLabel(prompt, copy))}
+                </span>
+                {source ? (
+                  <span className="truncate text-[0.625rem] leading-tight text-(--ui-text-quaternary)">
+                    {source}
+                  </span>
+                ) : null}
+              </span>
+            </button>
+          )
+        })}
+      </div>
+    </SidebarGroup>
   )
 }
 

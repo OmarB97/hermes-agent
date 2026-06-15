@@ -1,7 +1,24 @@
-import { defineConfig } from 'vite'
+import fs from 'fs'
+import path from 'path'
+
+import { defineConfig, searchForWorkspaceRoot } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
-import path from 'path'
+
+const repoRoot = path.resolve(__dirname, '../..')
+const rootNodeModules = path.resolve(repoRoot, 'node_modules')
+const rootNodeModulesRealPath = fs.existsSync(rootNodeModules)
+  ? fs.realpathSync(rootNodeModules)
+  : rootNodeModules
+const serverFsAllow = Array.from(
+  new Set([
+    searchForWorkspaceRoot(process.cwd()),
+    repoRoot,
+    __dirname,
+    rootNodeModules,
+    rootNodeModulesRealPath
+  ])
+)
 
 export default defineConfig({
   base: './',
@@ -45,6 +62,9 @@ export default defineConfig({
     dedupe: ['react', 'react-dom']
   },
   server: {
+    fs: {
+      allow: serverFsAllow
+    },
     host: '127.0.0.1',
     port: 5174,
     strictPort: true

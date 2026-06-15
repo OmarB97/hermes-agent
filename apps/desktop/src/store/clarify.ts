@@ -1,8 +1,10 @@
 import { atom, computed } from 'nanostores'
 
+import type { PromptRequestContext } from './prompts'
 import { $activeSessionId } from './session'
 
 export interface ClarifyRequest {
+  context?: PromptRequestContext
   requestId: string
   question: string
   choices: string[] | null

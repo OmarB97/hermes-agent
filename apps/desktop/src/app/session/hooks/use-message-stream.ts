@@ -33,7 +33,13 @@ import { $gateway } from '@/store/gateway'
 import { dispatchNativeNotification } from '@/store/native-notifications'
 import { notify } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
-import { clearAllPrompts, setApprovalRequest, setSecretRequest, setSudoRequest } from '@/store/prompts'
+import {
+  clearAllPrompts,
+  normalizePromptContext,
+  setApprovalRequest,
+  setSecretRequest,
+  setSudoRequest
+} from '@/store/prompts'
 import {
   setCurrentBranch,
   setCurrentCwd,
@@ -955,6 +961,7 @@ export function useMessageStream({
             requestId,
             question,
             choices: Array.isArray(payload?.choices) ? payload!.choices!.filter(c => typeof c === 'string') : null,
+            context: normalizePromptContext(payload, { targetAudience: { kind: 'originator' } }),
             sessionId: sessionId ?? null
           })
 
@@ -988,6 +995,7 @@ export function useMessageStream({
           // false only when a tirith warning forbids it; backend omits the field otherwise.
           allowPermanent: payload?.allow_permanent !== false,
           command,
+          context: normalizePromptContext(payload, { targetAudience: { kind: 'owner_admin' } }),
           description,
           sessionId: sessionId ?? null
         })
@@ -1012,7 +1020,11 @@ export function useMessageStream({
         const requestId = typeof payload?.request_id === 'string' ? payload.request_id : ''
 
         if (requestId) {
-          setSudoRequest({ requestId, sessionId: sessionId ?? null })
+          setSudoRequest({
+            requestId,
+            context: normalizePromptContext(payload, { targetAudience: { kind: 'owner_admin' } }),
+            sessionId: sessionId ?? null
+          })
 
           if (sessionId) {
             updateSessionState(sessionId, state => ({ ...state, needsInput: true }))
@@ -1036,6 +1048,7 @@ export function useMessageStream({
 
           setSecretRequest({
             requestId,
+            context: normalizePromptContext(payload, { targetAudience: { kind: 'owner_admin' } }),
             envVar,
             prompt: promptText,
             sessionId: sessionId ?? null
