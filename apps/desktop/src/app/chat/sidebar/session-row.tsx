@@ -194,7 +194,7 @@ export function SidebarSessionRow({
             reorderable && 'active:cursor-grabbing',
             (isSelected || checked) && 'bg-(--ui-row-active-background)',
             isWorking && 'text-foreground',
-            dragging && 'z-10 cursor-grabbing opacity-60 shadow-sm',
+            dragging && 'z-10 cursor-grabbing opacity-60',
             '[-webkit-app-region:no-drag]',
             className
           )}
@@ -206,7 +206,7 @@ export function SidebarSessionRow({
           onDoubleClick={selectionActive ? () => onResume() : undefined}
           transition={{ layout: { duration: 0.16, ease: [0.2, 0, 0, 1] } }}
         >
-          {isWorking && !needsInput && <span aria-hidden="true" className="arc-border" />}
+          {isWorking && !needsInput && !dragging && <span aria-hidden="true" className="arc-border" />}
           <button
             className="z-0 flex min-w-0 items-center gap-1.5 bg-transparent py-0.5 pl-2 pr-2 text-left"
             onClick={event => {

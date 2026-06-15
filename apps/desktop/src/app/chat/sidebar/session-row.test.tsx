@@ -311,6 +311,15 @@ describe('SidebarSessionRow gestures', () => {
     expect(title.className).toContain('font-normal')
   })
 
+  it('hides live row chrome while the row is being dragged', () => {
+    const { container } = renderRow({ dragging: true, isWorking: true })
+    const rowChrome = container.querySelector('[data-session-row-chrome]') as HTMLElement
+
+    expect(container.querySelector('.arc-border')).toBeNull()
+    expect(rowChrome.className).toContain('opacity-60')
+    expect(rowChrome.className).not.toContain('shadow-sm')
+  })
+
   it('keeps native session drag available on non-reorderable rows', () => {
     const onSessionDragEnd = vi.fn()
     const onSessionDragStart = vi.fn()

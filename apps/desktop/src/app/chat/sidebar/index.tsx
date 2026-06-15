@@ -283,7 +283,9 @@ function sessionDragPayloadFor(session: SessionInfo, options: { archived: boolea
   }
 }
 
-function activeSessionDragPayload(event: DragStartEvent | DragMoveEvent | DragEndEvent): null | SessionDragPayload {
+function activeSessionDragPayload(
+  event: DragStartEvent | DragMoveEvent | DragEndEvent | DragCancelEvent
+): null | SessionDragPayload {
   const payload = event.active.data.current?.sessionDragPayload
 
   return payload ? (payload as SessionDragPayload) : null
@@ -513,6 +515,8 @@ export function ChatSidebar({
   const [draggingSessionSourceSection, setDraggingSessionSourceSection] = useState<null | string>(null)
   const [sessionDndTarget, setSessionDndTarget] = useState<null | SidebarSessionDndTarget>(null)
   const [sessionDragOverlayWidth, setSessionDragOverlayWidth] = useState<null | number>(null)
+  const activeSessionDndPayloadRef = useRef<null | SessionDragPayload>(null)
+  const sessionDndCommittedRef = useRef(false)
   const sessionDndTargetRef = useRef<null | SidebarSessionDndTarget>(null)
   const renderedSessionDndTargetRef = useRef<null | SidebarSessionDndTarget>(null)
   const sessionDndPointerRef = useRef<ClientPoint | null>(null)
@@ -628,6 +632,8 @@ export function ChatSidebar({
     setDraggingSessionMode(null)
     setDraggingSessionSourceSection(null)
     setSessionDragOverlayWidth(null)
+    activeSessionDndPayloadRef.current = null
+    sessionDndCommittedRef.current = false
     sessionDndTargetRef.current = null
     renderedSessionDndTargetRef.current = null
     sessionDndPointerRef.current = null
@@ -646,40 +652,6 @@ export function ChatSidebar({
   }, [])
 
   const handleSessionDragEnd = useCallback(() => clearSessionDrag(), [clearSessionDrag])
-
-  useEffect(() => {
-    if (draggingSessionMode !== 'pointer') {
-      return
-    }
-
-    const rememberPointer = (event: MouseEvent | PointerEvent | TouchEvent) => {
-      const point = eventClientPoint(event)
-
-      if (point) {
-        sessionDndPointerRef.current = point
-      }
-
-      if (event.type === 'pointerup' || event.type === 'mouseup' || event.type === 'touchend') {
-        sessionDndReleasedRef.current = true
-      }
-    }
-
-    window.addEventListener('pointermove', rememberPointer, true)
-    window.addEventListener('pointerup', rememberPointer, true)
-    window.addEventListener('mousemove', rememberPointer, true)
-    window.addEventListener('mouseup', rememberPointer, true)
-    window.addEventListener('touchmove', rememberPointer, true)
-    window.addEventListener('touchend', rememberPointer, true)
-
-    return () => {
-      window.removeEventListener('pointermove', rememberPointer, true)
-      window.removeEventListener('pointerup', rememberPointer, true)
-      window.removeEventListener('mousemove', rememberPointer, true)
-      window.removeEventListener('mouseup', rememberPointer, true)
-      window.removeEventListener('touchmove', rememberPointer, true)
-      window.removeEventListener('touchend', rememberPointer, true)
-    }
-  }, [draggingSessionMode])
 
   // Whole session rows are native-draggable (the same drag that drops a
   // session into the composer), so Pinned/Sessions accept that drag directly:
@@ -1176,6 +1148,8 @@ export function ChatSidebar({
       return
     }
 
+    activeSessionDndPayloadRef.current = payload
+    sessionDndCommittedRef.current = false
     setDraggingSession(payload)
     setDraggingSessionMode('pointer')
     setDraggingSessionSourceSection((event.active.data.current?.sourceSectionKey as string | undefined) ?? null)
@@ -1193,13 +1167,21 @@ export function ChatSidebar({
   )
 
   const commitSidebarSessionDndTarget = useCallback(
-    (event: DragEndEvent | DragCancelEvent) => {
-      const payload = activeSessionDragPayload(event)
-      const target = renderedSessionDndTargetRef.current ?? sessionDndTargetRef.current
+    (event?: DragEndEvent | DragCancelEvent, explicitTarget?: null | SidebarSessionDndTarget) => {
+      if (sessionDndCommittedRef.current) {
+        return false
+      }
+
+      const payload = (event ? activeSessionDragPayload(event) : null) ?? activeSessionDndPayloadRef.current
+      const target = explicitTarget ?? renderedSessionDndTargetRef.current ?? sessionDndTargetRef.current
 
       if (payload && target) {
-        commitSessionDropDecision(payload, target.sectionKey, target.anchor)
+        sessionDndCommittedRef.current = commitSessionDropDecision(payload, target.sectionKey, target.anchor)
+
+        return sessionDndCommittedRef.current
       }
+
+      return false
     },
     [commitSessionDropDecision]
   )
@@ -1222,6 +1204,57 @@ export function ChatSidebar({
     },
     [clearSessionDrag, commitSidebarSessionDndTarget]
   )
+
+  useEffect(() => {
+    if (draggingSessionMode !== 'pointer') {
+      return
+    }
+
+    const rememberPointer = (event: MouseEvent | PointerEvent | TouchEvent) => {
+      const point = eventClientPoint(event)
+
+      if (point) {
+        sessionDndPointerRef.current = point
+      }
+
+      if (event.type !== 'pointerup' && event.type !== 'mouseup' && event.type !== 'touchend') {
+        return
+      }
+
+      sessionDndReleasedRef.current = true
+
+      const payload = activeSessionDndPayloadRef.current
+      const releaseTarget = payload && point ? targetFromSessionDndPoint(payload, point.clientX, point.clientY) : null
+
+      if (releaseTarget) {
+        renderedSessionDndTargetRef.current = releaseTarget
+        setCurrentSessionDndTarget(releaseTarget)
+      }
+
+      commitSidebarSessionDndTarget(undefined, releaseTarget)
+    }
+
+    window.addEventListener('pointermove', rememberPointer, true)
+    window.addEventListener('pointerup', rememberPointer, true)
+    window.addEventListener('mousemove', rememberPointer, true)
+    window.addEventListener('mouseup', rememberPointer, true)
+    window.addEventListener('touchmove', rememberPointer, true)
+    window.addEventListener('touchend', rememberPointer, true)
+
+    return () => {
+      window.removeEventListener('pointermove', rememberPointer, true)
+      window.removeEventListener('pointerup', rememberPointer, true)
+      window.removeEventListener('mousemove', rememberPointer, true)
+      window.removeEventListener('mouseup', rememberPointer, true)
+      window.removeEventListener('touchmove', rememberPointer, true)
+      window.removeEventListener('touchend', rememberPointer, true)
+    }
+  }, [
+    commitSidebarSessionDndTarget,
+    draggingSessionMode,
+    setCurrentSessionDndTarget,
+    targetFromSessionDndPoint
+  ])
 
   const commitSessionDropFromRelease = useCallback(
     (payload: SessionDragPayload, target: EventTarget | null, clientY: number) => {
@@ -1378,6 +1411,32 @@ export function ChatSidebar({
 
   const showSessionSections = showSessionSkeletons || sortedSessions.length > 0
 
+  const pinnedSectionHasRows = pinnedSessions.length > 0
+
+  const recentsSectionHasRows =
+    showSessionSkeletons || agentSessions.length > 0 || Boolean(displayAgentGroups?.some(group => group.sessions.length > 0))
+
+  const pinnedSectionRootClassName = pinnedSectionHasRows && pinsOpen
+    ? 'min-h-0 flex-[2_1_0] p-0 pb-1'
+    : 'shrink-0 p-0 pb-1'
+
+  const recentsSectionRootClassName = recentsSectionHasRows && agentsOpen
+    ? 'min-h-0 flex-[1_1_0] p-0'
+    : 'shrink-0 p-0'
+
+  const pinnedSectionContentClassName = cn(
+    'flex min-h-10 flex-col gap-px overflow-y-auto overscroll-contain rounded-lg pb-2 pt-1',
+    pinnedSectionHasRows ? 'min-h-0 flex-1' : 'shrink-0'
+  )
+
+  const recentsSectionContentClassName = cn(
+    'flex flex-col overflow-y-auto overscroll-contain pb-1.75',
+    recentsSectionHasRows ? 'min-h-0 flex-1' : 'max-h-24 shrink-0',
+    // Separate profile sections clearly in the ALL view; rows inside each group
+    // keep their own tight gap-px rhythm.
+    showAllProfiles ? 'gap-3' : 'gap-px'
+  )
+
   return (
     <>
       <Sidebar
@@ -1530,7 +1589,7 @@ export function ChatSidebar({
           {contentVisible && showSessionSections && !trimmedQuery && (
             <SidebarSessionsSection
               activeSessionId={activeSidebarSessionId}
-              contentClassName="flex min-h-10 shrink-0 flex-col gap-px rounded-lg pb-2 pt-1"
+              contentClassName={pinnedSectionContentClassName}
               draggingSession={draggingSession}
               draggingSessionMode={draggingSessionMode}
               draggingSessionSourceSection={draggingSessionSourceSection}
@@ -1556,7 +1615,7 @@ export function ChatSidebar({
               onTogglePin={unpinSession}
               open={pinsOpen}
               pinned
-              rootClassName="shrink-0 p-0 pb-1"
+              rootClassName={pinnedSectionRootClassName}
               sectionKey="pinned"
               sessionDragEnabled
               sessions={pinnedSessions}
@@ -1568,12 +1627,7 @@ export function ChatSidebar({
           {contentVisible && showSessionSections && !trimmedQuery && (
             <SidebarSessionsSection
               activeSessionId={activeSidebarSessionId}
-              contentClassName={cn(
-                'flex min-h-0 flex-1 flex-col overflow-y-auto overscroll-contain pb-1.75',
-                // Separate profile sections clearly in the ALL view; rows inside
-                // each group keep their own tight gap-px rhythm.
-                showAllProfiles ? 'gap-3' : 'gap-px'
-              )}
+              contentClassName={recentsSectionContentClassName}
               draggingSession={draggingSession}
               draggingSessionMode={draggingSessionMode}
               draggingSessionSourceSection={draggingSessionSourceSection}
@@ -1640,7 +1694,7 @@ export function ChatSidebar({
               onTogglePin={pinSession}
               open={agentsOpen}
               pinned={false}
-              rootClassName="min-h-0 flex-1 p-0"
+              rootClassName={recentsSectionRootClassName}
               sectionKey="sessions"
               sessionDragEnabled={!showAllProfiles}
               sessions={displayAgentSessions}
