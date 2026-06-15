@@ -212,16 +212,23 @@ export function SelectionActionBar({
         <Tip label={selectedCountLabel}>
           <span
             aria-label={selectedCountLabel}
-            className="flex min-w-0 max-w-full flex-wrap items-center gap-x-1 overflow-hidden text-[0.6875rem] font-semibold uppercase leading-[0.6875rem] tracking-wide text-(--ui-text-secondary)"
+            className="flex min-w-0 max-w-full items-center gap-x-1 overflow-hidden whitespace-nowrap text-[0.6875rem] font-semibold leading-[0.6875rem] text-(--ui-text-secondary)"
             data-selection-count-label
           >
             {selectedCountParts ? (
               <>
-                <span className="shrink-0">{selectedCountParts.count}</span>
-                <span className="min-w-0 break-words">{selectedCountParts.text}</span>
+                <span className="shrink-0" data-selection-count-number>
+                  {selectedCountParts.count}
+                </span>
+                <span
+                  className="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap"
+                  data-selection-count-text
+                >
+                  {selectedCountParts.text}
+                </span>
               </>
             ) : (
-              <span className="min-w-0 break-words">{selectedCountLabel}</span>
+              <span className="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">{selectedCountLabel}</span>
             )}
           </span>
         </Tip>
