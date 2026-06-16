@@ -147,4 +147,30 @@ describe('bootstrap progress', () => {
       fraction: 1
     })
   })
+
+  it('ignores a late failure event after completion', () => {
+    applyBootstrapEvent({
+      type: 'complete',
+      installRoot: '/tmp/hermes-agent',
+      marker: null
+    })
+
+    applyBootstrapEvent({
+      type: 'failed',
+      stage: 'rebuild',
+      error: 'stale rebuild failure'
+    })
+
+    expect($bootstrap.get()).toMatchObject({
+      status: 'completed',
+      error: null,
+      currentStage: null
+    })
+    expect($progress.get()).toEqual({
+      done: 3,
+      current: 3,
+      total: 3,
+      fraction: 1
+    })
+  })
 })

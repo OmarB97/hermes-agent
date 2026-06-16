@@ -22,12 +22,13 @@
 
 use std::env;
 use std::ffi::OsString;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -170,8 +171,7 @@ async fn run_update(app: AppHandle) -> Result<()> {
         &format!("[update] updating against branch {update_branch}"),
     );
     let child_env = update_child_env(&install_root);
-    let mut update_args: Vec<String> =
-        vec!["update".into(), "--yes".into(), "--gateway".into()];
+    let mut update_args: Vec<String> = vec!["update".into(), "--yes".into(), "--gateway".into()];
     // --force skips `hermes update`'s Windows running-exe guard (which would
     // `sys.exit(2)` and dead-end the handoff). By contract the desktop has
     // already exited and waited for the venv shim to unlock before launching
@@ -278,6 +278,27 @@ async fn run_update(app: AppHandle) -> Result<()> {
         }
     }
 
+    if let Some(target_app_ref) = target_app.as_ref() {
+        if let Some(current_target) =
+            target_app_matches_current_rebuilt_app(&install_root, target_app_ref)
+        {
+            emit_log(
+                &app,
+                Some("rebuild"),
+                LogStream::Stdout,
+                &format!(
+                    "[update] installed app already matches the current rebuilt bundle at {}; \
+                     skipping redundant rebuild/install.",
+                    current_target.display()
+                ),
+            );
+            emit_stage(&app, "rebuild", StageState::Skipped, Some(0), None);
+            emit_stage(&app, "install", StageState::Skipped, Some(0), None);
+            finish_update(&app, &install_root, Some(&current_target)).await?;
+            return Ok(());
+        }
+    }
+
     // ---- stage 2: hermes desktop --build-only ----------------------------
     // `hermes update` deliberately does NOT build apps/desktop (it installs
     // repo-root deps with --workspaces=false). This is the rebuild it skips.
@@ -296,6 +317,27 @@ async fn run_update(app: AppHandle) -> Result<()> {
     let rebuild_ms = started.elapsed().as_millis() as u64;
 
     if rebuild.exit_code != Some(0) {
+        if let Some(target_app_ref) = target_app.as_ref() {
+            if let Some(current_target) =
+                target_app_matches_current_rebuilt_app(&install_root, target_app_ref)
+            {
+                emit_log(
+                    &app,
+                    Some("rebuild"),
+                    LogStream::Stdout,
+                    &format!(
+                        "[update] rebuild failed, but the installed app already matches the \
+                         current rebuilt bundle at {}; treating the retry as complete.",
+                        current_target.display()
+                    ),
+                );
+                emit_stage(&app, "rebuild", StageState::Skipped, Some(rebuild_ms), None);
+                emit_stage(&app, "install", StageState::Skipped, Some(0), None);
+                finish_update(&app, &install_root, Some(&current_target)).await?;
+                return Ok(());
+            }
+        }
+
         let msg = format!(
             "Rebuilding the desktop app failed (exit {:?}). The update was \
              applied but the app could not be rebuilt; run `hermes desktop` \
@@ -318,7 +360,13 @@ async fn run_update(app: AppHandle) -> Result<()> {
         );
         return Err(anyhow!(msg));
     }
-    emit_stage(&app, "rebuild", StageState::Succeeded, Some(rebuild_ms), None);
+    emit_stage(
+        &app,
+        "rebuild",
+        StageState::Succeeded,
+        Some(rebuild_ms),
+        None,
+    );
 
     let launch_target = if let Some(target_app) = target_app {
         let started = Instant::now();
@@ -358,6 +406,16 @@ async fn run_update(app: AppHandle) -> Result<()> {
     };
 
     // ---- done: signal complete, then launch the fresh desktop ------------
+    finish_update(&app, &install_root, launch_target.as_deref()).await?;
+
+    Ok(())
+}
+
+async fn finish_update(
+    app: &AppHandle,
+    install_root: &Path,
+    launch_target: Option<&Path>,
+) -> Result<()> {
     emit(
         &app,
         BootstrapEvent::Complete {
@@ -367,7 +425,7 @@ async fn run_update(app: AppHandle) -> Result<()> {
     );
 
     if let Some(target_app) = launch_target {
-        if let Err(err) = launch_macos_app_and_exit(&app, &target_app).await {
+        if let Err(err) = launch_macos_app_and_exit(&app, target_app).await {
             emit_log(
                 &app,
                 None,
@@ -375,8 +433,11 @@ async fn run_update(app: AppHandle) -> Result<()> {
                 &format!("[update] could not auto-launch desktop: {err}. Launch Hermes manually."),
             );
         }
-    } else if let Err(err) =
-        crate::bootstrap::launch_hermes_desktop(app.clone(), install_root.to_string_lossy().into_owned()).await
+    } else if let Err(err) = crate::bootstrap::launch_hermes_desktop(
+        app.clone(),
+        install_root.to_string_lossy().into_owned(),
+    )
+    .await
     {
         // Launch failed: don't hard-fail the update (it succeeded); surface a
         // log line so the success screen can still tell the user to launch
@@ -392,6 +453,76 @@ async fn run_update(app: AppHandle) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn target_app_matches_current_rebuilt_app(
+    install_root: &Path,
+    target_app: &Path,
+) -> Option<PathBuf> {
+    let rebuilt_app = crate::bootstrap::resolve_hermes_desktop_app(install_root)?;
+    let target_stamp = app_bundle_stamp_identity(target_app)?;
+    let rebuilt_stamp = app_bundle_stamp_identity(&rebuilt_app)?;
+    if target_stamp != rebuilt_stamp {
+        return None;
+    }
+
+    let target_asar = app_asar_path(target_app);
+    let rebuilt_asar = app_asar_path(&rebuilt_app);
+    if !matching_file_contents_when_present(&target_asar, &rebuilt_asar) {
+        return None;
+    }
+
+    Some(target_app.to_path_buf())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn target_app_matches_current_rebuilt_app(
+    _install_root: &Path,
+    _target_app: &Path,
+) -> Option<PathBuf> {
+    None
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppBundleStamp {
+    commit: String,
+    tracked_source_diff_hash: String,
+}
+
+fn app_bundle_stamp_identity(app: &Path) -> Option<AppBundleStamp> {
+    install_stamp_identity_from_json(
+        &fs::read_to_string(
+            app.join("Contents")
+                .join("Resources")
+                .join("install-stamp.json"),
+        )
+        .ok()?,
+    )
+}
+
+fn install_stamp_identity_from_json(contents: &str) -> Option<AppBundleStamp> {
+    let value: serde_json::Value = serde_json::from_str(contents).ok()?;
+    Some(AppBundleStamp {
+        commit: value.get("commit")?.as_str()?.to_string(),
+        tracked_source_diff_hash: value
+            .get("trackedSourceDiffHash")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
+fn app_asar_path(app: &Path) -> PathBuf {
+    app.join("Contents").join("Resources").join("app.asar")
+}
+
+fn matching_file_contents_when_present(a: &Path, b: &Path) -> bool {
+    match (a.exists(), b.exists()) {
+        (false, false) => true,
+        (true, true) => fs::read(a).ok() == fs::read(b).ok(),
+        _ => false,
+    }
+}
+
 /// Poll until the venv shim is no longer locked (Windows) or a bounded timeout
 /// elapses. On non-Windows this is a short fixed grace since file locking
 /// isn't the failure mode there.
@@ -399,7 +530,12 @@ async fn wait_for_venv_free(install_root: &Path, app: &AppHandle) {
     let shim = venv_hermes(install_root);
     let deadline = Instant::now() + DESKTOP_EXIT_WAIT;
 
-    emit_log(app, Some("update"), LogStream::Stdout, "[update] waiting for Hermes to exit…");
+    emit_log(
+        app,
+        Some("update"),
+        LogStream::Stdout,
+        "[update] waiting for Hermes to exit…",
+    );
 
     loop {
         if !is_locked(&shim) {
@@ -485,7 +621,11 @@ fn is_locked(path: &Path) -> bool {
     if !path.exists() {
         return false;
     }
-    match std::fs::OpenOptions::new().read(true).write(true).open(path) {
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
         Ok(_) => false,
         Err(_) => true,
     }
@@ -550,7 +690,10 @@ async fn run_streamed(
         emit_log(app, stage_owned.as_deref(), LogStream::Stderr, &l);
     }
 
-    let status = child.wait().await.map_err(|e| anyhow!("waiting for child: {e}"))?;
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| anyhow!("waiting for child: {e}"))?;
     Ok(CmdResult {
         exit_code: status.code(),
     })
@@ -577,9 +720,17 @@ fn resolve_hermes(install_root: &Path) -> Option<PathBuf> {
         return Some(shim);
     }
     // PATH fallback. which-style probe via env, kept dependency-free.
-    let exe = if cfg!(target_os = "windows") { "hermes.exe" } else { "hermes" };
+    let exe = if cfg!(target_os = "windows") {
+        "hermes.exe"
+    } else {
+        "hermes"
+    };
     if let Ok(path) = std::env::var("PATH") {
-        let sep = if cfg!(target_os = "windows") { ';' } else { ':' };
+        let sep = if cfg!(target_os = "windows") {
+            ';'
+        } else {
+            ':'
+        };
         for dir in path.split(sep) {
             let cand = Path::new(dir).join(exe);
             if cand.exists() {
@@ -671,12 +822,17 @@ async fn install_macos_app_update(
         ));
     }
 
-    let rebuilt_app = crate::bootstrap::resolve_hermes_desktop_app(install_root).ok_or_else(|| {
-        anyhow!(
-            "desktop rebuild succeeded but no Hermes.app was found under {}",
-            install_root.join("apps").join("desktop").join("release").display()
-        )
-    })?;
+    let rebuilt_app =
+        crate::bootstrap::resolve_hermes_desktop_app(install_root).ok_or_else(|| {
+            anyhow!(
+                "desktop rebuild succeeded but no Hermes.app was found under {}",
+                install_root
+                    .join("apps")
+                    .join("desktop")
+                    .join("release")
+                    .display()
+            )
+        })?;
 
     let same = match (rebuilt_app.canonicalize(), target_app.canonicalize()) {
         (Ok(a), Ok(b)) => a == b,
@@ -774,7 +930,10 @@ async fn swap_in_new_bundle(tmp: &Path, target: &Path, old: &Path) -> Result<()>
             let _ = tokio::fs::rename(old, target).await;
         }
         remove_dir_if_exists(tmp).await;
-        return Err(anyhow!("installing updated app at {}: {err}", target.display()));
+        return Err(anyhow!(
+            "installing updated app at {}: {err}",
+            target.display()
+        ));
     }
     remove_dir_if_exists(old).await;
     Ok(())
@@ -911,7 +1070,10 @@ mod tests {
             target_app_from_args(["--update", "--target-app", "/Applications/Hermes.app"]),
             Some(PathBuf::from("/Applications/Hermes.app"))
         );
-        assert_eq!(target_app_from_args(["--target-app", "/tmp/not-an-app"]), None);
+        assert_eq!(
+            target_app_from_args(["--target-app", "/tmp/not-an-app"]),
+            None
+        );
     }
 
     // Helpers for the swap tests: make a throwaway dir tree we can rename.
@@ -931,6 +1093,85 @@ mod tests {
     fn write_marker(dir: &Path, contents: &str) {
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join("marker.txt"), contents).unwrap();
+    }
+
+    fn write_app_bundle(app: &Path, commit: &str, diff_hash: &str, asar: &[u8]) {
+        let macos = app.join("Contents").join("MacOS");
+        let resources = app.join("Contents").join("Resources");
+        std::fs::create_dir_all(&macos).unwrap();
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::write(macos.join("Hermes"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(resources.join("app.asar"), asar).unwrap();
+        std::fs::write(
+            resources.join("install-stamp.json"),
+            format!(
+                r#"{{"commit":"{commit}","trackedSourceDiffHash":"{diff_hash}","builtAt":"ignored"}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn mac_arm_release_app(root: &Path) -> PathBuf {
+        root.join("apps")
+            .join("desktop")
+            .join("release")
+            .join("mac-arm64")
+            .join("Hermes.app")
+    }
+
+    #[test]
+    fn install_stamp_identity_uses_commit_and_tracked_diff_only() {
+        let stamp = install_stamp_identity_from_json(
+            r#"{"commit":"abc123","trackedSourceDiffHash":"hash-a","builtAt":"one"}"#,
+        )
+        .unwrap();
+        let same_build_different_time = install_stamp_identity_from_json(
+            r#"{"commit":"abc123","trackedSourceDiffHash":"hash-a","builtAt":"two"}"#,
+        )
+        .unwrap();
+        let different_diff = install_stamp_identity_from_json(
+            r#"{"commit":"abc123","trackedSourceDiffHash":"hash-b","builtAt":"one"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(stamp, same_build_different_time);
+        assert_ne!(stamp, different_diff);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn current_rebuilt_app_matches_target_by_stamp_and_asar() {
+        let base = unique_tmp_dir("current-match");
+        let install_root = base.join("install");
+        let rebuilt = mac_arm_release_app(&install_root);
+        let target = base.join("Applications").join("Hermes.app");
+        write_app_bundle(&rebuilt, "abc123", "hash-a", b"same asar");
+        write_app_bundle(&target, "abc123", "hash-a", b"same asar");
+
+        assert_eq!(
+            target_app_matches_current_rebuilt_app(&install_root, &target),
+            Some(target.clone())
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn current_rebuilt_app_rejects_matching_stamp_with_different_asar() {
+        let base = unique_tmp_dir("current-mismatch");
+        let install_root = base.join("install");
+        let rebuilt = mac_arm_release_app(&install_root);
+        let target = base.join("Applications").join("Hermes.app");
+        write_app_bundle(&rebuilt, "abc123", "hash-a", b"rebuilt asar");
+        write_app_bundle(&target, "abc123", "hash-a", b"old asar");
+
+        assert_eq!(
+            target_app_matches_current_rebuilt_app(&install_root, &target),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
@@ -974,8 +1215,14 @@ mod tests {
 
         let result = swap_in_new_bundle(&tmp, &target, &old).await;
 
-        assert!(result.is_err(), "swap should fail when neither move can complete");
-        assert!(target.exists(), "original app must NOT be deleted on failure");
+        assert!(
+            result.is_err(),
+            "swap should fail when neither move can complete"
+        );
+        assert!(
+            target.exists(),
+            "original app must NOT be deleted on failure"
+        );
         assert_eq!(
             std::fs::read_to_string(target.join("marker.txt")).unwrap(),
             "OLD",
@@ -997,12 +1244,18 @@ mod tests {
         let result = swap_in_new_bundle(&tmp, &target, &old).await;
 
         assert!(result.is_err());
-        assert!(target.exists(), "original must be restored after failed install");
+        assert!(
+            target.exists(),
+            "original must be restored after failed install"
+        );
         assert_eq!(
             std::fs::read_to_string(target.join("marker.txt")).unwrap(),
             "OLD"
         );
-        assert!(!old.exists(), "backup should be rolled back, not left behind");
+        assert!(
+            !old.exists(),
+            "backup should be rolled back, not left behind"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }

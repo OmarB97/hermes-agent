@@ -249,6 +249,10 @@ export function applyBootstrapEvent(payload: BootstrapEvent): void {
       break
     }
     case 'failed':
+      if (cur.status === 'completed') {
+        console.warn('ignoring late bootstrap failure after completion')
+        break
+      }
       $bootstrap.set({
         ...cur,
         status: 'failed',
