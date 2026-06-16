@@ -18,6 +18,7 @@ import { coerceGatewayText, coerceThinkingText, normalizePersonalityValue } from
 import { gatewayEventRequiresSessionId } from '@/lib/gateway-events'
 import { triggerHaptic } from '@/lib/haptics'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
+import { mergeTokenUsagePayload, mergeUsageSnapshot, type TokenUsagePayload } from '@/lib/token-usage'
 import { setClarifyRequest } from '@/store/clarify'
 import { $gateway } from '@/store/gateway'
 import { notify } from '@/store/notifications'
@@ -33,12 +34,15 @@ import {
   setCurrentReasoningEffort,
   setCurrentServiceTier,
   setCurrentUsage,
+  setLocalDeviceName,
+  setSelectedStoredSessionId,
+  setSessionActivityStatus,
   setTurnStartedAt,
   setYoloActive
 } from '@/store/session'
 import { clearSessionSubagents, pruneDelegateFallbackSubagents, upsertSubagent } from '@/store/subagents'
 import { recordToolDiff } from '@/store/tool-diffs'
-import type { RpcEvent } from '@/types/hermes'
+import type { RpcEvent, UsageStats } from '@/types/hermes'
 
 import type { ClientSessionState } from '../../types'
 
@@ -195,6 +199,10 @@ const firstString = (...candidates: unknown[]): string => {
   }
 
   return ''
+}
+
+function activeUsageSnapshot(value: unknown): Partial<UsageStats> | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? (value as Partial<UsageStats>) : null
 }
 
 function delegateTaskPayloads(
@@ -684,6 +692,12 @@ export function useMessageStream({
       const isActiveEvent = !!sessionId && sessionId === activeSessionIdRef.current
 
       if (event.type === 'gateway.ready') {
+        const deviceName = typeof payload?.device_name === 'string' ? payload.device_name.trim() : ''
+
+        if (deviceName) {
+          setLocalDeviceName(current => (current.trim() ? current : deviceName))
+        }
+
         return
       } else if (event.type === 'session.info') {
         // Apply session-scoped fields when the event targets the active
@@ -694,6 +708,7 @@ export function useMessageStream({
         const modelChanged = typeof payload?.model === 'string'
         const providerChanged = typeof payload?.provider === 'string'
         const runningChanged = typeof payload?.running === 'boolean'
+        const storedSessionId = typeof payload?.session_key === 'string' && payload.session_key ? payload.session_key : null
 
         if (apply) {
           if (modelChanged) {
@@ -731,15 +746,31 @@ export function useMessageStream({
           if (typeof payload?.yolo === 'boolean') {
             setYoloActive(payload.yolo)
           }
+
+          if (storedSessionId && sessionId) {
+            setSelectedStoredSessionId(storedSessionId)
+            updateSessionState(
+              sessionId,
+              state => ({
+                ...state,
+                storedSessionId
+              }),
+              storedSessionId
+            )
+          }
         }
 
         if (sessionId && hasStatePatch) {
-          updateSessionState(sessionId, state => ({
-            ...state,
-            ...statePatch,
-            branch: statePatch.branch ?? state.branch,
-            cwd: statePatch.cwd ?? state.cwd
-          }))
+          updateSessionState(
+            sessionId,
+            state => ({
+              ...state,
+              ...statePatch,
+              branch: statePatch.branch ?? state.branch,
+              cwd: statePatch.cwd ?? state.cwd
+            }),
+            storedSessionId ?? undefined
+          )
         }
 
         if (apply) {
@@ -771,12 +802,12 @@ export function useMessageStream({
                 streamId: null,
                 turnStartedAt: null
               }
-            })
+            }, storedSessionId ?? undefined)
           }
         }
 
         if (payload?.usage && (!explicitSid || isActiveEvent)) {
-          setCurrentUsage(current => ({ ...current, ...payload.usage }))
+          setCurrentUsage(current => mergeUsageSnapshot(current, activeUsageSnapshot(payload.usage)))
         }
 
         if (typeof payload?.credential_warning === 'string' && payload.credential_warning) {
@@ -789,6 +820,23 @@ export function useMessageStream({
           void queryClient.invalidateQueries({
             queryKey: explicitSid && sessionId ? ['model-options', sessionId] : ['model-options']
           })
+        }
+      } else if (event.type === 'token.usage') {
+        if (isActiveEvent) {
+          setCurrentUsage(current => mergeTokenUsagePayload(current, payload as TokenUsagePayload | undefined))
+        }
+      } else if (event.type === 'status.update') {
+        if (!isActiveEvent) {
+          return
+        }
+
+        const kind = typeof payload?.kind === 'string' ? payload.kind : 'lifecycle'
+        const text = typeof payload?.text === 'string' ? payload.text.trim() : ''
+
+        if (kind === 'ready') {
+          setSessionActivityStatus(null)
+        } else if ((kind === 'lifecycle' || kind === 'compressing') && text) {
+          setSessionActivityStatus({ kind, text })
         }
       } else if (event.type === 'message.start') {
         if (!sessionId) {
@@ -813,9 +861,14 @@ export function useMessageStream({
         }))
 
         if (isActiveEvent) {
+          setSessionActivityStatus(null)
           setTurnStartedAt(Date.now())
         }
       } else if (event.type === 'message.delta') {
+        if (isActiveEvent) {
+          setSessionActivityStatus(null)
+        }
+
         if (sessionId) {
           appendAssistantDelta(sessionId, coerceGatewayText(payload?.text))
         }
@@ -857,7 +910,7 @@ export function useMessageStream({
         }
 
         if (payload?.usage) {
-          setCurrentUsage(current => ({ ...current, ...payload.usage }))
+          setCurrentUsage(current => mergeUsageSnapshot(current, activeUsageSnapshot(payload.usage)))
         }
       } else if (event.type === 'tool.start' || event.type === 'tool.progress' || event.type === 'tool.generating') {
         if (!sessionId) {
@@ -875,6 +928,10 @@ export function useMessageStream({
           // the sidebar indicator clears as soon as it's answered, not only at
           // message.complete.
           updateSessionState(sessionId, state => (state.needsInput ? { ...state, needsInput: false } : state))
+        }
+
+        if (payload?.usage && isActiveEvent) {
+          setCurrentUsage(current => mergeUsageSnapshot(current, activeUsageSnapshot(payload.usage)))
         }
 
         if (typeof payload?.inline_diff === 'string' && payload.inline_diff.trim()) {
