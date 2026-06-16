@@ -1036,6 +1036,24 @@ def switch_model(
                     if isinstance(entry_models, dict) and new_model in entry_models:
                         override = True
                         break
+                # Special handling: if target_provider is a custom provider but doesn't match
+                # the exact slug, check if this custom provider entry matches the base_url pattern
+                # that would indicate it's a custom provider for the target_provider
+                if not override and target_provider.startswith("custom:") and entry_name:
+                    # Check if the custom provider entry name matches the custom provider name in target_provider
+                    # This handles cases where models.dev cache is stale and we need to fall back to
+                    # custom_providers for validation
+                    target_custom_name = target_provider[len("custom:"):] if target_provider.startswith("custom:") else target_provider
+                    if target_custom_name == entry_name:
+                        # This is the custom provider we're targeting - check for model match
+                        entry_model = entry.get("model", "")
+                        entry_models = entry.get("models", {})
+                        if new_model == entry_model:
+                            override = True
+                            break
+                        if isinstance(entry_models, dict) and new_model in entry_models:
+                            override = True
+                            break
         if override:
             validation = {"accepted": True, "persist": True, "recognized": False, "message": validation.get("message", "")}
         else:
