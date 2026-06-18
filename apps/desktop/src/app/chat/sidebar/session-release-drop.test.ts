@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import type { SessionDragPayload } from '@/app/chat/composer/inline-refs'
 
-import { resolveSidebarSessionReleaseDrop } from './session-release-drop'
+import { resolveSidebarSessionReleaseDrop, shouldResolveSidebarPointerRelease } from './session-release-drop'
 
 const RECENT_ROW: SessionDragPayload = {
   archived: false,
@@ -35,6 +35,49 @@ const anchorPinIdForSessionId = (sessionId: string) =>
   sessionId === 'pinned-live' ? 'pinned-root' : sessionId === 'other-pinned-live' ? 'other-pinned-root' : sessionId
 
 describe('resolveSidebarSessionReleaseDrop', () => {
+  it('uses retained pointer anchors when dnd-kit loses the final over target', () => {
+    expect(
+      shouldResolveSidebarPointerRelease({
+        anchor: { before: false, sessionId: 'second-live' },
+        sourceSectionKey: 'sessions',
+        targetSectionKey: 'sessions'
+      })
+    ).toBe(true)
+
+    expect(
+      resolveSidebarSessionReleaseDrop({
+        anchor: { before: false, sessionId: 'second-live' },
+        anchorPinIdForSessionId,
+        payload: { ...RECENT_ROW, id: 'first-live', pinId: 'first-root' },
+        pinnedSessionIds: [],
+        sectionKey: 'sessions',
+        sessionOrderIds: ['first-live', 'second-live', 'third-live'],
+        showAllProfiles: false
+      })
+    ).toEqual({
+      nextOrder: ['second-live', 'first-live', 'third-live'],
+      type: 'sessions'
+    })
+  })
+
+  it('ignores same-section pointer releases without a retained anchor', () => {
+    expect(
+      shouldResolveSidebarPointerRelease({
+        anchor: null,
+        sourceSectionKey: 'sessions',
+        targetSectionKey: 'sessions'
+      })
+    ).toBe(false)
+
+    expect(
+      shouldResolveSidebarPointerRelease({
+        anchor: null,
+        sourceSectionKey: 'sessions',
+        targetSectionKey: 'pinned'
+      })
+    ).toBe(true)
+  })
+
   it('pins a Sessions row at the released Pinned anchor index', () => {
     expect(
       resolveSidebarSessionReleaseDrop({

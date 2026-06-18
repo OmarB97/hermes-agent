@@ -11,6 +11,12 @@ export type SidebarSessionReleaseDropDecision =
   | { index?: number; pinId: string; type: 'pin' }
   | { nextOrder?: string[]; restoreSessionId?: string; type: 'sessions'; unpinPinId?: string }
 
+interface SidebarPointerReleaseOptions {
+  anchor: null | SessionDropAnchor
+  sourceSectionKey?: null | SidebarSessionReleaseSection
+  targetSectionKey?: null | SidebarSessionReleaseSection
+}
+
 interface ResolveSidebarSessionReleaseDropOptions {
   anchor: null | SessionDropAnchor
   anchorPinIdForSessionId: (sessionId: string) => string
@@ -23,6 +29,14 @@ interface ResolveSidebarSessionReleaseDropOptions {
 
 function placeSessionIdAtEnd(ids: readonly string[], movingId: string): string[] {
   return [...ids.filter(id => id !== movingId), movingId]
+}
+
+export function shouldResolveSidebarPointerRelease({
+  anchor,
+  sourceSectionKey,
+  targetSectionKey
+}: SidebarPointerReleaseOptions): boolean {
+  return Boolean(targetSectionKey && (sourceSectionKey !== targetSectionKey || anchor))
 }
 
 export function resolveSidebarSessionReleaseDrop({

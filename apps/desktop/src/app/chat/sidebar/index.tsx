@@ -128,7 +128,7 @@ import { SidebarCronJobsSection } from './cron-jobs-section'
 import { SidebarLoadMoreRow } from './load-more-row'
 import { ProfileRail } from './profile-switcher'
 import { SelectionActionBar } from './selection-action-bar'
-import { resolveSidebarSessionReleaseDrop } from './session-release-drop'
+import { resolveSidebarSessionReleaseDrop, shouldResolveSidebarPointerRelease } from './session-release-drop'
 import { SidebarSessionRow } from './session-row'
 import {
   type FrozenSectionBand,
@@ -1311,6 +1311,10 @@ export function ChatSidebar({
     resetSidebarPointerDrag()
 
     if (!over) {
+      if (pointerDrag?.targetSectionKey && shouldResolveSidebarPointerRelease(pointerDrag)) {
+        resolveSessionRelease(pointerDrag.targetSectionKey, pointerDrag.payload, pointerDrag.anchor)
+      }
+
       return
     }
 
@@ -1374,6 +1378,10 @@ export function ChatSidebar({
     }
 
     if (active.id === over.id) {
+      if (pointerDrag?.targetSectionKey && shouldResolveSidebarPointerRelease(pointerDrag)) {
+        resolveSessionRelease(pointerDrag.targetSectionKey, payload, pointerDrag.anchor)
+      }
+
       return
     }
 
