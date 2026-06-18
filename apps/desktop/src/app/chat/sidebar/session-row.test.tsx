@@ -410,8 +410,13 @@ describe('SidebarSessionRow gestures', () => {
 
     fireEvent.pointerDown(rowButton)
     expect(onPointerDown).toHaveBeenCalledTimes(1)
-    fireEvent.pointerDown(dragAnchor)
-    expect(onPointerDown).toHaveBeenCalledTimes(1)
+    fireEvent.pointerDown(dragSource)
+    expect(onPointerDown).toHaveBeenCalledTimes(2)
+
+    const actionsButton = container.querySelector('[data-session-row-actions]') as HTMLButtonElement
+
+    fireEvent.pointerDown(actionsButton)
+    expect(onPointerDown).toHaveBeenCalledTimes(2)
 
     fireEvent.dragStart(dragAnchor, { dataTransfer: transfer })
     fireEvent.dragEnd(dragAnchor)

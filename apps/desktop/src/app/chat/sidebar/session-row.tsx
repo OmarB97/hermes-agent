@@ -63,6 +63,13 @@ const AGE_TICKS: ReadonlyArray<[number, 'ageDay' | 'ageHour' | 'ageMin']> = [
   [60_000, 'ageMin']
 ]
 
+function isNestedSessionRowDragHandleTarget(target: EventTarget | null): boolean {
+  return (
+    target instanceof HTMLElement &&
+    Boolean(target.closest('[data-session-row-actions], [data-session-row-main]'))
+  )
+}
+
 export function formatSidebarRowAge(seconds: number, r: Translations['sidebar']['row']): string {
   const delta = Math.max(0, Date.now() - seconds * 1000)
 
@@ -116,6 +123,31 @@ export function SidebarSessionRow({
   const [actionsMenuOpen, setActionsMenuOpen] = useState(false)
   const [actionsKeyboardFocus, setActionsKeyboardFocus] = useState(false)
   const actionsVisible = actionsMenuOpen || actionsKeyboardFocus
+  const rowDragActivationProps =
+    reorderable && dragHandleProps
+      ? {
+          onKeyDown: (event: React.KeyboardEvent<HTMLElement>) => {
+            if (!isNestedSessionRowDragHandleTarget(event.target)) {
+              dragHandleProps.onKeyDown?.(event)
+            }
+          },
+          onMouseDown: (event: React.MouseEvent<HTMLElement>) => {
+            if (!isNestedSessionRowDragHandleTarget(event.target)) {
+              dragHandleProps.onMouseDown?.(event)
+            }
+          },
+          onPointerDown: (event: React.PointerEvent<HTMLElement>) => {
+            if (!isNestedSessionRowDragHandleTarget(event.target)) {
+              dragHandleProps.onPointerDown?.(event)
+            }
+          },
+          onTouchStart: (event: React.TouchEvent<HTMLElement>) => {
+            if (!isNestedSessionRowDragHandleTarget(event.target)) {
+              dragHandleProps.onTouchStart?.(event)
+            }
+          }
+        }
+      : undefined
 
   const bulkContextActions =
     checked && bulkSelectedSessionIds && bulkSelectedSessionIds.length > 1
@@ -216,6 +248,7 @@ export function SidebarSessionRow({
           data-session-row-chrome
           data-working={isWorking ? 'true' : undefined}
           layout="position"
+          {...rowDragActivationProps}
           onDoubleClick={selectionActive ? () => onResume() : undefined}
           transition={{ layout: { duration: 0.16, ease: [0.2, 0, 0, 1] } }}
         >
