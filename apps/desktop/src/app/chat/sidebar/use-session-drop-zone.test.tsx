@@ -20,6 +20,7 @@ import {
   type SessionDragFlags,
   type SessionDropAnchor,
   sessionDropAnchor,
+  sessionDropAnchorFromCandidates,
   sessionDropMarkerIndex,
   useSessionDropZone
 } from './use-session-drop-zone'
@@ -426,6 +427,24 @@ describe('sessionDropAnchor', () => {
     rowWithRect('b', 154, 26, root)
 
     expect(sessionDropAnchor(dropEventAt(moving, 140, root), { movingSessionId: 'moving', previous })).toEqual({
+      before: true,
+      sessionId: 'b'
+    })
+  })
+
+  it('resolves pointer-dnd anchors from frozen row candidates when dnd-kit over is the moving row', () => {
+    const candidates = [
+      { bottom: 126, sessionId: 'a', top: 100 },
+      { bottom: 153, sessionId: 'moving', top: 127 },
+      { bottom: 180, sessionId: 'b', top: 154 }
+    ]
+
+    expect(
+      sessionDropAnchorFromCandidates(candidates, 140, {
+        movingSessionId: 'moving',
+        previous: { before: false, sessionId: 'a' }
+      })
+    ).toEqual({
       before: true,
       sessionId: 'b'
     })

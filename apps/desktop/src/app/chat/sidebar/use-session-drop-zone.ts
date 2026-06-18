@@ -46,6 +46,12 @@ interface SessionDropAnchorOptions {
   previous?: null | SessionDropAnchor
 }
 
+export interface SessionDropAnchorCandidate {
+  bottom: number
+  sessionId: string
+  top: number
+}
+
 export function placeSessionIdAtAnchor(
   ids: readonly string[],
   movingId: string,
@@ -183,12 +189,8 @@ export function frozenSectionKeyFromPoint(bands: readonly FrozenSectionBand[], c
   return best?.key ?? null
 }
 
-function rowAnchorFromRect(
-  sessionId: string,
-  rect: DOMRect,
-  clientY: number
-): SessionDropAnchor {
-  return { before: clientY < rect.top + rect.height / 2, sessionId }
+function rowAnchorFromBounds(sessionId: string, top: number, bottom: number, clientY: number): SessionDropAnchor {
+  return { before: clientY < top + (bottom - top) / 2, sessionId }
 }
 
 function rowsInScope(event: ReactDragEvent): HTMLElement[] {
@@ -213,20 +215,32 @@ export function sessionDropAnchor(
   options: SessionDropAnchorOptions = {}
 ): null | SessionDropAnchor {
   const rows = rowsInScope(event)
-    .map(row => ({ rect: row.getBoundingClientRect(), row, sessionId: row.dataset.sessionId }))
+    .map(row => ({ rect: row.getBoundingClientRect(), sessionId: row.dataset.sessionId }))
     .filter(
-      (entry): entry is { rect: DOMRect; row: HTMLElement; sessionId: string } =>
+      (entry): entry is { rect: DOMRect; sessionId: string } =>
         Boolean(entry.sessionId) && entry.sessionId !== options.movingSessionId
     )
-    .sort((a, b) => a.rect.top - b.rect.top)
+    .map(({ rect, sessionId }) => ({ bottom: rect.bottom, sessionId, top: rect.top }))
+
+  return sessionDropAnchorFromCandidates(rows, event.clientY, options)
+}
+
+export function sessionDropAnchorFromCandidates(
+  candidates: SessionDropAnchorCandidate[],
+  clientY: number,
+  options: SessionDropAnchorOptions = {}
+): null | SessionDropAnchor {
+  const rows = candidates
+    .filter(row => row.sessionId !== options.movingSessionId)
+    .sort((a, b) => a.top - b.top)
 
   if (rows.length === 0) {
     return null
   }
 
-  for (const { rect, sessionId } of rows) {
-    if (event.clientY >= rect.top && event.clientY <= rect.bottom) {
-      return rowAnchorFromRect(sessionId, rect, event.clientY)
+  for (const { bottom, sessionId, top } of rows) {
+    if (clientY >= top && clientY <= bottom) {
+      return rowAnchorFromBounds(sessionId, top, bottom, clientY)
     }
   }
 
@@ -234,10 +248,10 @@ export function sessionDropAnchor(
     const current = rows[index]
     const next = rows[index + 1]
 
-    if (event.clientY > current.rect.bottom && event.clientY < next.rect.top) {
-      const gapMidpoint = current.rect.bottom + (next.rect.top - current.rect.bottom) / 2
+    if (clientY > current.bottom && clientY < next.top) {
+      const gapMidpoint = current.bottom + (next.top - current.bottom) / 2
 
-      return event.clientY < gapMidpoint
+      return clientY < gapMidpoint
         ? { before: false, sessionId: current.sessionId }
         : { before: true, sessionId: next.sessionId }
     }
@@ -246,11 +260,11 @@ export function sessionDropAnchor(
   const first = rows[0]
   const last = rows[rows.length - 1]
 
-  if (event.clientY < first.rect.top) {
+  if (clientY < first.top) {
     return { before: true, sessionId: first.sessionId }
   }
 
-  if (event.clientY > last.rect.bottom) {
+  if (clientY > last.bottom) {
     return { before: false, sessionId: last.sessionId }
   }
 

@@ -135,6 +135,7 @@ import {
   frozenSectionKeyFromPoint,
   previewItemsForSessionDrop,
   type SessionDropAnchor,
+  sessionDropAnchorFromCandidates,
   useSessionDropZone
 } from './use-session-drop-zone'
 import { VirtualSessionList } from './virtual-session-list'
@@ -1108,6 +1109,43 @@ export function ChatSidebar({
     [sessionSectionForId]
   )
 
+  const sessionDropAnchorForPointer = useCallback(
+    (event: DragMoveEvent | DragOverEvent | DragEndEvent, targetSectionKey: null | SidebarSessionDropSectionKey) => {
+      const centerY = activeDragCenterY(event)
+
+      if (centerY == null || !targetSectionKey || typeof document === 'undefined') {
+        return null
+      }
+
+      const section = document.querySelector<HTMLElement>(`[data-sidebar-session-section="${targetSectionKey}"]`)
+
+      if (!section) {
+        return null
+      }
+
+      const movingId = String(event.active.id)
+      const candidates = [...section.querySelectorAll<HTMLElement>('[data-session-id]')]
+        .map(row => {
+          const sessionId = row.dataset.sessionId
+
+          if (!sessionId || sessionId === movingId || sessionSectionForId(sessionId) !== targetSectionKey) {
+            return null
+          }
+
+          const rect = row.getBoundingClientRect()
+
+          return { bottom: rect.bottom, sessionId, top: rect.top }
+        })
+        .filter((candidate): candidate is { bottom: number; sessionId: string; top: number } => Boolean(candidate))
+
+      return sessionDropAnchorFromCandidates(candidates, centerY, {
+        movingSessionId: movingId,
+        previous: sidebarPointerDragRef.current?.anchor
+      })
+    },
+    [sessionSectionForId]
+  )
+
   const pointerTargetSectionForEvent = useCallback(
     (event: DragMoveEvent | DragOverEvent | DragEndEvent) => {
       const centerY = activeDragCenterY(event)
@@ -1225,7 +1263,7 @@ export function ChatSidebar({
     }
 
     const targetSectionKey = pointerTargetSectionForEvent(event)
-    const anchor = sessionDropAnchorForOver(event, targetSectionKey)
+    const anchor = sessionDropAnchorForPointer(event, targetSectionKey) ?? sessionDropAnchorForOver(event, targetSectionKey)
 
     patchSidebarPointerDrag({
       anchor: anchor ?? (targetSectionKey === current.targetSectionKey ? current.anchor : null),
@@ -1241,7 +1279,7 @@ export function ChatSidebar({
     }
 
     const targetSectionKey = pointerTargetSectionForEvent(event)
-    const anchor = sessionDropAnchorForOver(event, targetSectionKey)
+    const anchor = sessionDropAnchorForPointer(event, targetSectionKey) ?? sessionDropAnchorForOver(event, targetSectionKey)
 
     patchSidebarPointerDrag({
       anchor: anchor ?? (targetSectionKey === current.targetSectionKey ? current.anchor : null),
