@@ -1124,6 +1124,7 @@ export function ChatSidebar({
       }
 
       const movingId = String(event.active.id)
+
       const candidates = [...section.querySelectorAll<HTMLElement>('[data-session-id]')]
         .map(row => {
           const sessionId = row.dataset.sessionId
@@ -1254,6 +1255,35 @@ export function ChatSidebar({
       targetSectionKey: drag.sourceSectionKey
     })
   }
+
+  const handleNativeSessionDragStart = useCallback(
+    (payload: SessionDragPayload) => {
+      const inferredSection =
+        payload.archived ? 'archived' : payload.pinned ? 'pinned' : sessionSectionForId(payload.id)
+
+      const sourceSectionKey = isSidebarSessionDropSectionKey(inferredSection) ? inferredSection : undefined
+
+      if (!sourceSectionKey) {
+        resetSidebarPointerDrag()
+
+        return
+      }
+
+      freezeSidebarSectionBands()
+      setSidebarPointerDrag({
+        anchor: null,
+        overlayWidth: null,
+        payload,
+        sourceSectionKey,
+        targetSectionKey: sourceSectionKey
+      })
+    },
+    [freezeSidebarSectionBands, resetSidebarPointerDrag, sessionSectionForId, setSidebarPointerDrag]
+  )
+
+  const handleNativeSessionDragEnd = useCallback(() => {
+    resetSidebarPointerDrag()
+  }, [resetSidebarPointerDrag])
 
   const handleSidebarDragMove = (event: DragMoveEvent) => {
     const current = sidebarPointerDragRef.current
@@ -1594,6 +1624,8 @@ export function ChatSidebar({
                     onReorder={handlePinnedDragEnd}
                     onRestoreSessions={onRestoreSessions}
                     onResumeSession={onResumeSession}
+                    onSessionDragEnd={handleNativeSessionDragEnd}
+                    onSessionDragStart={handleNativeSessionDragStart}
                     onToggle={() => setSidebarPinsOpen(!pinsOpen)}
                     onTogglePin={unpinSession}
                     open={pinsOpen}
@@ -1701,6 +1733,8 @@ export function ChatSidebar({
                     onReorder={showAllProfiles ? undefined : handleAgentDragEnd}
                     onRestoreSessions={onRestoreSessions}
                     onResumeSession={onResumeSession}
+                    onSessionDragEnd={handleNativeSessionDragEnd}
+                    onSessionDragStart={handleNativeSessionDragStart}
                     onToggle={() => setSidebarRecentsOpen(!agentsOpen)}
                     onTogglePin={pinSession}
                     open={agentsOpen}
@@ -1825,6 +1859,8 @@ export function ChatSidebar({
                     onRestoreSession={onRestoreSession}
                     onRestoreSessions={onRestoreSessions}
                     onResumeSession={onResumeSession}
+                    onSessionDragEnd={handleNativeSessionDragEnd}
+                    onSessionDragStart={handleNativeSessionDragStart}
                     onToggle={() => {
                       const next = !archivedOpen
                       setSidebarArchivedOpen(next)
@@ -2081,6 +2117,8 @@ interface SidebarSessionsSectionProps {
   sessionDragEnabled?: boolean
   sourceSectionKey?: null | string
   onReorder?: (event: DragEndEvent) => void
+  onSessionDragEnd?: () => void
+  onSessionDragStart?: (payload: SessionDragPayload) => void
   dndSensors?: ReturnType<typeof useSensors>
   ownDndContext?: boolean
   dropActive?: boolean
@@ -2090,7 +2128,7 @@ interface SidebarSessionsSectionProps {
   onDeleteSessions?: (sessionIds: string[]) => Promise<unknown> | void
 }
 
-function SidebarSessionsSection({
+export function SidebarSessionsSection({
   label,
   open,
   onToggle,
@@ -2120,6 +2158,8 @@ function SidebarSessionsSection({
   sessionDragEnabled = false,
   sourceSectionKey,
   onReorder,
+  onSessionDragEnd,
+  onSessionDragStart,
   dndSensors,
   ownDndContext = true,
   dropActive = false,
@@ -2184,6 +2224,8 @@ function SidebarSessionsSection({
       onRestore: onRestoreSession ? () => onRestoreSession(session.id) : undefined,
       onRestoreSelectedSessions: onRestoreSessions,
       onResume: () => onResumeSession(session.id),
+      onSessionDragEnd,
+      onSessionDragStart,
       onToggleSelect: sectionKey ? (mode: 'range' | 'single') => handleToggleSelect(session.id, mode) : undefined,
       selectable,
       selectionActive,
@@ -2293,6 +2335,8 @@ function SidebarSessionsSection({
         onRestoreSession={onRestoreSession}
         onRestoreSessions={onRestoreSessions}
         onResumeSession={onResumeSession}
+        onSessionDragEnd={onSessionDragEnd}
+        onSessionDragStart={onSessionDragStart}
         onTogglePin={onTogglePin}
         onToggleSelect={sectionKey ? handleToggleSelect : undefined}
         pinned={pinned}
