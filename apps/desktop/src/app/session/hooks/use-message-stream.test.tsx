@@ -24,6 +24,7 @@ function MessageStreamHarness({ activeSessionId = 'session-1' }: { activeSession
     queryClient: queryClientRef.current,
     refreshHermesConfig: vi.fn(async () => undefined),
     refreshSessions: vi.fn(async () => undefined),
+    sessionStateByRuntimeIdRef: statesRef,
     updateSessionState: (sessionId, updater, storedSessionId) => {
       const previous = statesRef.current.get(sessionId) ?? createClientSessionState(null)
       const state = storedSessionId === undefined ? previous : { ...previous, storedSessionId }

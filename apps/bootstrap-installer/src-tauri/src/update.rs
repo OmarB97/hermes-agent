@@ -3,8 +3,9 @@
 //! Driven when the installer is launched as `Hermes-Setup.exe --update` (see
 //! `AppMode` in lib.rs). The desktop app hands off to us — it exits, then we:
 //!
-//!   1. wait for the old Hermes desktop process to fully exit (so the venv
-//!      shim is free; otherwise `hermes update` aborts with exit code 2),
+//!   1. wait for the old Hermes desktop process to fully exit (so both the
+//!      venv shim and packaged app.asar are free; otherwise `hermes update`
+//!      or repair bootstrap can race locked files),
 //!   2. run `hermes update --yes --gateway` (Python/repo update; this does NOT
 //!      rebuild apps/desktop by design — see cmd_update in hermes_cli/main.py),
 //!   3. run `hermes desktop --build-only` (the rebuild step update skips),
@@ -40,8 +41,8 @@ use crate::events::{BootstrapEvent, LogStream, StageInfo, StageState};
 /// hermes_cli/main.py (sys.exit(2)). We surface a targeted message for this.
 const UPDATE_EXIT_CONCURRENT: i32 = 2;
 
-/// How long to wait for the old desktop process to release the venv shim
-/// before giving up and letting `hermes update`'s own guard decide.
+/// How long to wait for the old desktop process to release files under the
+/// install tree before giving up and letting `hermes update`'s own guard decide.
 const DESKTOP_EXIT_WAIT: Duration = Duration::from_secs(20);
 const DESKTOP_EXIT_POLL: Duration = Duration::from_millis(500);
 
@@ -308,7 +309,7 @@ async fn run_update(app: AppHandle) -> Result<()> {
     emit_stage(&app, "rebuild", StageState::Running, None, None);
     let started = Instant::now();
     let rebuild_args: Vec<String> = vec!["desktop".into(), "--build-only".into()];
-    let rebuild = run_streamed(
+    let mut rebuild = run_streamed(
         &app,
         &hermes,
         &rebuild_args,
@@ -317,6 +318,33 @@ async fn run_update(app: AppHandle) -> Result<()> {
         Some("rebuild"),
     )
     .await?;
+
+    // Retry-once: the first `--build-only` can return nonzero on a still-settling
+    // post-update tree or a network-blocked Electron fetch that our self-heal
+    // repaired mid-run. A second attempt then builds clean off the healed dist
+    // (the content-hash stamp makes it a near-no-op when the first actually
+    // succeeded). Without this the updater bails here and never reaches the
+    // relaunch below — the app updates but doesn't restart. Matches the
+    // retry-once `hermes update` already does above, and `hermes update`'s own
+    // desktop rebuild in cmd_update.
+    if rebuild_needs_retry(rebuild.exit_code) {
+        emit_log(
+            &app,
+            Some("rebuild"),
+            LogStream::Stdout,
+            "[rebuild] first desktop rebuild failed; retrying once (a self-healed \
+             Electron download builds clean on the second run)…",
+        );
+        rebuild = run_streamed(
+            &app,
+            &hermes,
+            &rebuild_args,
+            &install_root,
+            &child_env,
+            Some("rebuild"),
+        )
+        .await?;
+    }
     let rebuild_ms = started.elapsed().as_millis() as u64;
 
     if rebuild.exit_code != Some(0) {
@@ -695,6 +723,14 @@ fn is_locked(path: &Path) -> bool {
         Ok(_) => false,
         Err(_) => true,
     }
+}
+
+/// Whether the `desktop --build-only` rebuild should be retried once. Any
+/// non-success exit qualifies: the common cause is a transient first-attempt
+/// failure (still-settling tree / self-healed Electron download) that a clean
+/// second run resolves.
+fn rebuild_needs_retry(exit_code: Option<i32>) -> bool {
+    exit_code != Some(0)
 }
 
 /// Spawn `hermes <args>` from `cwd`, stream stdout/stderr as Log events on the
@@ -1153,6 +1189,16 @@ mod tests {
             Some("main".to_string())
         );
         assert_eq!(update_branch_from_args(["--update"]), None);
+    }
+
+    #[test]
+    fn rebuild_retries_only_on_failure() {
+        assert!(!rebuild_needs_retry(Some(0)), "a clean rebuild must not retry");
+        assert!(rebuild_needs_retry(Some(1)), "a failed rebuild retries once");
+        assert!(
+            rebuild_needs_retry(None),
+            "a killed/signalled rebuild (no exit code) retries once"
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 import type { ThreadMessageLike } from '@assistant-ui/react'
 
+import { dedupeGeneratedImageEchoesInParts } from '@/lib/generated-images'
 import { mediaDisplayLabel, mediaMarkdownHref } from '@/lib/media'
 import { redactSensitiveText, redactSensitiveValue } from '@/lib/secret-redaction'
 import { parseTodos } from '@/lib/todos'
@@ -62,11 +63,14 @@ export type GatewayEventPayload = {
   // approval.request (dangerous command / execute_code) — session-keyed
   command?: string
   description?: string
+  // False when a tirith content-security warning forbids a permanent allow.
+  allow_permanent?: boolean
   // secret.request (skill credential capture)
   env_var?: string
   prompt?: string
   // status.update (gateway lifecycle statuses: compression progress,
-  // background-process notices)
+  // background-process notices; kind=process → background process
+  // completion/watch-match)
   kind?: string
   // gateway.ready (the emitting gateway's resolved device name)
   device_name?: string
@@ -185,75 +189,46 @@ function displayContentForMessage(role: SessionMessage['role'], content: unknown
   return [refs.join('\n'), visibleText].filter(Boolean).join('\n\n') || visibleText
 }
 
-export function appendTextPart(parts: ChatMessagePart[], delta: string): ChatMessagePart[] {
-  const next = [...parts]
-  const last = next.at(-1)
-
-  if (last?.type === 'text') {
-    next[next.length - 1] = { ...last, text: `${last.text}${delta}` }
-
-    return next
-  }
-
-  next.push(textPart(delta))
-
-  return next
+const STREAM_PART: Record<'reasoning' | 'text', (text: string) => ChatMessagePart> = {
+  reasoning: reasoningPart,
+  text: textPart
 }
 
-export function appendAssistantTextPart(parts: ChatMessagePart[], delta: string): ChatMessagePart[] {
+// Coalesce a streaming delta into the most recent same-type part within the
+// current segment, where a segment is bounded by any non-streaming part (a
+// tool call, image, …). The opposite streaming channel (text <-> reasoning) is
+// transparent, so a reasoning burst between two content deltas can't shred one
+// sentence into text / Thinking / text — the fragmentation models that
+// interleave reasoning_content + content otherwise produce. Tool calls still
+// open a fresh part, preserving narration order across steps.
+function appendStreamPart(
+  parts: ChatMessagePart[],
+  type: 'reasoning' | 'text',
+  delta: string
+): { index: number; parts: ChatMessagePart[] } {
   const next = [...parts]
-  let textIndex = next.length - 1
 
-  if (next[textIndex]?.type !== 'text') {
-    textIndex = -1
+  for (let i = next.length - 1; i >= 0; i--) {
+    const part = next[i]
 
-    // Reasoning rows are chrome around the model voice; tool rows are
-    // chronology. Continue prose through trailing reasoning, but never move it
-    // backward across a tool call.
-    for (let index = next.length - 1; index >= 0; index -= 1) {
-      const part = next[index]
+    if (part.type === type) {
+      next[i] = { ...part, text: `${(part as { text: string }).text}${delta}` } as ChatMessagePart
 
-      if (part.type === 'text') {
-        textIndex = index
+      return { index: i, parts: next }
+    }
 
-        break
-      }
-
-      if (part.type !== 'reasoning') {
-        break
-      }
+    if (part.type !== 'text' && part.type !== 'reasoning') {
+      break
     }
   }
 
-  if (textIndex === -1) {
-    next.push(textPart(delta))
-    textIndex = next.length - 1
-  } else {
-    const part = next[textIndex]
+  next.push(STREAM_PART[type](delta))
 
-    if (part?.type === 'text') {
-      next[textIndex] = { ...part, text: `${part.text}${delta}` }
-    } else {
-      next.push(textPart(delta))
-      textIndex = next.length - 1
-    }
-  }
+  return { index: next.length - 1, parts: next }
+}
 
-  const last = next[textIndex]
-
-  if (last?.type === 'text') {
-    const current = last.text
-
-    const deltaMayContainMedia =
-      delta.includes('MEDIA:') || delta.includes('DIA:') || delta.includes('EDIA:') || delta.includes('IA:')
-
-    const redacted = redactSensitiveText(current)
-    const needsMediaPass = deltaMayContainMedia || redacted.includes('MEDIA:')
-    const nextText = needsMediaPass ? renderMediaTags(redacted) : redacted
-    next[textIndex] = nextText === current ? last : { ...last, text: nextText }
-  }
-
-  return next
+export function appendTextPart(parts: ChatMessagePart[], delta: string): ChatMessagePart[] {
+  return appendStreamPart(parts, 'text', delta).parts
 }
 
 function appendAssistantParts(parts: ChatMessagePart[], appended: ChatMessagePart[]): ChatMessagePart[] {
@@ -275,16 +250,43 @@ function shouldAppendToActiveAssistant(active: ChatMessage, nextParts: ChatMessa
 }
 
 export function appendReasoningPart(parts: ChatMessagePart[], delta: string): ChatMessagePart[] {
-  const next = [...parts]
-  const last = next.at(-1)
+  const { index, parts: next } = appendStreamPart(parts, 'reasoning', delta)
+  const part = next[index]
 
-  if (last?.type === 'reasoning') {
-    next[next.length - 1] = { ...last, text: redactSensitiveText(`${last.text}${delta}`) }
+  // Keep reasoning transcripts scrubbed of captured secrets (Rule D): redact the
+  // coalesced text, not just the delta, so a secret split across deltas can't slip
+  // through the seam.
+  if (part?.type === 'reasoning') {
+    const redacted = redactSensitiveText(part.text)
 
+    if (redacted !== part.text) {
+      next[index] = { ...part, text: redacted }
+    }
+  }
+
+  return next
+}
+
+export function appendAssistantTextPart(parts: ChatMessagePart[], delta: string): ChatMessagePart[] {
+  const { index, parts: next } = appendStreamPart(parts, 'text', delta)
+  const part = next[index]
+
+  if (part?.type !== 'text') {
     return next
   }
 
-  next.push(reasoningPart(delta))
+  const mayContainMedia =
+    delta.includes('MEDIA:') || delta.includes('DIA:') || delta.includes('EDIA:') || delta.includes('IA:')
+
+  // Redact captured secrets from visible assistant text before any media pass
+  // (Rule D). Redact the coalesced text so a secret spanning deltas is caught.
+  const redacted = redactSensitiveText(part.text)
+  const needsMediaPass = mayContainMedia || redacted.includes('MEDIA:')
+  const nextText = needsMediaPass ? renderMediaTags(redacted) : redacted
+
+  if (nextText !== part.text) {
+    next[index] = { ...part, text: nextText }
+  }
 
   return next
 }
@@ -881,8 +883,12 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
   })
   flushPendingTools(messages.length)
 
+  const withoutGeneratedImageEchoes = result.map(message =>
+    message.role === 'assistant' ? { ...message, parts: dedupeGeneratedImageEchoesInParts(message.parts) } : message
+  )
+
   return withUniqueToolCallIds(
-    result.filter(m => chatMessageText(m).trim() || m.parts.some(part => part.type !== 'text'))
+    withoutGeneratedImageEchoes.filter(m => chatMessageText(m).trim() || m.parts.some(part => part.type !== 'text'))
   )
 }
 

@@ -35,6 +35,9 @@ export function SessionPickerDialog({
 
   const sessionsQuery = useQuery({
     enabled: open,
+    // Rule B (fork): flat, single-scope session list — do NOT span all profiles
+    // (upstream's listAllProfileSessions reintroduces profile-scoping the fork
+    // deliberately suppresses).
     queryFn: () => listSessions(200, 1, 'exclude'),
     queryKey: ['session-picker', 'sessions']
   })

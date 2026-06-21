@@ -594,11 +594,11 @@ export default function SkillsPage() {
                               )}
                               <div className="mt-3">
                                 <Button
-                                  size="xs"
+                                  size="sm"
                                   outlined
                                   onClick={() => setConfigToolset(ts)}
+                                  prefix={<Wrench />}
                                 >
-                                  <Wrench className="h-3 w-3 mr-1" />
                                   Configure
                                 </Button>
                               </div>

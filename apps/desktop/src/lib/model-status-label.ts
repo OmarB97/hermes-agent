@@ -21,6 +21,22 @@ export function defaultReasoningEffortLabel(effort: string): string {
   return reasoningEffortLabel(effort || 'none') || 'Off'
 }
 
+/** Which model/provider a picker should mark "current". With a live session the
+ *  gateway's `model.options` is authoritative; pre-session there is no server
+ *  "current", so the sticky composer pick wins over the profile default the
+ *  global options query returns — else the checkmark snaps back to the default
+ *  and the pick looks ignored. */
+export function currentPickerSelection(
+  hasSession: boolean,
+  store: { model: string; provider: string },
+  options?: { model?: string; provider?: string }
+): { model: string; provider: string } {
+  return {
+    model: String((hasSession && options?.model) || store.model || options?.model || ''),
+    provider: String((hasSession && options?.provider) || store.provider || options?.provider || '')
+  }
+}
+
 /** Strip provider prefix and normalize for display. */
 export function modelBaseId(model: string): string {
   const trimmed = model.trim()
@@ -71,6 +87,9 @@ export function modelDisplayParts(model: string): { name: string; tag: string } 
       break
     }
   }
+
+  // Drop a trailing date-pin (`…-20251101`) — snapshot noise, not a name.
+  base = base.replace(/-\d{8}$/, '')
 
   return { name: prettifyBase(base) || model.trim() || 'No model', tag }
 }

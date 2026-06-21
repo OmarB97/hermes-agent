@@ -1,15 +1,14 @@
 import { useStore } from '@nanostores/react'
-import type { ReactNode } from 'react'
 import { useCallback, useMemo } from 'react'
 
 import type { CommandCenterSection } from '@/app/command-center'
 import { $terminalTakeover, setTerminalTakeover } from '@/app/right-sidebar/store'
 import { GatewayMenuPanel } from '@/app/shell/gateway-menu-panel'
+import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { useI18n } from '@/i18n'
 import {
   Activity,
   AlertCircle,
-  ChevronDown,
   Clock,
   Command,
   Hash,
@@ -19,7 +18,6 @@ import {
   Zap,
   ZapFilled
 } from '@/lib/icons'
-import { formatModelStatusLabel } from '@/lib/model-status-label'
 import type { RuntimeReadinessResult } from '@/lib/runtime-readiness'
 import { contextBarLabel, contextCapacityClassName, LiveDuration, usageContextLabel } from '@/lib/statusbar'
 import { cn } from '@/lib/utils'
@@ -30,20 +28,16 @@ import {
   $activeSessionId,
   $busy,
   $connection,
-  $currentFastMode,
-  $currentModel,
-  $currentProvider,
-  $currentReasoningEffort,
   $currentUsage,
   $sessionActivityStatus,
   $sessionStartedAt,
   $turnStartedAt,
   $workingSessionIds,
   $yoloActive,
-  setModelPickerOpen,
   setYoloActive
 } from '@/store/session'
 import { $subagentsBySession, activeSubagentCount } from '@/store/subagents'
+import { $gatewayRestarting } from '@/store/system-actions'
 import {
   $backendUpdateApply,
   $backendUpdateStatus,
@@ -67,7 +61,6 @@ interface StatusbarItemsOptions {
   gatewayLogLines: readonly string[]
   gatewayState: string
   inferenceStatus: RuntimeReadinessResult | null
-  modelMenuContent?: ReactNode
   openAgents: () => void
   openCommandCenterSection: (section: CommandCenterSection) => void
   freshDraftReady: boolean
@@ -85,7 +78,6 @@ export function useStatusbarItems({
   gatewayLogLines,
   gatewayState,
   inferenceStatus,
-  modelMenuContent,
   openAgents,
   openCommandCenterSection,
   freshDraftReady,
@@ -99,12 +91,9 @@ export function useStatusbarItems({
   const terminalTakeover = useStore($terminalTakeover)
   const yoloActive = useStore($yoloActive)
   const busy = useStore($busy)
-  const currentFastMode = useStore($currentFastMode)
-  const currentModel = useStore($currentModel)
-  const currentProvider = useStore($currentProvider)
-  const currentReasoningEffort = useStore($currentReasoningEffort)
   const currentUsage = useStore($currentUsage)
   const desktopActionTasks = useStore($desktopActionTasks)
+  const gatewayRestarting = useStore($gatewayRestarting)
   const previewServerRestartStatus = useStore($previewServerRestartStatus)
   const sessionActivityStatus = useStore($sessionActivityStatus)
   const sessionStartedAt = useStore($sessionStartedAt)
@@ -327,9 +316,15 @@ export function useStatusbarItems({
         variant: 'action'
       },
       {
-        className: gatewayClassName,
-        detail: gatewayDetail,
-        icon: inferenceReady ? <Activity className="size-3" /> : <AlertCircle className="size-3" />,
+        className: gatewayRestarting ? undefined : gatewayClassName,
+        detail: gatewayRestarting ? copy.gatewayRestarting : gatewayDetail,
+        icon: gatewayRestarting ? (
+          <GlyphSpinner ariaLabel={copy.gatewayRestarting} className="size-3" />
+        ) : inferenceReady ? (
+          <Activity className="size-3" />
+        ) : (
+          <AlertCircle className="size-3" />
+        ),
         id: 'gateway-health',
         label: copy.gateway,
         menuClassName: 'w-72',
@@ -382,6 +377,7 @@ export function useStatusbarItems({
       gatewayMenuContent,
       gatewayClassName,
       gatewayDetail,
+      gatewayRestarting,
       inferenceReady,
       inferenceStatus?.reason,
       openAgents,
@@ -442,37 +438,6 @@ export function useStatusbarItems({
         variant: 'action'
       },
       {
-        id: 'model-summary',
-        label: (
-          <span className="inline-flex min-w-0 items-center gap-0.5">
-            <span className="truncate">
-              {formatModelStatusLabel(currentModel, {
-                fastMode: currentFastMode,
-                reasoningEffort: currentReasoningEffort
-              })}
-            </span>
-            <ChevronDown className="size-2.5 shrink-0 opacity-50" />
-          </span>
-        ),
-        ...(modelMenuContent
-          ? {
-              menuAlign: 'end' as const,
-              menuClassName: 'w-64',
-              menuContent: modelMenuContent,
-              title: currentProvider
-                ? copy.modelTitle(currentProvider, currentModel || copy.modelNone)
-                : copy.switchModel,
-              variant: 'menu' as const
-            }
-          : {
-              onSelect: () => setModelPickerOpen(true),
-              title: currentProvider
-                ? copy.providerModelTitle(currentProvider, currentModel || copy.noModel)
-                : copy.openModelPicker,
-              variant: 'action' as const
-            })
-      },
-      {
         className: `w-7 justify-center px-0${terminalTakeover ? ' bg-accent/55 text-foreground' : ''}`,
         hidden: !chatOpen,
         icon: <Terminal className="size-3.5" />,
@@ -491,11 +456,6 @@ export function useStatusbarItems({
       contextCapacityClass,
       contextUsage,
       copy,
-      currentFastMode,
-      currentModel,
-      currentProvider,
-      currentReasoningEffort,
-      modelMenuContent,
       sessionActivityStatus,
       sessionStartedAt,
       showYoloToggle,
