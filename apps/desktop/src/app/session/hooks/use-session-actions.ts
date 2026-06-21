@@ -1165,14 +1165,33 @@ export function useSessionActions({
     setSessionsTotal(keptSessions.length)
 
     try {
-      const result = await bulkArchiveSessions([...preserveIds])
+      // FLATTENED SIDEBAR: the recents list merges sessions from every profile
+      // (default + remote/pool), but bulk-archive is profile-scoped. Archive
+      // each profile present in the list so remote/pool-owned rows (e.g. the
+      // autopilot's /goal runs, which live on another backend) actually persist
+      // as archived instead of resurfacing on the next refresh — the
+      // long-standing "archived sessions come back" bug.
+      const profiles = Array.from(
+        new Set(previousSessions.map(session => normalizeProfileKey(session.profile)).filter(Boolean))
+      )
+      if (profiles.length === 0) {
+        profiles.push(normalizeProfileKey($activeGatewayProfile.get()))
+      }
+
+      const results = await Promise.all(
+        profiles.map(profile =>
+          bulkArchiveSessions([...preserveIds], profile).catch(() => ({ ok: false, archived: 0 }))
+        )
+      )
+      const archived = results.reduce((sum, result) => sum + (result?.archived ?? 0), 0)
+
       notify({
         durationMs: 2_500,
         kind: 'success',
-        message: result.archived === 1 ? 'Archived 1 session' : `Archived ${result.archived} sessions`
+        message: archived === 1 ? 'Archived 1 session' : `Archived ${archived} sessions`
       })
 
-      return result
+      return { ok: true, archived }
     } catch (err) {
       setSessions(previousSessions)
       setSessionsTotal(previousTotal)
