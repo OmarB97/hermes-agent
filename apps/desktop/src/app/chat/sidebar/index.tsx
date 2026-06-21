@@ -122,8 +122,8 @@ import {
 } from '@/store/sidebar-selection'
 
 import { type AppView, ARTIFACTS_ROUTE, MESSAGING_ROUTE, SKILLS_ROUTE } from '../../routes'
-import { SidebarPanelLabel } from '../../shell/sidebar-label'
 import type { SidebarNavItem } from '../../types'
+import { SidebarCount, SidebarSectionHeader } from './section-header'
 
 import { CloudChannelsDialog } from './cloud-channels-dialog'
 import { SidebarCronJobsSection } from './cron-jobs-section'
@@ -1813,36 +1813,6 @@ function ArchiveAllSessionsDialog({ count, open, onConfirm, onOpenChange, submit
   )
 }
 
-interface SidebarSectionHeaderProps {
-  label: string
-  open: boolean
-  onToggle: () => void
-  action?: React.ReactNode
-  meta?: React.ReactNode
-  icon?: React.ReactNode
-}
-
-function SidebarSectionHeader({ label, open, onToggle, action, meta, icon }: SidebarSectionHeaderProps) {
-  return (
-    <div className="group/section flex shrink-0 items-center justify-between pb-1 pt-1.5">
-      <button
-        className="group/section-label flex w-fit items-center gap-1 bg-transparent text-left leading-none"
-        onClick={onToggle}
-        type="button"
-      >
-        {icon}
-        <SidebarPanelLabel>{label}</SidebarPanelLabel>
-        {meta && <SidebarCount>{meta}</SidebarCount>}
-        <DisclosureCaret
-          className="text-(--ui-text-tertiary) opacity-0 transition group-hover/section-label:opacity-100"
-          open={open}
-        />
-      </button>
-      {action}
-    </div>
-  )
-}
-
 function SidebarSessionSkeletons() {
   return (
     <div aria-hidden="true" className="grid gap-px">
@@ -2355,10 +2325,6 @@ interface SortableWorkspaceProps {
 
 function SortableSidebarWorkspaceGroup(props: SortableWorkspaceProps) {
   return <SidebarWorkspaceGroup {...props} {...useSortableBindings(groupDndId(props.group.id))} />
-}
-
-function SidebarCount({ children }: { children: React.ReactNode }) {
-  return <span className="text-[0.6875rem] font-medium text-(--ui-text-quaternary)">{children}</span>
 }
 
 type SortableSessionRowProps = React.ComponentProps<typeof SidebarSessionRow> & {
