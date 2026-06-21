@@ -806,6 +806,35 @@ export function DesktopController() {
     }
   }, [gatewayState, refreshCronJobs])
 
+  // Keep the sidebar session list live without a user action. Sessions get
+  // archived out-of-band — the always-on gateway's auto-archive maintenance, a
+  // second window, or another device — so a desktop that only refreshed on
+  // connect/explicit-action shows stale, already-archived rows that look like
+  // they "come back" after a manual archive. Poll the unified list on the same
+  // cadence as the cron section (and on tab re-focus) while connected so the
+  // sidebar reflects the backend. refreshSessions is request-deduped and merges
+  // by lineage, keeping pinned/active/working rows, so a poll never clobbers an
+  // in-flight optimistic archive.
+  useEffect(() => {
+    if (gatewayState !== 'open') {
+      return
+    }
+
+    const tick = () => {
+      if (document.visibilityState === 'visible') {
+        void refreshSessions()
+      }
+    }
+
+    const intervalId = window.setInterval(tick, CRON_POLL_INTERVAL_MS)
+    document.addEventListener('visibilitychange', tick)
+
+    return () => {
+      window.clearInterval(intervalId)
+      document.removeEventListener('visibilitychange', tick)
+    }
+  }, [gatewayState, refreshSessions])
+
   useEffect(() => {
     if (gatewayState === 'open' && !activeSessionId && freshDraftReady) {
       void refreshCurrentModel()
