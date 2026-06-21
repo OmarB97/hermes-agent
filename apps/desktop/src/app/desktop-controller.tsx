@@ -365,8 +365,9 @@ export function DesktopController() {
     setArchivedSessionsLoading(true)
 
     try {
-      const scope = $profileScope.get()
-      const profile = scope === ALL_PROFILES ? 'all' : scope
+      // FLATTENED SIDEBAR: device/profile is an abstraction — always aggregate
+      // every profile/device into one unified list.
+      const profile = 'all'
       const limit = wantPage ? $archivedSessionsLimit.get() : 1
 
       const result = await listAllProfileSessions(limit, 0, 'only', 'recent', profile, {
@@ -431,7 +432,9 @@ export function DesktopController() {
       // Scope the fetch to the active profile (not always 'all') so a profile
       // with few recent sessions isn't windowed out of the cross-profile
       // recency page — the empty-history-on-profile-switch bug.
-      const sessionProfile = profileScope === ALL_PROFILES ? 'all' : profileScope
+      // FLATTENED SIDEBAR: always fetch the unified cross-profile list so every
+      // device's sessions appear in one flat, reorderable list.
+      const sessionProfile = 'all'
 
       const result = await listAllProfileSessions(limit, 1, 'exclude', 'recent', sessionProfile, {
         excludeSources: SIDEBAR_EXCLUDED_SOURCES

@@ -89,36 +89,4 @@ describe('VirtualSessionList drag behavior', () => {
     expect(onPointerDown).toHaveBeenCalledTimes(1)
     expect(onSessionDragStart).not.toHaveBeenCalled()
   })
-
-  it('renders a cross-section preview row as pointer-dnd visual state, not a native drag source', () => {
-    render(
-      <DndContext>
-        <SortableContext items={['s1', 'moving']}>
-          <VirtualSessionList
-            activeSessionId={null}
-            draggingSessionId="moving"
-            dropActive
-            onArchiveSession={vi.fn()}
-            onDeleteSession={vi.fn()}
-            onResumeSession={vi.fn()}
-            onTogglePin={vi.fn()}
-            pinned
-            sectionKey="pinned"
-            sessionDragEnabled
-            sessions={[session(), session({ id: 'moving', title: 'Moving session' })]}
-            sortable
-            sourceSectionKey="sessions"
-            workingSessionIdSet={new Set()}
-          />
-        </SortableContext>
-      </DndContext>
-    )
-
-    const previewRow = screen.getByText('Moving session').closest('[data-session-id]') as HTMLElement
-    const previewChrome = previewRow.querySelector('[data-session-row-chrome]') as HTMLElement
-
-    expect(previewRow.draggable).toBe(false)
-    expect(previewRow.dataset.sessionDragSource).toBeUndefined()
-    expect(previewChrome.className).toContain('opacity-60')
-  })
 })

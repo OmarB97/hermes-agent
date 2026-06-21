@@ -40,7 +40,6 @@ interface SessionRowCommonProps {
 interface VirtualSessionListProps {
   activeSessionId: null | string
   className?: string
-  dropActive?: boolean
   onArchiveSession: (sessionId: string) => void
   onDeleteSession: (sessionId: string) => void
   onResumeSession: (sessionId: string) => void
@@ -64,8 +63,6 @@ interface VirtualSessionListProps {
   selectedSessionIds?: readonly string[]
   selectedIds?: ReadonlySet<string>
   sectionKey?: string
-  sessionDragEnabled?: boolean
-  sourceSectionKey?: null | string
   onToggleSelect?: (sessionId: string, mode: 'range' | 'single') => void
   onArchiveSessions?: (sessionIds: string[]) => Promise<unknown> | void
   onDeleteSessions?: (sessionIds: string[]) => Promise<unknown> | void
@@ -96,7 +93,6 @@ function sessionDragPayloadFor(
 export const VirtualSessionList: FC<VirtualSessionListProps> = ({
   activeSessionId,
   className,
-  dropActive = false,
   onArchiveSession,
   onDeleteSession,
   onResumeSession,
@@ -117,8 +113,6 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
   selectedSessionIds,
   selectedIds,
   sectionKey,
-  sessionDragEnabled = false,
-  sourceSectionKey,
   onToggleSelect,
   onArchiveSessions,
   onDeleteSessions,
@@ -182,10 +176,7 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
 
     const presence = presenceBySession?.get(session.id)
 
-    const crossSectionPreview =
-      sessionDragEnabled && dropActive && draggingSessionId === session.id && sourceSectionKey !== sectionKey
-
-    return (sessionDragEnabled || sortable) && !crossSectionPreview ? (
+    return sortable ? (
       <VirtualSortableSessionRow
         archived={archived}
         commonProps={commonProps}
@@ -202,10 +193,10 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
         {...commonProps}
         data-index={virtualItem.index}
         key={session.id}
-        nativeDraggable={!crossSectionPreview}
+        nativeDraggable
         presence={presence}
         ref={virtualizer.measureElement}
-        reorderable={reorderable || crossSectionPreview}
+        reorderable={reorderable}
         session={session}
       />
     )
