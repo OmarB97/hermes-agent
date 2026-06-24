@@ -1397,6 +1397,7 @@ export const zh: Translations = {
     cloudHostOffline: '主机离线',
     cloudParticipantLabel: (device, count) => `${device} x${count}`,
     allPinned: '这里的全部已置顶。取消置顶某个对话即可在最近中显示。',
+    recentsEmpty: '暂无最近对话',
     shiftClickHint: 'Shift+ 单击对话以置顶 · 拖动以重新排序',
     noWorkspace: '无工作区',
     newSessionIn: label => `在 ${label} 中新建会话`,

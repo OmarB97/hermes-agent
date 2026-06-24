@@ -1334,6 +1334,7 @@ export const ja = defineLocale({
     cloudHostOffline: 'ホストオフライン',
     cloudParticipantLabel: (device, count) => `${device} x${count}`,
     allPinned: 'ここにあるものはすべてピン留めされています。チャットのピン留めを解除すると最近のものに表示されます。',
+    recentsEmpty: '最近のチャットはありません',
     shiftClickHint: 'Shift クリックでピン留め · ドラッグで並べ替え',
     noWorkspace: 'ワークスペースなし',
     newSessionIn: label => `${label} で新しいセッション`,

@@ -866,9 +866,13 @@ export function ChatSidebar({
   }, [displayAgentGroups, showAllProfiles, workspaceOrderIds])
 
   // Skeletons are a first-load-only affordance; background refreshes keep
-  // flipping $sessionsLoading and must not re-flash the section. See
-  // ./session-visibility.
-  const { showSessionSections, showSessionSkeletons } = deriveSidebarSessionVisibility({
+  // flipping $sessionsLoading and must not re-flash the section. The area also
+  // mounts for pinned/cron/archived content on its own, not just recents, so an
+  // empty-recents account still sees those sections. See ./session-visibility.
+  const { recentsEmptyState, showSessionSections, showSessionSkeletons } = deriveSidebarSessionVisibility({
+    hasArchived: archivedTotal > 0 || archivedSessions.length > 0,
+    hasCronJobs: cronJobs.length > 0,
+    hasPinned: pinnedSessions.length > 0,
     sessionCount: sortedSessions.length,
     sessionsInitialLoadComplete,
     sessionsLoading
@@ -1483,7 +1487,15 @@ export function ChatSidebar({
                     )}
                     dndSensors={dndSensors}
                     draggingSessionId={dndDrag?.activeId}
-                    emptyState={showSessionSkeletons ? <SidebarSessionSkeletons /> : <SidebarAllPinnedState />}
+                    emptyState={
+                      recentsEmptyState === 'skeletons' ? (
+                        <SidebarSessionSkeletons />
+                      ) : recentsEmptyState === 'empty' ? (
+                        <SidebarRecentsEmptyState />
+                      ) : (
+                        <SidebarAllPinnedState />
+                      )
+                    }
                     footer={
                       // Hide "load more" only when workspace-grouped (those groups page
                       // themselves). ALL-profiles now pages per-profile from each profile
@@ -1840,6 +1852,20 @@ function SidebarAllPinnedState() {
   return (
     <div className="grid min-h-24 place-items-center rounded-lg text-center text-xs text-(--ui-text-tertiary)">
       {t.sidebar.allPinned}
+    </div>
+  )
+}
+
+// Shown in the recents list when there are genuinely no recent sessions (the
+// area is only mounted because pinned/cron/archived have content). Distinct from
+// SidebarAllPinnedState, whose "unpin a chat" copy only fits when recents exist
+// but are all pinned.
+function SidebarRecentsEmptyState() {
+  const { t } = useI18n()
+
+  return (
+    <div className="grid min-h-24 place-items-center rounded-lg text-center text-xs text-(--ui-text-tertiary)">
+      {t.sidebar.recentsEmpty}
     </div>
   )
 }
