@@ -68,7 +68,11 @@ async function gitRootFor(start: string) {
   let cached = gitRootCache.get(key)
 
   if (!cached) {
-    cached = desktopGitRoot(start)
+    // Normalize before the IPC, not just for the cache key: a raw Windows path
+    // (C:\repo) and its cleaned form (C:/repo) collapse to one cache entry, so
+    // the arg handed to the main process must be the cleaned path too —
+    // otherwise it depends on which spelling populated the cache first.
+    cached = desktopGitRoot(clean(start))
     gitRootCache.set(key, cached)
   }
 
