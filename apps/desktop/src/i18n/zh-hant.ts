@@ -1287,6 +1287,7 @@ export const zhHant = defineLocale({
     cloudHostOffline: '主機離線',
     cloudParticipantLabel: (device, count) => `${device} x${count}`,
     allPinned: '這裡的全部已釘選。取消釘選某個聊天即可在最近中顯示。',
+    recentsEmpty: '沒有最近的聊天',
     shiftClickHint: 'Shift + 點擊聊天以釘選 · 拖曳以重新排序',
     noWorkspace: '無工作區',
     newSessionIn: label => `在 ${label} 中新建工作階段`,

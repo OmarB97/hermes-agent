@@ -1213,6 +1213,7 @@ export const en: Translations = {
     cloudHostOffline: 'host offline',
     cloudParticipantLabel: (device, count) => `${device} x${count}`,
     allPinned: 'Everything here is pinned. Unpin a chat to show it in recents.',
+    recentsEmpty: 'No recent chats',
     shiftClickHint: 'Shift-click a chat to pin',
     noWorkspace: 'No workspace',
     newSessionIn: label => `New session in ${label}`,
