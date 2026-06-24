@@ -108,6 +108,7 @@ import {
   $selectedStoredSessionId,
   $sessionProfileTotals,
   $sessions,
+  $sessionsInitialLoadComplete,
   $sessionsLoading,
   $sessionsTotal,
   $workingSessionIds,
@@ -131,6 +132,7 @@ import { SidebarLoadMoreRow } from './load-more-row'
 import { ProfileRail } from './profile-switcher'
 import { SelectionActionBar } from './selection-action-bar'
 import { SidebarSessionRow } from './session-row'
+import { deriveSidebarSessionVisibility } from './session-visibility'
 import { VirtualSessionList } from './virtual-session-list'
 
 const VIRTUALIZE_THRESHOLD = 25
@@ -407,6 +409,7 @@ export function ChatSidebar({
   const messagingPlatformTotals = useStore($messagingPlatformTotals)
   const messagingTruncated = useStore($messagingTruncated)
   const sessionsLoading = useStore($sessionsLoading)
+  const sessionsInitialLoadComplete = useStore($sessionsInitialLoadComplete)
   const sessionsTotal = useStore($sessionsTotal)
   const sessionProfileTotals = useStore($sessionProfileTotals)
   const workingSessionIds = useStore($workingSessionIds)
@@ -862,9 +865,14 @@ export function ChatSidebar({
     }
   }, [displayAgentGroups, showAllProfiles, workspaceOrderIds])
 
-  const showSessionSkeletons = sessionsLoading && sortedSessions.length === 0
-
-  const showSessionSections = showSessionSkeletons || sortedSessions.length > 0
+  // Skeletons are a first-load-only affordance; background refreshes keep
+  // flipping $sessionsLoading and must not re-flash the section. See
+  // ./session-visibility.
+  const { showSessionSections, showSessionSkeletons } = deriveSidebarSessionVisibility({
+    sessionCount: sortedSessions.length,
+    sessionsInitialLoadComplete,
+    sessionsLoading
+  })
 
   // ──────────────────────────────────────────────────────────────────────────
   // Canonical dnd-kit multi-container engine.
