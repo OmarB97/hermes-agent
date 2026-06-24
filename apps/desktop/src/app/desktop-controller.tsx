@@ -81,6 +81,7 @@ import {
   setMessagingTruncated,
   setSessionProfileTotals,
   setSessions,
+  setSessionsInitialLoadComplete,
   setSessionsLoading,
   setSessionsTotal
 } from '../store/session'
@@ -448,6 +449,12 @@ export function DesktopController() {
         setSessions(prev => mergeSessionPage(prev, result.sessions, sessionsToKeep()))
         setSessionsTotal(typeof result.total === 'number' ? result.total : result.sessions.length)
         setSessionProfileTotals(result.profile_totals ?? {})
+        // First fetch has succeeded: from now on the sidebar treats refreshes as
+        // silent background revalidation and stops re-showing skeletons, so the
+        // session section no longer flashes in/out on every periodic refresh.
+        // Set only on success so a failed initial load can still show skeletons
+        // when a reconnect retries it.
+        setSessionsInitialLoadComplete(true)
       }
     } finally {
       if (refreshSessionsRequestRef.current === requestId) {
