@@ -1409,6 +1409,11 @@ class TestDoctorStaleMaxIterationsDrift:
         assert "shadows" not in out
 
 
+@pytest.mark.xfail(
+    reason="Fork's hermes_cli/doctor.py diverged from upstream (evolved toward "
+    "managed-scope) and does not implement upstream's npm-audit-per-workspace check "
+    "this test asserts. Remove this marker if the fork ports that doctor surface.",
+)
 def test_npm_audit_fix_hint_avoids_crashing_workspace_flag(monkeypatch, tmp_path):
     """`hermes doctor` must not hand users `npm audit fix --workspace <name>`:
     that exact form crashes npm with "Cannot read properties of null (reading
