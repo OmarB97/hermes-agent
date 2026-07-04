@@ -1395,6 +1395,7 @@ def run_conversation(
                             "messages": messages,
                             "completed": False,
                             "api_calls": api_call_count,
+                            "final_response": f"Invalid API response after {max_retries} retries: {_failure_hint}",
                             "error": f"Invalid API response after {max_retries} retries: {_failure_hint}",
                             "failed": True  # Mark as failure for filtering
                         }
@@ -2738,6 +2739,12 @@ def run_conversation(
                         "messages": messages,
                         "completed": False,
                         "api_calls": api_call_count,
+                        "final_response": (
+                            "Context overflow and auto-compaction is disabled "
+                            "(compression.enabled: false). Run /compress to compact "
+                            "manually, /new to start fresh, or switch to a "
+                            "larger-context model."
+                        ),
                         "error": (
                             "Context overflow and auto-compaction is disabled "
                             "(compression.enabled: false). Run /compress to compact manually, "
@@ -2955,6 +2962,7 @@ def run_conversation(
                             "messages": messages,
                             "completed": False,
                             "api_calls": api_call_count,
+                            "final_response": f"Request payload too large: max compression attempts ({max_compression_attempts}) reached.",
                             "error": f"Request payload too large: max compression attempts ({max_compression_attempts}) reached.",
                             "partial": True,
                             "failed": True,
@@ -2989,6 +2997,7 @@ def run_conversation(
                             "messages": messages,
                             "completed": False,
                             "api_calls": api_call_count,
+                            "final_response": "Request payload too large (413). Cannot compress further.",
                             "error": "Request payload too large (413). Cannot compress further.",
                             "partial": True,
                             "failed": True,
@@ -3042,6 +3051,7 @@ def run_conversation(
                                 "messages": messages,
                                 "completed": False,
                                 "api_calls": api_call_count,
+                                "final_response": f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached.",
                                 "error": f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached.",
                                 "partial": True,
                                 "failed": True,
@@ -3111,6 +3121,7 @@ def run_conversation(
                             "messages": messages,
                             "completed": False,
                             "api_calls": api_call_count,
+                            "final_response": f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached.",
                             "error": f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached.",
                             "partial": True,
                             "failed": True,
@@ -3145,6 +3156,7 @@ def run_conversation(
                             "messages": messages,
                             "completed": False,
                             "api_calls": api_call_count,
+                            "final_response": f"Context length exceeded ({approx_tokens:,} tokens). Cannot compress further.",
                             "error": f"Context length exceeded ({approx_tokens:,} tokens). Cannot compress further.",
                             "partial": True,
                             "failed": True,
