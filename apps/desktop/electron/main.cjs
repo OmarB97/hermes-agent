@@ -1967,19 +1967,19 @@ async function checkUpdates() {
   const originUrl = await getOriginUrl(updateRoot)
   if (!remote && target.remote === 'origin' && isOfficialSshRemote(originUrl)) {
     const git = args => runGit(args, { cwd: updateRoot }).then(r => r.stdout.trim())
-    const [currentSha, target, dirtyStr, currentBranch] = await Promise.all([
+    const [currentSha, targetLs, dirtyStr, currentBranch] = await Promise.all([
       git(['rev-parse', 'HEAD']),
       runGit(['ls-remote', OFFICIAL_REPO_HTTPS_URL, `refs/heads/${target.branch}`], { cwd: updateRoot }),
       git(['status', '--porcelain']),
       git(['rev-parse', '--abbrev-ref', 'HEAD'])
     ])
-    const targetSha = firstLine(target.stdout).split(/\s+/)[0] || ''
-    if (target.code !== 0 || !targetSha) {
+    const targetSha = firstLine(targetLs.stdout).split(/\s+/)[0] || ''
+    if (targetLs.code !== 0 || !targetSha) {
       return {
         supported: true,
         branch,
         error: 'fetch-failed',
-        message: firstLine(target.stderr) || 'git ls-remote failed.',
+        message: firstLine(targetLs.stderr) || 'git ls-remote failed.',
         hermesRoot: updateRoot,
         fetchedAt: Date.now()
       }
