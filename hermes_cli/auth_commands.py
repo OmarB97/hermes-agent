@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import sys
 import time
@@ -530,6 +531,60 @@ def auth_logout_command(args) -> None:
     auth_mod.logout_command(SimpleNamespace(provider=getattr(args, "provider", None)))
 
 
+def auth_probe_command(args) -> None:
+    """`hermes auth probe <provider>` — a real 1-token "test my AI" call.
+
+    BYO-frontier capture §B / TASK 1+2. Reads the stored API key for the
+    provider from the 0600 pooled-credential store and makes a real inference
+    call (Anthropic ``/v1/messages`` / OpenAI ``/chat/completions``,
+    ``max_tokens=1``). Prints the one-line user-facing result, then a single
+    JSON line (``{provider, mode, ok, latency_ms, model, error_class?,
+    secret_fingerprint, ...}``) for machine consumers (the Rust
+    ``meshboard-agent test-ai`` shells out to this and parses the JSON).
+
+    Exit 0 on a valid credential, non-zero otherwise — the exit code IS the
+    pass/fail signal for callers, and ``error_class`` carries the reason.
+    """
+    from agent import ai_connectivity_probe as probe_mod
+
+    raw_provider = getattr(args, "provider", "")
+    canonical = probe_mod.normalize_provider(raw_provider)
+    if canonical is None:
+        raise SystemExit(
+            f"`hermes auth probe` supports anthropic / openai, not {raw_provider!r}"
+        )
+
+    pool = load_pool(canonical)
+    entry = pool.current() or (pool.entries()[0] if pool.entries() else None)
+    if entry is None or not (entry.access_token or "").strip():
+        # No stored credential — that is itself a failure the user should see.
+        label = probe_mod._provider_label(canonical)
+        print(f"{label}: ✗ no credential stored — run `meshboard-agent connect {raw_provider}`")
+        print(json.dumps({
+            "provider": canonical,
+            "ok": False,
+            "error_class": "invalid_key",
+            "hint": "no credential stored",
+        }))
+        raise SystemExit(2)
+
+    is_oauth = (getattr(entry, "auth_type", "") or "").lower() == AUTH_TYPE_OAUTH
+    base_url = (getattr(entry, "base_url", "") or "").strip() or None
+    model_override = (getattr(args, "model", None) or "").strip() or None
+
+    result = probe_mod.probe(
+        canonical,
+        entry.access_token,
+        base_url=base_url,
+        model=model_override,
+        is_oauth=is_oauth,
+    )
+    print(result.one_line())
+    print(json.dumps(result.to_dict()))
+    if not result.ok:
+        raise SystemExit(1)
+
+
 def auth_spotify_command(args) -> None:
     action = str(getattr(args, "spotify_action", "") or "login").strip().lower()
     if action in {"", "login"}:
@@ -794,6 +849,9 @@ def auth_command(args) -> None:
         return
     if action == "logout":
         auth_logout_command(args)
+        return
+    if action == "probe":
+        auth_probe_command(args)
         return
     if action == "spotify":
         auth_spotify_command(args)

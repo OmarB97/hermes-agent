@@ -108,6 +108,7 @@ import {
   $selectedStoredSessionId,
   $sessionProfileTotals,
   $sessions,
+  $sessionsInitialLoadComplete,
   $sessionsLoading,
   $sessionsTotal,
   $workingSessionIds,
@@ -122,8 +123,8 @@ import {
 } from '@/store/sidebar-selection'
 
 import { type AppView, ARTIFACTS_ROUTE, MESSAGING_ROUTE, SKILLS_ROUTE } from '../../routes'
-import { SidebarPanelLabel } from '../../shell/sidebar-label'
 import type { SidebarNavItem } from '../../types'
+import { SidebarCount, SidebarSectionHeader } from './section-header'
 
 import { CloudChannelsDialog } from './cloud-channels-dialog'
 import { SidebarCronJobsSection } from './cron-jobs-section'
@@ -131,6 +132,7 @@ import { SidebarLoadMoreRow } from './load-more-row'
 import { ProfileRail } from './profile-switcher'
 import { SelectionActionBar } from './selection-action-bar'
 import { SidebarSessionRow } from './session-row'
+import { deriveSidebarSessionVisibility } from './session-visibility'
 import { VirtualSessionList } from './virtual-session-list'
 
 const VIRTUALIZE_THRESHOLD = 25
@@ -407,6 +409,7 @@ export function ChatSidebar({
   const messagingPlatformTotals = useStore($messagingPlatformTotals)
   const messagingTruncated = useStore($messagingTruncated)
   const sessionsLoading = useStore($sessionsLoading)
+  const sessionsInitialLoadComplete = useStore($sessionsInitialLoadComplete)
   const sessionsTotal = useStore($sessionsTotal)
   const sessionProfileTotals = useStore($sessionProfileTotals)
   const workingSessionIds = useStore($workingSessionIds)
@@ -862,9 +865,18 @@ export function ChatSidebar({
     }
   }, [displayAgentGroups, showAllProfiles, workspaceOrderIds])
 
-  const showSessionSkeletons = sessionsLoading && sortedSessions.length === 0
-
-  const showSessionSections = showSessionSkeletons || sortedSessions.length > 0
+  // Skeletons are a first-load-only affordance; background refreshes keep
+  // flipping $sessionsLoading and must not re-flash the section. The area also
+  // mounts for pinned/cron/archived content on its own, not just recents, so an
+  // empty-recents account still sees those sections. See ./session-visibility.
+  const { recentsEmptyState, showSessionSections, showSessionSkeletons } = deriveSidebarSessionVisibility({
+    hasArchived: archivedTotal > 0 || archivedSessions.length > 0,
+    hasCronJobs: cronJobs.length > 0,
+    hasPinned: pinnedSessions.length > 0,
+    sessionCount: sortedSessions.length,
+    sessionsInitialLoadComplete,
+    sessionsLoading
+  })
 
   // ──────────────────────────────────────────────────────────────────────────
   // Canonical dnd-kit multi-container engine.
@@ -1475,7 +1487,15 @@ export function ChatSidebar({
                     )}
                     dndSensors={dndSensors}
                     draggingSessionId={dndDrag?.activeId}
-                    emptyState={showSessionSkeletons ? <SidebarSessionSkeletons /> : <SidebarAllPinnedState />}
+                    emptyState={
+                      recentsEmptyState === 'skeletons' ? (
+                        <SidebarSessionSkeletons />
+                      ) : recentsEmptyState === 'empty' ? (
+                        <SidebarRecentsEmptyState />
+                      ) : (
+                        <SidebarAllPinnedState />
+                      )
+                    }
                     footer={
                       // Hide "load more" only when workspace-grouped (those groups page
                       // themselves). ALL-profiles now pages per-profile from each profile
@@ -1813,36 +1833,6 @@ function ArchiveAllSessionsDialog({ count, open, onConfirm, onOpenChange, submit
   )
 }
 
-interface SidebarSectionHeaderProps {
-  label: string
-  open: boolean
-  onToggle: () => void
-  action?: React.ReactNode
-  meta?: React.ReactNode
-  icon?: React.ReactNode
-}
-
-function SidebarSectionHeader({ label, open, onToggle, action, meta, icon }: SidebarSectionHeaderProps) {
-  return (
-    <div className="group/section flex shrink-0 items-center justify-between pb-1 pt-1.5">
-      <button
-        className="group/section-label flex w-fit items-center gap-1 bg-transparent text-left leading-none"
-        onClick={onToggle}
-        type="button"
-      >
-        {icon}
-        <SidebarPanelLabel>{label}</SidebarPanelLabel>
-        {meta && <SidebarCount>{meta}</SidebarCount>}
-        <DisclosureCaret
-          className="text-(--ui-text-tertiary) opacity-0 transition group-hover/section-label:opacity-100"
-          open={open}
-        />
-      </button>
-      {action}
-    </div>
-  )
-}
-
 function SidebarSessionSkeletons() {
   return (
     <div aria-hidden="true" className="grid gap-px">
@@ -1862,6 +1852,20 @@ function SidebarAllPinnedState() {
   return (
     <div className="grid min-h-24 place-items-center rounded-lg text-center text-xs text-(--ui-text-tertiary)">
       {t.sidebar.allPinned}
+    </div>
+  )
+}
+
+// Shown in the recents list when there are genuinely no recent sessions (the
+// area is only mounted because pinned/cron/archived have content). Distinct from
+// SidebarAllPinnedState, whose "unpin a chat" copy only fits when recents exist
+// but are all pinned.
+function SidebarRecentsEmptyState() {
+  const { t } = useI18n()
+
+  return (
+    <div className="grid min-h-24 place-items-center rounded-lg text-center text-xs text-(--ui-text-tertiary)">
+      {t.sidebar.recentsEmpty}
     </div>
   )
 }
@@ -2355,10 +2359,6 @@ interface SortableWorkspaceProps {
 
 function SortableSidebarWorkspaceGroup(props: SortableWorkspaceProps) {
   return <SidebarWorkspaceGroup {...props} {...useSortableBindings(groupDndId(props.group.id))} />
-}
-
-function SidebarCount({ children }: { children: React.ReactNode }) {
-  return <span className="text-[0.6875rem] font-medium text-(--ui-text-quaternary)">{children}</span>
 }
 
 type SortableSessionRowProps = React.ComponentProps<typeof SidebarSessionRow> & {

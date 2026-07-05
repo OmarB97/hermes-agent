@@ -55,6 +55,8 @@ import {
   $freshDraftReady,
   $gatewayState,
   $messagingSessions,
+  $resumeExhaustedSessionId,
+  $resumeFailedSessionId,
   $selectedStoredSessionId,
   $sessions,
   $workingSessionIds,
@@ -79,6 +81,7 @@ import {
   setMessagingTruncated,
   setSessionProfileTotals,
   setSessions,
+  setSessionsInitialLoadComplete,
   setSessionsLoading,
   setSessionsTotal
 } from '../store/session'
@@ -204,6 +207,8 @@ export function DesktopController() {
   const filePreviewTarget = useStore($filePreviewTarget)
   const previewTarget = useStore($previewTarget)
   const selectedStoredSessionId = useStore($selectedStoredSessionId)
+  const resumeFailedSessionId = useStore($resumeFailedSessionId)
+  const resumeExhaustedSessionId = useStore($resumeExhaustedSessionId)
   const terminalTakeover = useStore($terminalTakeover)
   const panesFlipped = useStore($panesFlipped)
   const profileScope = useStore($profileScope)
@@ -444,6 +449,12 @@ export function DesktopController() {
         setSessions(prev => mergeSessionPage(prev, result.sessions, sessionsToKeep()))
         setSessionsTotal(typeof result.total === 'number' ? result.total : result.sessions.length)
         setSessionProfileTotals(result.profile_totals ?? {})
+        // First fetch has succeeded: from now on the sidebar treats refreshes as
+        // silent background revalidation and stops re-showing skeletons, so the
+        // session section no longer flashes in/out on every periodic refresh.
+        // Set only on success so a failed initial load can still show skeletons
+        // when a reconnect retries it.
+        setSessionsInitialLoadComplete(true)
       }
     } finally {
       if (refreshSessionsRequestRef.current === requestId) {
@@ -606,6 +617,7 @@ export function DesktopController() {
     queryClient,
     refreshHermesConfig,
     refreshSessions,
+    sessionStateByRuntimeIdRef,
     updateSessionState
   })
 
@@ -801,6 +813,35 @@ export function DesktopController() {
     }
   }, [gatewayState, refreshCronJobs])
 
+  // Keep the sidebar session list live without a user action. Sessions get
+  // archived out-of-band — the always-on gateway's auto-archive maintenance, a
+  // second window, or another device — so a desktop that only refreshed on
+  // connect/explicit-action shows stale, already-archived rows that look like
+  // they "come back" after a manual archive. Poll the unified list on the same
+  // cadence as the cron section (and on tab re-focus) while connected so the
+  // sidebar reflects the backend. refreshSessions is request-deduped and merges
+  // by lineage, keeping pinned/active/working rows, so a poll never clobbers an
+  // in-flight optimistic archive.
+  useEffect(() => {
+    if (gatewayState !== 'open') {
+      return
+    }
+
+    const tick = () => {
+      if (document.visibilityState === 'visible') {
+        void refreshSessions()
+      }
+    }
+
+    const intervalId = window.setInterval(tick, CRON_POLL_INTERVAL_MS)
+    document.addEventListener('visibilitychange', tick)
+
+    return () => {
+      window.clearInterval(intervalId)
+      document.removeEventListener('visibilitychange', tick)
+    }
+  }, [gatewayState, refreshSessions])
+
   useEffect(() => {
     if (gatewayState === 'open' && !activeSessionId && freshDraftReady) {
       void refreshCurrentModel()
@@ -816,6 +857,8 @@ export function DesktopController() {
     freshDraftReady,
     gatewayState,
     locationPathname: location.pathname,
+    resumeExhaustedSessionId,
+    resumeFailedSessionId,
     resumeSession,
     routedSessionId,
     runtimeIdByStoredSessionIdRef,
@@ -833,7 +876,6 @@ export function DesktopController() {
     gatewayLogLines,
     gatewayState,
     inferenceStatus,
-    modelMenuContent,
     openAgents,
     freshDraftReady,
     openCommandCenterSection,
@@ -980,6 +1022,7 @@ export function DesktopController() {
       onPickImages={() => void composer.pickImages()}
       onReload={reloadFromMessage}
       onRemoveAttachment={id => void composer.removeAttachment(id)}
+      onRetryResume={sessionId => void resumeSession(sessionId, true)}
       onSteer={steerPrompt}
       onSubmit={submitText}
       onThreadMessagesChange={handleThreadMessagesChange}

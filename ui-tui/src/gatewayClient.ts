@@ -84,8 +84,16 @@ const asWireText = (raw: unknown): string | null => {
     return raw
   }
 
-  if (raw instanceof ArrayBuffer || ArrayBuffer.isView(raw)) {
-    return _wireDecoder.decode(raw as ArrayBufferLike)
+  if (raw instanceof ArrayBuffer) {
+    return _wireDecoder.decode(raw)
+  }
+
+  if (ArrayBuffer.isView(raw)) {
+    // Re-view as a concrete Uint8Array over the same bytes (no copy). Under
+    // @types/node 24 + TS 6 the abstract `ArrayBufferView` no longer assigns to
+    // TextDecoder.decode's parameter, but a concrete typed array does — and this
+    // is more honest than the old blanket `as ArrayBufferLike` cast.
+    return _wireDecoder.decode(new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength))
   }
 
   return null

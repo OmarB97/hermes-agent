@@ -5324,7 +5324,13 @@ class AIAgent:
             str: Final assistant response
         """
         result = self.run_conversation(message, stream_callback=stream_callback)
-        return result["final_response"]
+        # run_conversation has early-return / error paths (interrupted, retries
+        # exhausted, policy/billing bail) that omit "final_response". Honor the
+        # documented `-> str` contract instead of crashing with KeyError, so a
+        # run that never produced a final turn is recorded as a clean empty
+        # result (treated as a failed run upstream) rather than a harness Python
+        # traceback that gets misclassified as a launcher/harness fault.
+        return result.get("final_response") or ""
 
     def _run_codex_app_server_turn(
         self,
@@ -5517,10 +5523,11 @@ def main(
     print(f"📞 API Calls: {result['api_calls']}")
     print(f"💬 Messages: {len(result['messages'])}")
     
-    if result['final_response']:
+    _final_response = result.get('final_response')
+    if _final_response:
         print("\n🎯 FINAL RESPONSE:")
         print("-" * 30)
-        print(result['final_response'])
+        print(_final_response)
     
     # Save sample trajectory to UUID-named file if requested
     if save_sample:
