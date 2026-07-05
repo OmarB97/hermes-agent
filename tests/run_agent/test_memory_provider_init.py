@@ -107,11 +107,33 @@ class CoreShadowProvider:
         ]
 
 
-# NOTE: upstream's test_core_tool_names_rejected_from_memory_routing_table (#40466)
-# was dropped here — the fork removed the reserved-name rejection from
-# agent/memory_manager.py, so the merged source no longer rejects memory tools that
-# shadow core tool names (clarify, delegate_task). Flagged for the operator: this is
-# a safety guard worth restoring given autopilot's reliance on delegate_task.
+def test_core_tool_names_rejected_from_memory_routing_table():
+    """Memory tools shadowing core tool names are rejected at registration (#40466).
+
+    Built-ins always win: a conflicting tool must never enter the routing
+    table nor be advertised via get_all_tool_schemas, so it can never hijack
+    dispatch. The non-conflicting tool is preserved.
+    """
+    from agent.memory_manager import MemoryManager
+
+    mm = MemoryManager()
+    mm.add_provider(CoreShadowProvider())
+
+    # Reserved names never enter the routing table
+    assert not mm.has_tool("clarify")
+    assert not mm.has_tool("delegate_task")
+    assert "clarify" not in mm._tool_to_provider
+    assert "delegate_task" not in mm._tool_to_provider
+
+    # Non-conflicting tool survives
+    assert mm.has_tool("honcho_search")
+    assert "honcho_search" in mm._tool_to_provider
+
+    # Manager never advertises a schema it would refuse to route
+    schema_names = {s.get("name") for s in mm.get_all_tool_schemas()}
+    assert "clarify" not in schema_names
+    assert "delegate_task" not in schema_names
+    assert "honcho_search" in schema_names
 
 
 def test_aiagent_forwards_warning_callback_to_cli_memory_provider():
