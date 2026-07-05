@@ -937,6 +937,7 @@ export interface Translations {
     cloudHostOffline: string
     cloudParticipantLabel: (device: string, count: string) => string
     allPinned: string
+    recentsEmpty: string
     shiftClickHint: string
     noWorkspace: string
     newSessionIn: (label: string) => string

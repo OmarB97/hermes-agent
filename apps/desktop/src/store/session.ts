@@ -209,6 +209,12 @@ export const $messagingTruncated = atom<boolean>(false)
 // one. Empty for single-profile users (fall back to $sessionsTotal).
 export const $sessionProfileTotals = atom<Record<string, number>>({})
 export const $sessionsLoading = atom(true)
+// True once the *first* session fetch has settled. The sidebar shows its
+// loading skeletons only while this is false; every later background refresh
+// (gateway reconnect, post-turn refetch, cross-window sync) flips
+// $sessionsLoading true→false again, but must NOT re-show skeletons — otherwise
+// the whole session section flashes in and out on an empty-recents account.
+export const $sessionsInitialLoadComplete = atom(false)
 export const $workingSessionIds = atom<string[]>([])
 export const $activeSessionId = atom<string | null>(null)
 export const $selectedStoredSessionId = atom<string | null>(null)
@@ -281,6 +287,8 @@ export const setMessagingTruncated = (next: Updater<boolean>) => updateAtom($mes
 export const setSessionProfileTotals = (next: Updater<Record<string, number>>) =>
   updateAtom($sessionProfileTotals, next)
 export const setSessionsLoading = (next: Updater<boolean>) => updateAtom($sessionsLoading, next)
+export const setSessionsInitialLoadComplete = (next: Updater<boolean>) =>
+  updateAtom($sessionsInitialLoadComplete, next)
 export const setWorkingSessionIds = (next: Updater<string[]>) => updateAtom($workingSessionIds, next)
 export const setActiveSessionId = (next: Updater<string | null>) => updateAtom($activeSessionId, next)
 export const setSelectedStoredSessionId = (next: Updater<string | null>) => updateAtom($selectedStoredSessionId, next)

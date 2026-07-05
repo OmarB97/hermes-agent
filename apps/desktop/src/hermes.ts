@@ -164,8 +164,16 @@ export function autoArchiveOldSessions(
   })
 }
 
-export function bulkArchiveSessions(preserveIds: string[] = []): Promise<{ ok: boolean; archived: number }> {
+export function bulkArchiveSessions(
+  preserveIds: string[] = [],
+  profile?: string | null
+): Promise<{ ok: boolean; archived: number }> {
   return window.hermesDesktop.api<{ ok: boolean; archived: number }>({
+    // Route to the owning profile's backend (mirrors setSessionArchived). The
+    // flat sidebar merges sessions from every profile, but archive is
+    // profile-scoped — without this the call only hit the default profile, so
+    // remote/pool-owned rows (e.g. autopilot /goal runs) survived every archive.
+    ...(profile ? { profile } : {}),
     path: '/api/sessions/bulk-archive',
     method: 'POST',
     body: { preserve_ids: Array.from(new Set(preserveIds.filter(Boolean))).slice(0, 5000) }

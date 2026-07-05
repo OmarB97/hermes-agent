@@ -81,6 +81,16 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
         "logout", help="Log out a provider and clear stored auth state"
     )
     auth_logout.add_argument("provider", help="Provider id")
+    auth_probe = auth_subparsers.add_parser(
+        "probe",
+        help="Test a stored credential with a real 1-token inference call",
+    )
+    auth_probe.add_argument(
+        "provider", help="Provider to probe (anthropic / openai)"
+    )
+    auth_probe.add_argument(
+        "--model", help="Override the probe model (default: cheapest per provider)"
+    )
     auth_spotify = auth_subparsers.add_parser(
         "spotify", help="Authenticate Hermes with Spotify via PKCE"
     )
