@@ -1137,6 +1137,17 @@ class AIAgent:
         stale_base, uses_implicit_default = self._resolved_api_call_stale_timeout_base()
         base_url = getattr(self, "_base_url", None) or self.base_url or ""
         if uses_implicit_default and base_url and is_local_endpoint(base_url):
+            from agent.chat_completion_helpers import (
+                _dflash_local_stale_timeout,
+            )
+            _model = (
+                api_payload.get("model")
+                if isinstance(api_payload, dict)
+                else self.model
+            ) or self.model
+            _dflash_timeout = _dflash_local_stale_timeout(api_payload, _model)
+            if _dflash_timeout is not None:
+                return _dflash_timeout
             return float("inf")
 
         from agent.chat_completion_helpers import estimate_request_context_tokens

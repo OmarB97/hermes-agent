@@ -6305,29 +6305,37 @@ class TestInterruptVprintForceTrue:
 class TestAnthropicInterruptHandler:
     """_interruptible_api_call must handle Anthropic mode when interrupted."""
 
+    @staticmethod
+    def _chat_completion_helpers_source() -> str:
+        from pathlib import Path
+
+        import agent.chat_completion_helpers as helpers
+
+        return Path(helpers.__file__).read_text(encoding="utf-8")
+
     def test_interruptible_has_anthropic_branch(self):
         """The interrupt handler must check api_mode == 'anthropic_messages'."""
-        import inspect
-        from agent.chat_completion_helpers import interruptible_api_call
-        source = inspect.getsource(interruptible_api_call)
+        source = self._chat_completion_helpers_source()
         assert "anthropic_messages" in source, \
             "interruptible_api_call must handle Anthropic interrupt (api_mode check)"
 
     def test_interruptible_rebuilds_anthropic_client(self):
         """After interrupting, the Anthropic client should be rebuilt."""
-        import inspect
-        from agent.chat_completion_helpers import interruptible_api_call
-        source = inspect.getsource(interruptible_api_call)
-        assert "build_anthropic_client" in source, \
-            "interruptible_api_call must rebuild Anthropic client after interrupt"
+        source = self._chat_completion_helpers_source()
+        assert source.count("agent._rebuild_anthropic_client()") >= 2, \
+            "interruptible_api_call must rebuild Anthropic clients after stale or interrupted calls"
+        assert "agent._anthropic_client.close()" in source, \
+            "interruptible_api_call must close Anthropic clients before rebuilding them"
 
     def test_streaming_has_anthropic_branch(self):
         """_streaming_api_call must also handle Anthropic interrupt."""
-        import inspect
-        from agent.chat_completion_helpers import interruptible_streaming_api_call
-        source = inspect.getsource(interruptible_streaming_api_call)
-        assert "anthropic_messages" in source, \
-            "interruptible_streaming_api_call must handle Anthropic interrupt"
+        source = self._chat_completion_helpers_source()
+        assert "if agent.api_mode == \"anthropic_messages\":" in source, \
+            "interruptible_streaming_api_call must branch for Anthropic Messages"
+        assert "agent._try_refresh_anthropic_client_credentials()" in source, \
+            "interruptible_streaming_api_call must refresh Anthropic credentials before streaming"
+        assert "result[\"response\"] = _call_anthropic()" in source, \
+            "interruptible_streaming_api_call must call the Anthropic streaming path"
 
 
 # ---------------------------------------------------------------------------
