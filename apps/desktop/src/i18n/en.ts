@@ -1509,7 +1509,7 @@ export const en: Translations = {
     archiveAllSucceeded: count => `Archived ${count} session${count === 1 ? '' : 's'}`,
     archiveAllFailed: 'Archive all failed',
     allPinned: 'Everything here is pinned. Unpin a chat to show it in recents.',
-    shiftClickHint: 'Shift-click a chat to pin',
+    shiftClickHint: 'Drag a chat here, or shift-click to pin',
     noWorkspace: 'No workspace',
     noProject: 'No project',
     projectEmpty: 'No sessions yet',
