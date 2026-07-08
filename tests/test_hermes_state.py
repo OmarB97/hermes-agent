@@ -5160,6 +5160,13 @@ class TestSessionIdSearch:
 
         matches = db.search_sessions_by_id("mid99")
 
+        assert [s["id"] for s in matches] == [tip]
+        assert matches[0]["_lineage_ids"] == [root, mid, tip]
+
+
+class TestListCronJobRuns:
+    """``list_cron_job_runs`` powers the desktop cron run-history endpoint.
+
     It must scope to exactly one job's runs via an id prefix range (not a
     substring), order newest-first, enrich with preview/last_active, and stay
     bounded by the requested window rather than the whole cron history.
