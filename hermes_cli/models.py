@@ -3651,13 +3651,24 @@ def fetch_api_models(
     Returns a list of model ID strings, or ``None`` if the endpoint could not
     be reached (network error, timeout, auth failure, etc.).
     """
-    return probe_api_models(
+    probe = probe_api_models(
         api_key,
         base_url,
         timeout=timeout,
         api_mode=api_mode,
         request_headers=headers,
-    ).get("models")
+    )
+    metadata = probe.get("model_metadata") or {}
+    for cache_base in {base_url, probe.get("resolved_base_url")}:
+        cache_key = _api_model_metadata_cache_key(cache_base)
+        if cache_key:
+            _LAST_API_MODEL_METADATA_BY_BASE_URL[cache_key] = metadata
+    return probe.get("models")
+
+
+def cached_api_model_metadata(base_url: Optional[str]) -> dict[str, dict[str, Any]]:
+    """Return metadata from the most recent ``fetch_api_models`` call for a base URL."""
+    return dict(_LAST_API_MODEL_METADATA_BY_BASE_URL.get(_api_model_metadata_cache_key(base_url), {}))
 
 
 # ---------------------------------------------------------------------------
