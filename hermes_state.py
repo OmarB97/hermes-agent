@@ -3123,6 +3123,91 @@ class SessionDB:
             for r in rows
         ]
 
+    @staticmethod
+    def _surfaced_session_clause(alias: str = "s") -> str:
+        """SQL predicate for rows shown by list_sessions_rich by default.
+
+        Roots + /branch children only, AND never delegate-subagent rows (tagged
+        with a ``$._delegate_from`` marker by the v18 migration / on creation) so
+        subagent runs stay out of the sidebar and pickers. Applied uniformly here
+        so the list query and its matching count clause never diverge.
+        """
+        return (
+            f"(({alias}.parent_session_id IS NULL"
+            f" OR json_extract({alias}.model_config, '$._branched_from') IS NOT NULL"
+            " OR EXISTS (SELECT 1 FROM sessions p"
+            f"            WHERE p.id = {alias}.parent_session_id"
+            "            AND p.end_reason = 'branched'"
+            f"            AND {alias}.started_at >= p.ended_at))"
+            f" AND {_delegate_from_json(alias + '.model_config')} IS NULL)"
+        )
+
+    def _batch_compression_lineages(self, root_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Walk compression-continuation chains for multiple roots in one query.
+
+        Returns a dict mapping root_id -> {"tip_id": tip_id, "ids": [root..tip]}
+        for each requested root. Replaces the N+1 ``get_compression_tip()``
+        calls in ``list_sessions_rich`` and gives desktop enough aliases to
+        collapse stale pinned intermediate segments into the live row.
+        """
+        if not root_ids:
+            return {}
+
+        root_ids = list(dict.fromkeys(root_ids))
+        placeholders = ",".join("?" * len(root_ids))
+        query = f"""
+            WITH RECURSIVE chain(root_id, cur_id, depth, path) AS (
+                SELECT id, id, 0, ',' || id || ',' FROM sessions WHERE id IN ({placeholders})
+                UNION ALL
+                SELECT c.root_id, child.id, c.depth + 1, c.path || child.id || ','
+                FROM chain c
+                JOIN sessions parent ON parent.id = c.cur_id
+                JOIN sessions child ON child.parent_session_id = c.cur_id
+                WHERE parent.end_reason = 'compression'
+                  AND child.started_at >= parent.ended_at
+                  AND instr(c.path, ',' || child.id || ',') = 0
+            )
+            SELECT root_id, cur_id, depth
+            FROM chain
+            ORDER BY root_id, depth
+        """
+        with self._lock:
+            cursor = self._conn.execute(query, root_ids)
+            rows = cursor.fetchall()
+
+        lineages: Dict[str, Dict[str, Any]] = {
+            rid: {"tip_id": rid, "ids": [rid], "_depth": 0} for rid in root_ids
+        }
+        for row in rows:
+            rid = row["root_id"]
+            cid = row["cur_id"]
+            depth = int(row["depth"] or 0)
+            entry = lineages.setdefault(rid, {"tip_id": rid, "ids": [rid], "_depth": 0})
+            if cid not in entry["ids"]:
+                entry["ids"].append(cid)
+            if depth >= int(entry.get("_depth") or 0):
+                entry["tip_id"] = cid
+                entry["_depth"] = depth
+
+        for entry in lineages.values():
+            entry.pop("_depth", None)
+        return lineages
+
+    def _batch_compression_tips(self, root_ids: List[str]) -> Dict[str, str]:
+        """Walk compression-continuation chains for multiple roots in one query.
+
+        Returns a dict mapping root_id -> tip_id for each root that has a
+        continuation chain. Roots with no continuation are omitted.
+        Replaces the N+1 ``get_compression_tip()`` calls in ``list_sessions_rich``.
+        """
+        lineages = self._batch_compression_lineages(root_ids)
+        tips = {}
+        for rid, lineage in lineages.items():
+            tid = lineage.get("tip_id")
+            if tid and tid != rid:
+                tips[rid] = tid
+        return tips
+
     def list_sessions_rich(
         self,
         source: str = None,
@@ -3349,6 +3434,9 @@ class SessionDB:
         else:
             _sel = self._compact_session_cols() if compact_rows else "s.*"
             query = f"""
+                WITH msg_max AS (
+                    SELECT session_id, MAX(timestamp) AS max_ts FROM messages GROUP BY session_id
+                )
                 SELECT {_sel},
                     COALESCE(
                         (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
