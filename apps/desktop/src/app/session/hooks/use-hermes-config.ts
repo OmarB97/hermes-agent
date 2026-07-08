@@ -2,7 +2,7 @@ import { type MutableRefObject, useCallback, useState } from 'react'
 
 import { getHermesConfig, getHermesConfigDefaults } from '@/hermes'
 import { BUILTIN_PERSONALITIES, normalizePersonalityValue, personalityNamesFromConfig } from '@/lib/chat-runtime'
-import { desktopYoloDefaultFromConfig } from '@/lib/yolo-session'
+import { normalize } from '@/lib/text'
 import {
   $currentCwd,
   setAvailablePersonalities,
@@ -11,16 +11,32 @@ import {
   setCurrentPersonality,
   setCurrentReasoningEffort,
   setCurrentServiceTier,
-  setDesktopYoloDefaultActive,
-  setIntroPersonality,
-  setYoloActive
+  setIntroPersonality
 } from '@/store/session'
+import { applyAutoSpeakFromConfig } from '@/store/voice-prefs'
 
 const DEFAULT_VOICE_SECONDS = 120
 const FAST_TIERS = new Set(['fast', 'priority', 'on'])
 
 function recordingLimit(value: unknown) {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : DEFAULT_VOICE_SECONDS
+}
+
+/** config.yaml hands back whatever the user wrote — `reasoning_effort: false`
+ *  (or `off`/`no`, which YAML also parses to boolean false) means thinking
+ *  disabled, and a bare boolean must not throw on `.trim()`. */
+function normalizeConfigEffort(value: unknown): string {
+  if (value === false) {
+    return 'none'
+  }
+
+  if (typeof value !== 'string') {
+    return ''
+  }
+
+  const effort = normalize(value)
+
+  return effort === 'false' || effort === 'disabled' ? 'none' : effort
 }
 
 interface HermesConfigOptions {
@@ -55,22 +71,23 @@ export function useHermesConfig({ activeSessionIdRef, refreshProjectBranch }: He
       const cwd = (config.terminal?.cwd ?? '').trim()
 
       if (cwd && cwd !== '.') {
-        setCurrentCwd(prev => prev || cwd)
+        // Configured terminal.cwd beats a stale remembered workspace cwd
+        // (#38855) — but never yank the workspace out from under an active
+        // session; those keep their own cwd until the user detaches.
+        setCurrentCwd(prev => (activeSessionIdRef.current ? prev : cwd))
         void refreshProjectBranch($currentCwd.get() || cwd)
       }
 
-      const reasoning = (config.agent?.reasoning_effort ?? '').trim()
+      const reasoning = normalizeConfigEffort(config.agent?.reasoning_effort)
       const tier = (config.agent?.service_tier ?? '').trim()
-      const yoloDefault = desktopYoloDefaultFromConfig(config)
 
       setCurrentReasoningEffort(prev => (activeSessionIdRef.current ? prev : reasoning))
       setCurrentServiceTier(prev => (activeSessionIdRef.current ? prev : tier))
       setCurrentFastMode(prev => (activeSessionIdRef.current ? prev : FAST_TIERS.has(tier.toLowerCase())))
-      setDesktopYoloDefaultActive(yoloDefault)
-      setYoloActive(prev => (activeSessionIdRef.current ? prev : yoloDefault))
 
       setVoiceMaxRecordingSeconds(recordingLimit(config.voice?.max_recording_seconds))
       setSttEnabled(config.stt?.enabled !== false)
+      applyAutoSpeakFromConfig(config)
     } catch {
       // Config is nice-to-have; chat still works without it.
     }

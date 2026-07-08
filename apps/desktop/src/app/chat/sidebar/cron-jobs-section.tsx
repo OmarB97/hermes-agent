@@ -3,18 +3,20 @@ import { useEffect, useMemo, useState } from 'react'
 
 import { Codicon } from '@/components/ui/codicon'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
+import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { SidebarGroup, SidebarGroupContent } from '@/components/ui/sidebar'
 import { Tip } from '@/components/ui/tooltip'
 import { getCronJobRuns, type SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { fmtDayTime, relativeTime } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { $selectedStoredSessionId } from '@/store/session'
 import type { CronJob } from '@/types/hermes'
 
 import { jobState, jobTitle, STATE_DOT } from '../../cron/job-state'
+import { SidebarPanelLabel } from '../../shell/sidebar-label'
 
 import { SidebarLoadMoreRow } from './load-more-row'
-import { SidebarSectionHeader } from './section-header'
 
 const INACTIVE_STATES = new Set(['completed', 'disabled', 'error', 'paused'])
 
@@ -30,30 +32,6 @@ const PEEK_POLL_INTERVAL_MS = 8000
 // steps on demand (mirrors the messaging sections in the sidebar).
 const INITIAL_VISIBLE_JOBS = 3
 const LOAD_MORE_STEP = 10
-
-const relativeFmt = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto', style: 'short' })
-
-// Localized "in 5 min" / "2 hr ago" without hand-rolled strings — picks the
-// coarsest sensible unit so a daily job reads "in 14 hr", not "in 840 min".
-function relativeTime(targetMs: number, nowMs: number): string {
-  const diff = targetMs - nowMs
-  const abs = Math.abs(diff)
-  const sign = diff < 0 ? -1 : 1
-
-  if (abs < 60_000) {
-    return relativeFmt.format(sign * Math.round(abs / 1000), 'second')
-  }
-
-  if (abs < 3_600_000) {
-    return relativeFmt.format(sign * Math.round(abs / 60_000), 'minute')
-  }
-
-  if (abs < 86_400_000) {
-    return relativeFmt.format(sign * Math.round(abs / 3_600_000), 'hour')
-  }
-
-  return relativeFmt.format(sign * Math.round(abs / 86_400_000), 'day')
-}
 
 function nextRunMs(job: CronJob): null | number {
   if (!job.next_run_at) {
@@ -75,9 +53,7 @@ function formatRunTime(seconds?: null | number): string {
 
   const date = new Date(seconds * 1000)
 
-  return Number.isNaN(date.valueOf())
-    ? '—'
-    : date.toLocaleString(undefined, { day: 'numeric', hour: 'numeric', minute: '2-digit', month: 'short' })
+  return Number.isNaN(date.valueOf()) ? '—' : fmtDayTime.format(date)
 }
 
 interface SidebarCronJobsSectionProps {
@@ -153,9 +129,22 @@ export function SidebarCronJobsSection({
 
   return (
     <SidebarGroup className="shrink-0 p-0 pb-1">
-      <SidebarSectionHeader label={label} meta={countLabel} onToggle={onToggle} open={open} />
+      <div className="group/section flex shrink-0 items-center justify-between pb-1 pt-1.5">
+        <button
+          className="group/section-label flex w-fit items-center gap-1 bg-transparent text-left leading-none"
+          onClick={onToggle}
+          type="button"
+        >
+          <SidebarPanelLabel>{label}</SidebarPanelLabel>
+          <span className="text-[0.6875rem] font-medium text-(--ui-text-quaternary)">{countLabel}</span>
+          <DisclosureCaret
+            className="text-(--ui-text-tertiary) opacity-0 transition group-hover/section-label:opacity-100"
+            open={open}
+          />
+        </button>
+      </div>
       {open && (
-        <SidebarGroupContent className="flex max-h-72 flex-col gap-px overflow-y-auto overscroll-contain pb-1.75 compact:max-h-none compact:overflow-visible">
+        <SidebarGroupContent className="flex max-h-72 flex-col gap-px overflow-x-hidden overflow-y-auto overscroll-contain pb-1.75 compact:max-h-none compact:overflow-visible">
           {shown.map(job => (
             <CronJobSidebarRow
               expanded={peekJobId === job.id}
@@ -241,11 +230,9 @@ function CronJobSidebarRow({
             open={expanded}
           />
         </button>
-        {/* Trailing cluster: countdown by default, quick actions on hover.
-            pr-1.5 + the timestamp type ramp match the session rows' age column
-            so the right rail reads as one line down the sidebar. */}
-        <div className="flex items-center gap-0.5 justify-self-end pr-1.5">
-          <span className="text-[0.625rem] leading-none text-(--ui-text-tertiary) tabular-nums group-hover/cron:hidden">
+        {/* Trailing cluster: countdown by default, quick actions on hover. */}
+        <div className="flex items-center gap-0.5 justify-self-end pr-1">
+          <span className="text-[0.6875rem] text-(--ui-text-tertiary) tabular-nums group-hover/cron:hidden">
             {meta}
           </span>
           <div className="hidden items-center gap-0.5 group-hover/cron:flex">
@@ -317,7 +304,7 @@ function CronJobSidebarRuns({ jobId, onOpenRun }: { jobId: string; onOpenRun: (s
     <div className="mb-1 ml-[1.375rem] flex flex-col gap-px">
       {runs === null ? (
         <div className="flex items-center gap-1.5 py-1 pl-1 text-[0.6875rem] text-(--ui-text-tertiary)">
-          <Codicon name="loading" size="0.75rem" spinning />
+          <GlyphSpinner ariaLabel={c.loading} className="text-[0.75rem]" />
         </div>
       ) : runs.length === 0 ? (
         <div className="py-1 pl-1 text-[0.6875rem] text-(--ui-text-tertiary)">{c.noRuns}</div>

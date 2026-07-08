@@ -16,6 +16,7 @@ export interface RuntimeReadinessSignals {
 
 export interface RuntimeReadinessOptions {
   defaultReason?: string
+  requestedProvider?: string
   unknownReady?: boolean
 }
 
@@ -24,7 +25,6 @@ export interface RuntimeReadinessResult {
   ready: boolean
   reason: null | string
   source: 'fallback' | 'runtime_check' | 'setup_status'
-  unavailable?: boolean
 }
 
 export type RuntimeReadinessRequester = <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
@@ -53,37 +53,27 @@ function normalizeMessage(value: null | string | undefined): null | string {
   return next ? next : null
 }
 
-function isTransportFailure(value: null | string): boolean {
-  const message = value?.toLowerCase() ?? ''
-
-  return (
-    message.includes('timed out') ||
-    message.includes('timeout') ||
-    message.includes('failed to fetch') ||
-    message.includes('connection refused') ||
-    message.includes('econnrefused') ||
-    message.includes('timed out connecting to hermes backend') ||
-    message.includes("background gateway didn't come up")
-  )
-}
-
 async function requestWithFallback<T>(
   requestGateway: RuntimeReadinessRequester,
-  method: string
+  method: string,
+  params?: Record<string, unknown>
 ): Promise<{ error: null | string; value: null | T }> {
   try {
-    return { error: null, value: await requestGateway<T>(method) }
+    return { error: null, value: await requestGateway<T>(method, params) }
   } catch (error) {
     return { error: toErrorMessage(error), value: null }
   }
 }
 
 export async function fetchRuntimeReadinessSignals(
-  requestGateway: RuntimeReadinessRequester
+  requestGateway: RuntimeReadinessRequester,
+  requestedProvider?: string
 ): Promise<RuntimeReadinessSignals> {
+  const runtimeParams = requestedProvider?.trim() ? { provider: requestedProvider.trim() } : undefined
+
   const [setup, runtime] = await Promise.all([
     requestWithFallback<SetupStatusSnapshot>(requestGateway, 'setup.status'),
-    requestWithFallback<RuntimeCheckSnapshot>(requestGateway, 'setup.runtime_check')
+    requestWithFallback<RuntimeCheckSnapshot>(requestGateway, 'setup.runtime_check', runtimeParams)
   ])
 
   return {
@@ -144,20 +134,6 @@ export function interpretRuntimeReadiness(
     }
   }
 
-  if (
-    signals.setup == null &&
-    signals.runtime == null &&
-    (isTransportFailure(setupFailure) || isTransportFailure(runtimeFailure))
-  ) {
-    return {
-      checksDisagree: false,
-      ready: false,
-      reason: runtimeFailure ?? setupFailure ?? defaultReason,
-      source: 'fallback',
-      unavailable: true
-    }
-  }
-
   return {
     checksDisagree: false,
     ready: unknownReady,
@@ -170,7 +146,7 @@ export async function evaluateRuntimeReadiness(
   requestGateway: RuntimeReadinessRequester,
   options: RuntimeReadinessOptions = {}
 ): Promise<RuntimeReadinessResult> {
-  const signals = await fetchRuntimeReadinessSignals(requestGateway)
+  const signals = await fetchRuntimeReadinessSignals(requestGateway, options.requestedProvider)
 
   return interpretRuntimeReadiness(signals, options)
 }

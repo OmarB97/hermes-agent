@@ -4,6 +4,7 @@ import type { QuickModelOption } from '@/app/chat/composer/types'
 import type { ClientSessionState, CommandDispatchResponse } from '@/app/types'
 import { formatRefValue } from '@/components/assistant-ui/directive-text'
 import { type ChatMessage, type ChatMessagePart, chatMessageText, textPart } from '@/lib/chat-messages'
+import { normalize } from '@/lib/text'
 import type { ComposerAttachment } from '@/store/composer'
 import type { ModelOptionsResponse, SessionInfo } from '@/types/hermes'
 
@@ -38,6 +39,8 @@ export function createClientSessionState(
   return {
     storedSessionId,
     messages,
+    branch: '',
+    cwd: '',
     model: '',
     provider: '',
     reasoningEffort: '',
@@ -45,8 +48,6 @@ export function createClientSessionState(
     fast: false,
     yolo: false,
     personality: '',
-    branch: '',
-    cwd: '',
     busy: false,
     awaitingResponse: false,
     streamId: null,
@@ -155,6 +156,13 @@ export function pathLabel(path: string): string {
 }
 
 export function attachmentDisplayText(attachment: ComposerAttachment): string | null {
+  // Session switches / draft restores can leave undefined holes in the
+  // composer attachments array (see AttachmentList's filter(Boolean) + #49624).
+  // Every consumer funnels through here, so guard the chokepoint too.
+  if (!attachment) {
+    return null
+  }
+
   if (attachment.kind === 'terminal' && attachment.detail) {
     return `\`\`\`terminal\n${attachment.detail.trim()}\n\`\`\``
   }
@@ -188,6 +196,10 @@ export function attachmentDisplayText(attachment: ComposerAttachment): string | 
  * through to `attachmentDisplayText`.
  */
 export function optimisticAttachmentRef(attachment: ComposerAttachment): string | null {
+  if (!attachment) {
+    return null
+  }
+
   if (attachment.kind === 'image' && attachment.previewUrl?.startsWith('data:')) {
     return attachment.previewUrl
   }
@@ -206,13 +218,18 @@ export function personalityNamesFromConfig(config: unknown): string[] {
 }
 
 export function normalizePersonalityValue(value: string): string {
-  const trimmed = value.trim().toLowerCase()
+  const trimmed = normalize(value)
 
   return !trimmed || trimmed === 'default' || trimmed === 'none' ? '' : trimmed
 }
 
 export function parseSlashCommand(command: string) {
-  const match = command.replace(/^\/+/, '').match(/^(\S+)\s*(.*)$/)
+  // `[\s\S]*` (not `.*`): the arg may span newlines — `/goal <multi-line text>`
+  // or a skill command with a long pasted context. The old `.*$` regex failed
+  // the whole match on any newline, so every multiline slash command parsed as
+  // an empty name and got swallowed (#41323, #55510). The backend and CLI both
+  // split on any whitespace (`split(maxsplit=1)`), so this is the parity fix.
+  const match = command.replace(/^\/+/, '').match(/^(\S+)([\s\S]*)$/)
 
   return match ? { name: match[1], arg: match[2].trim() } : { name: '', arg: '' }
 }
@@ -241,9 +258,7 @@ export function parseCommandDispatch(raw: unknown): CommandDispatchResponse | nu
       return typeof row.message === 'string' ? { type: 'send', message: row.message, notice: str(row.notice) } : null
 
     case 'prefill':
-      return typeof row.message === 'string'
-        ? { type: 'prefill', message: row.message, notice: str(row.notice) }
-        : null
+      return typeof row.message === 'string' ? { type: 'prefill', message: row.message, notice: str(row.notice) } : null
 
     default:
       return null
@@ -333,12 +348,7 @@ export function toRuntimeMessage(message: ChatMessage): ThreadMessage {
       content: message.parts.filter((part): part is Extract<ChatMessagePart, { type: 'text' }> => part.type === 'text'),
       attachments: [],
       createdAt,
-      metadata: {
-        custom: {
-          attachmentRefs: message.attachmentRefs ?? [],
-          ...(message.senderDevice ? { senderDevice: message.senderDevice } : {})
-        }
-      }
+      metadata: { custom: { attachmentRefs: message.attachmentRefs ?? [] } }
     } as ThreadMessage
   }
 

@@ -78,12 +78,9 @@ function Kbd({ children, className, size, variant, ...props }: KbdProps) {
 
 interface KbdGroupProps extends Omit<React.ComponentProps<'span'>, 'children'>, VariantProps<typeof kbdVariants> {
   keys: string[]
-  size?: 'sm'
 }
 
 function KbdGroup({ className, keys, size, variant, ...props }: KbdGroupProps) {
-  const keyClassName = size === 'sm' ? 'h-3.5 min-w-3.5 px-0.5 text-[0.5rem]' : undefined
-
   return (
     <span
       aria-label={keys.join(' ')}
@@ -92,7 +89,7 @@ function KbdGroup({ className, keys, size, variant, ...props }: KbdGroupProps) {
       {...props}
     >
       {keys.map((key, index) => (
-        <Kbd className={keyClassName} key={`${key}-${index}`} size={size} variant={variant}>
+        <Kbd key={`${key}-${index}`} size={size} variant={variant}>
           {key}
         </Kbd>
       ))}

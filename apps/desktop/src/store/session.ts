@@ -5,7 +5,7 @@ import type { ContextSuggestion } from '@/app/types'
 import type { HermesConnection } from '@/global'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { persistBoolean, persistString, storedBoolean, storedString } from '@/lib/storage'
-import type { SessionInfo, SessionPresenceRecord, UsageStats } from '@/types/hermes'
+import type { SessionInfo, UsageStats } from '@/types/hermes'
 
 type Updater<T> = T | ((current: T) => T)
 
@@ -21,15 +21,15 @@ const COMPOSER_PROVIDER_KEY = 'hermes.desktop.composer.provider'
 const COMPOSER_EFFORT_KEY = 'hermes.desktop.composer.reasoning-effort'
 const COMPOSER_FAST_KEY = 'hermes.desktop.composer.fast'
 
-// Cached copy of Settings → Sessions → Default project directory. The main
-// process persists this in project-dir.json, but the renderer must also honor it
-// when seeding $currentCwd — otherwise PR #37586's sticky localStorage home dir
-// wins and new sessions ignore the user's explicit picker choice.
+// The last chat the user had open, so a relaunch lands back on it instead of an
+// empty new-chat. Stored (not runtime) id — the route is keyed by stored id.
+const LAST_SESSION_KEY = 'hermes.desktop.lastSessionId'
+
+export const getRememberedSessionId = (): null | string => storedString(LAST_SESSION_KEY)
+export const setRememberedSessionId = (id: null | string) => persistString(LAST_SESSION_KEY, id)
+
 let configuredDefaultProjectDir = ''
 
-// Remote backends each get their own remembered workspace, keyed by base URL +
-// profile, so switching backends (or back to local) never leaks one backend's
-// last folder into another. Local keeps the bare key for backward compatibility.
 function workspaceCwdKey(connection: HermesConnection | null = $connection.get()): string {
   if (connection?.mode !== 'remote') {
     return WORKSPACE_CWD_KEY
@@ -37,6 +37,7 @@ function workspaceCwdKey(connection: HermesConnection | null = $connection.get()
 
   const base = encodeURIComponent(connection.baseUrl || 'remote')
   const profile = encodeURIComponent(connection.profile || 'default')
+
   return `${WORKSPACE_CWD_KEY}.remote.${base}.${profile}`
 }
 
@@ -82,6 +83,7 @@ export async function ensureDefaultWorkspaceCwd(): Promise<void> {
 
   if ($connection.get()?.mode === 'remote') {
     seedLiveCwd(remembered)
+
     return
   }
 
@@ -153,18 +155,34 @@ export function mergeSessionPage(
 ): SessionInfo[] {
   const keep = keepIds instanceof Set ? keepIds : new Set(keepIds)
 
+  // Carry a known title onto a row that arrives title-less, so a freshly
+  // submitted session (e.g. a branch draft) holds its placeholder instead of
+  // flashing its raw message preview in the gap between persist and the async
+  // auto-titler. A real clear sets the local title null first, so this never
+  // masks one.
+  const prevById = new Map(previous.map(session => [session.id, session]))
+
+  const merged = incoming.map(session => {
+    if (session.title?.trim()) {
+      return session
+    }
+
+    const carried = prevById.get(session.id)?.title?.trim()
+
+    return carried ? { ...session, title: carried } : session
+  })
+
   if (keep.size === 0) {
-    return incoming
+    return merged
   }
 
-  const incomingIds = new Set(incoming.map(session => session.id))
+  const incomingIds = new Set(merged.map(session => session.id))
+
   // Deduplicate by compression lineage: when auto-compression rotates the tip
   // id (old #4 → new #5), the incoming page carries the new tip but the
   // previous list still holds the old one.  Without lineage-level dedup both
   // rows survive as separate sidebar entries (fixes #43483).
-  const incomingLineageKeys = new Set(
-    incoming.map(session => session._lineage_root_id ?? session.id)
-  )
+  const incomingLineageKeys = new Set(merged.map(session => session._lineage_root_id ?? session.id))
 
   const survivors = previous.filter(
     session =>
@@ -173,7 +191,7 @@ export function mergeSessionPage(
       (keep.has(session.id) || (session._lineage_root_id != null && keep.has(session._lineage_root_id)))
   )
 
-  return survivors.length ? [...survivors, ...incoming] : incoming
+  return survivors.length ? [...survivors, ...merged] : merged
 }
 
 export const $connection = atom<HermesConnection | null>(null)
@@ -209,12 +227,6 @@ export const $messagingTruncated = atom<boolean>(false)
 // one. Empty for single-profile users (fall back to $sessionsTotal).
 export const $sessionProfileTotals = atom<Record<string, number>>({})
 export const $sessionsLoading = atom(true)
-// True once the *first* session fetch has settled. The sidebar shows its
-// loading skeletons only while this is false; every later background refresh
-// (gateway reconnect, post-turn refetch, cross-window sync) flips
-// $sessionsLoading true→false again, but must NOT re-show skeletons — otherwise
-// the whole session section flashes in and out on an empty-recents account.
-export const $sessionsInitialLoadComplete = atom(false)
 export const $workingSessionIds = atom<string[]>([])
 export const $activeSessionId = atom<string | null>(null)
 export const $selectedStoredSessionId = atom<string | null>(null)
@@ -287,8 +299,6 @@ export const setMessagingTruncated = (next: Updater<boolean>) => updateAtom($mes
 export const setSessionProfileTotals = (next: Updater<Record<string, number>>) =>
   updateAtom($sessionProfileTotals, next)
 export const setSessionsLoading = (next: Updater<boolean>) => updateAtom($sessionsLoading, next)
-export const setSessionsInitialLoadComplete = (next: Updater<boolean>) =>
-  updateAtom($sessionsInitialLoadComplete, next)
 export const setWorkingSessionIds = (next: Updater<string[]>) => updateAtom($workingSessionIds, next)
 export const setActiveSessionId = (next: Updater<string | null>) => updateAtom($activeSessionId, next)
 export const setSelectedStoredSessionId = (next: Updater<string | null>) => updateAtom($selectedStoredSessionId, next)
@@ -328,16 +338,18 @@ export const setCurrentCwd = (next: Updater<string>) => {
   persistString(workspaceCwdKey(), $currentCwd.get().trim() || null)
 }
 
-/** Workspace for a brand-new chat. On a remote backend, only that backend's
- *  remembered folder applies (the local Settings default is meaningless there);
- *  otherwise an explicit Settings override wins, then the sticky last-used
- *  folder, then whatever is already live. */
 export const workspaceCwdForNewSession = (): string => {
   if ($connection.get()?.mode === 'remote') {
     return getRememberedWorkspaceCwd()
   }
 
-  return getConfiguredDefaultProjectDir() || getRememberedWorkspaceCwd() || $currentCwd.get().trim()
+  // A bare new chat starts DETACHED — no inherited cwd, so the composer's coding
+  // rail (which keys off $currentCwd) shows no branch and the first message runs
+  // in the gateway's default rather than silently in the last repo you touched.
+  // Only an explicit default-project-dir setting pre-attaches. Entering a
+  // project/worktree attaches its cwd directly (startSessionInWorkspace), so the
+  // "remember where I was when I'm in a project" case is unaffected.
+  return getConfiguredDefaultProjectDir()
 }
 
 export const setCurrentBranch = (next: Updater<string>) => updateAtom($currentBranch, next)
@@ -361,6 +373,20 @@ export const setSessionPickerOpen = (next: Updater<boolean>) => updateAtom($sess
 const SESSION_WATCHDOG_TIMEOUT_MS = 8 * 60 * 1000
 const sessionWatchdogTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
+// Notified (with the stored session id) whenever the watchdog force-clears a
+// stuck session. The session-state cache subscribes to also drop that session's
+// busy/awaiting flags — clearing `$workingSessionIds` alone only removes the
+// sidebar dot, leaving the composer stuck on "Thinking"/Stop for a hung or
+// looping turn that never streamed its terminal event.
+type SessionWatchdogListener = (storedSessionId: string) => void
+const sessionWatchdogListeners = new Set<SessionWatchdogListener>()
+
+export function onSessionWatchdogClear(listener: SessionWatchdogListener): () => void {
+  sessionWatchdogListeners.add(listener)
+
+  return () => void sessionWatchdogListeners.delete(listener)
+}
+
 function armSessionWatchdog(sessionId: string) {
   const existing = sessionWatchdogTimers.get(sessionId)
 
@@ -375,6 +401,10 @@ function armSessionWatchdog(sessionId: string) {
     // away or the session genuinely finished, the timer is a no-op.
     if ($workingSessionIds.get().includes(sessionId)) {
       setWorkingSessionIds(current => current.filter(id => id !== sessionId))
+    }
+
+    for (const listener of sessionWatchdogListeners) {
+      listener(sessionId)
     }
   }, SESSION_WATCHDOG_TIMEOUT_MS)
 
@@ -491,133 +521,5 @@ export function setSessionWorking(sessionId: string | null | undefined, working:
     if (wasWorking) {
       markSessionSettled(sessionId)
     }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Channels / archived / presence atoms (restored 2026-06-15).
-//
-// These producers were dropped from main when the cloud-channels + upstream
-// fork-ship merges (#220-#224) landed their consumer components without the
-// store plumbing; the desktop self-update rebuild (`tsc -b`) then failed. The
-// implementations below are the coherent versions the feature branches carry.
-// ---------------------------------------------------------------------------
-
-// Archived conversations, fetched as their own slice (archived='only') for the
-// sidebar's collapsed Archived section. Rows load lazily on first expand; the
-// boot refresh only resolves the TOTAL (cheap limit-1 probe) so the section
-// header can show an honest count without paying for rows nobody opened.
-export const $archivedSessions = atom<SessionInfo[]>([])
-export const $archivedSessionsTotal = atom<number>(0)
-export const $archivedSessionsLoading = atom(false)
-
-export const DEFAULT_DESKTOP_YOLO_ACTIVE = true
-// Desktop new-chat default. The backend approval bypass remains session-scoped;
-// this preference decides whether desktop applies that bypass to new sessions.
-export const $desktopYoloDefault = atom(DEFAULT_DESKTOP_YOLO_ACTIVE)
-
-// Live sessions discovered across devices/clients (session.presence_list).
-export const $sessionPresence = atom<SessionPresenceRecord[]>([])
-
-// Transient gateway lifecycle status for the ACTIVE session (auto-compression
-// progress, background-process notices). Mirrors `status.update` events and is
-// cleared by the next stream activity, so it only shows while nothing else
-// (deltas, tool events) is moving.
-export interface SessionActivityStatus {
-  kind: string
-  text: string
-}
-export const $sessionActivityStatus = atom<SessionActivityStatus | null>(null)
-
-// THIS device's resolved name (config → MeshBoard → Tailscale → hostname),
-// captured from the FIRST gateway.ready frame — the primary local gateway
-// connects at boot before any remote backend can exist. Used as the
-// sender_device on prompts sent to REMOTE gateways (channels Phase 2b).
-export const $localDeviceName = atom('')
-
-// One viewer device in a session's channel roster (deduped, with a live-client
-// count when the same device watches from more than one window).
-export interface SessionParticipant {
-  device: string
-  count: number
-}
-
-// Channel presence (channels Phase 3): who is currently viewing each session,
-// keyed by session id. Fed by `session.participants` gateway events; the header
-// renders co-viewer chips for the active session (filtering out THIS device).
-// Empty/solo-local sessions simply hold no entry, so the chip row is absent
-// with no mesh/tailnet involved.
-export const $sessionParticipants = atom<Record<string, SessionParticipant[]>>({})
-
-export const setArchivedSessions = (next: Updater<SessionInfo[]>) => updateAtom($archivedSessions, next)
-export const setArchivedSessionsTotal = (next: Updater<number>) => updateAtom($archivedSessionsTotal, next)
-export const setArchivedSessionsLoading = (next: Updater<boolean>) => updateAtom($archivedSessionsLoading, next)
-
-/** Shift one profile's listable-count by `delta`, clamped at zero. Only known
- *  keys move: when the aggregator hasn't reported a profile yet, the sidebar
- *  already falls back to the loaded row count, so inventing an entry here
- *  would replace an honest fallback with a guess. */
-export const adjustSessionProfileTotal = (profileKey: string, delta: number) =>
-  $sessionProfileTotals.set(
-    profileKey in $sessionProfileTotals.get()
-      ? {
-          ...$sessionProfileTotals.get(),
-          [profileKey]: Math.max(0, ($sessionProfileTotals.get()[profileKey] ?? 0) + delta)
-        }
-      : $sessionProfileTotals.get()
-  )
-
-/** Same contract as {@link adjustSessionProfileTotal} for a messaging
- *  platform's resolved total: adjust only once a per-platform fetch has
- *  established the real number. */
-export const adjustMessagingPlatformTotal = (sourceId: string, delta: number) =>
-  $messagingPlatformTotals.set(
-    sourceId in $messagingPlatformTotals.get()
-      ? {
-          ...$messagingPlatformTotals.get(),
-          [sourceId]: Math.max(0, ($messagingPlatformTotals.get()[sourceId] ?? 0) + delta)
-        }
-      : $messagingPlatformTotals.get()
-  )
-
-export const setDesktopYoloDefaultActive = (next: Updater<boolean>) => updateAtom($desktopYoloDefault, next)
-export const setSessionPresence = (next: Updater<SessionPresenceRecord[]>) => updateAtom($sessionPresence, next)
-
-export const setSessionActivityStatus = (next: Updater<SessionActivityStatus | null>) =>
-  updateAtom($sessionActivityStatus, next)
-export const setLocalDeviceName = (next: Updater<string>) => updateAtom($localDeviceName, next)
-
-// Replace the channel roster for one session. An empty roster drops the key so
-// the map doesn't accumulate stale entries as the user moves between sessions.
-export const setSessionParticipants = (sessionId: string, participants: SessionParticipant[]) => {
-  if (!sessionId) {
-    return
-  }
-
-  const current = $sessionParticipants.get()
-
-  if (participants.length === 0) {
-    if (!(sessionId in current)) {
-      return
-    }
-
-    const next = { ...current }
-    delete next[sessionId]
-    $sessionParticipants.set(next)
-
-    return
-  }
-
-  $sessionParticipants.set({ ...current, [sessionId]: participants })
-}
-
-/** Shield a row from the next refresh's page-merge eviction for the settle
- *  grace window. A just-restored (unarchived) conversation usually has old
- *  activity timestamps, so it sits outside the recency page the next refresh
- *  fetches — without a grace entry, mergeSessionPage() would evict the row the
- *  user just brought back while they're looking at it. */
-export function shieldSessionFromMerge(sessionId: string) {
-  if (sessionId) {
-    markSessionSettled(sessionId)
   }
 }

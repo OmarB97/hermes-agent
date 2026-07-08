@@ -12,6 +12,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { Switch } from '@/components/ui/switch'
 import { useI18n } from '@/i18n'
+import { normalize } from '@/lib/text'
 import { setModelPreset } from '@/store/model-presets'
 import { notifyError } from '@/store/notifications'
 import { $activeSessionId, setCurrentFastMode, setCurrentReasoningEffort } from '@/store/session'
@@ -166,7 +167,11 @@ export function ModelEditSubmenu({
       }
       void (async () => {
         try {
-          await requestGateway('config.set', { key: 'fast', session_id: activeSessionId, value: enabled ? 'fast' : 'normal' })
+          await requestGateway('config.set', {
+            key: 'fast',
+            session_id: activeSessionId,
+            value: enabled ? 'fast' : 'normal'
+          })
         } catch (err) {
           setCurrentFastMode(!enabled)
           setModelPreset(provider, model, { fast: !enabled })
@@ -227,12 +232,13 @@ export function ModelEditSubmenu({
   )
 }
 
-export function isThinkingEnabled(effort: string): boolean {
-  return normalizeReasoningEffort(effort) !== 'none'
+function isThinkingEnabled(effort: string): boolean {
+  // Empty = Hermes default (medium) = on; only an explicit "none" is off.
+  return normalize(effort || 'medium') !== 'none'
 }
 
-export function normalizeEffort(effort: string): string {
-  const value = normalizeReasoningEffort(effort)
+function normalizeEffort(effort: string): string {
+  const value = normalize(effort || 'medium')
 
   // Thinking off → no effort selected in the radio group.
   if (value === 'none') {
@@ -240,8 +246,4 @@ export function normalizeEffort(effort: string): string {
   }
 
   return EFFORT_OPTIONS.some(option => option.value === value) ? value : 'medium'
-}
-
-function normalizeReasoningEffort(effort: string): string {
-  return effort.trim().toLowerCase() || 'none'
 }

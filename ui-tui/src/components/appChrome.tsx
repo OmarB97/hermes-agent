@@ -162,16 +162,20 @@ function FaceTicker({ color, startedAt, style }: { color: string; startedAt?: nu
   )
 }
 
-export function ctxBarColor(pct: number | undefined, t: Theme) {
+function ctxBarColor(pct: number | undefined, t: Theme) {
   if (pct == null) {
     return t.color.muted
   }
 
-  if (pct >= 90) {
+  if (pct >= 95) {
     return t.color.statusCritical
   }
 
-  if (pct >= 70) {
+  if (pct > 80) {
+    return t.color.statusBad
+  }
+
+  if (pct >= 50) {
     return t.color.statusWarn
   }
 
@@ -244,9 +248,8 @@ export interface StatusBarSegments {
   bg: boolean
   compactCtx: boolean
   compressions: boolean
-  cost: boolean
   duration: boolean
-  multiline: boolean
+  subagents: boolean
   voice: boolean
 }
 
@@ -255,13 +258,12 @@ export function statusBarSegments(cols: number): StatusBarSegments {
 
   return {
     compactCtx: w < 72,
-    multiline: w < 72,
     bar: w >= 72,
     duration: w >= 76,
     compressions: w >= 80,
     voice: w >= 84,
     bg: w >= 88,
-    cost: w >= 96
+    subagents: w >= 92
   }
 }
 
@@ -416,7 +418,6 @@ export function StatusRule({
   lastTurnEndedAt,
   liveSessionCount,
   sessionStartedAt,
-  showCost,
   turnStartedAt,
   voiceLabel,
   onSessionCountClick,
@@ -427,19 +428,14 @@ export function StatusRule({
   const segs = statusBarSegments(cols)
 
   // On narrow terminals the context read-out collapses to a bare token count
-  // plus capacity (`12k/128k ctx`) while the visual fill bar is dropped.
-  // Keeping max capacity visible matters more on phones than saving a few
-  // columns because it lets the color-coded readout make sense at a glance.
+  // (`12k tok`) and the visual fill bar is dropped entirely.
   const ctxLabel = usage.context_max
     ? segs.compactCtx
-      ? `${fmtK(usage.context_used ?? 0)}/${fmtK(usage.context_max)}`
+      ? `${fmtK(usage.context_used ?? 0)} tok`
       : `${fmtK(usage.context_used ?? 0)}/${fmtK(usage.context_max)}`
     : usage.total > 0
       ? `${fmtK(usage.total)} tok`
       : ''
-
-  const ctxPctLabel = pct != null ? `${Math.round(pct)}%` : ''
-  const compactCtxText = [ctxLabel, ctxPctLabel].filter(Boolean).join(' ')
 
   const bar = !segs.compactCtx && usage.context_max ? ctxBar(pct) : ''
   const modelText = modelLabel(model, modelReasoningEffort, modelFast)
@@ -455,61 +451,6 @@ export function StatusRule({
   // so short notices reserve exactly what they need.
   const NOTICE_RESERVE_MAX = 24
   const noticeReserve = showNotice ? Math.min(stringWidth(notice!.text), NOTICE_RESERVE_MAX) : 0
-
-  if (segs.multiline) {
-    const width = Math.max(1, Math.floor(cols || 1))
-    const contextPrefix = ctxLabel ? 'ctx ' : ''
-    const contextText = ctxLabel ? `${contextPrefix}${compactCtxText}` : ''
-    const contextWidth = stringWidth(contextText)
-    const sep = modelText && contextText ? ' │ ' : ''
-    const minModelWidth = 10
-    const splitContext = !!contextText && contextWidth + stringWidth(sep) + minModelWidth > width
-
-    const modelWidth = splitContext
-      ? width
-      : Math.max(1, width - (contextText ? contextWidth + stringWidth(sep) : 0))
-
-    return (
-      <Box flexDirection="column">
-        <Box height={1} width={width}>
-          <Text color={t.color.border}>{'─ '}</Text>
-          {busy ? (
-            <FaceTicker color={statusColor} startedAt={turnStartedAt} style={indicatorStyle} />
-          ) : showNotice ? (
-            <Text color={noticeColor(notice!.level, t)} wrap="truncate-end">
-              {notice!.text}
-            </Text>
-          ) : (
-            <Text color={statusColor} wrap="truncate-end">
-              {status}
-            </Text>
-          )}
-        </Box>
-        <Box height={1} width={width}>
-          {modelText ? (
-            <Box flexShrink={0} width={modelWidth}>
-              <Text color={t.color.muted} wrap="truncate-end">
-                {modelText}
-              </Text>
-            </Box>
-          ) : null}
-          {!splitContext && contextText ? (
-            <Text color={t.color.muted} wrap="truncate-end">
-              {sep}
-              <Text color={barColor}>{contextText}</Text>
-            </Text>
-          ) : null}
-        </Box>
-        {splitContext && contextText ? (
-          <Box height={1} width={width}>
-            <Text color={barColor} wrap="truncate-end">
-              {contextText}
-            </Text>
-          </Box>
-        ) : null}
-      </Box>
-    )
-  }
 
   // Width of the must-keep left segments (indicator + model + context). They
   // are pinned (never shrink) and reserved so the cwd/branch on the right
@@ -551,12 +492,11 @@ export function StatusRule({
 
   const sessionCountText = liveSessionCount > 0 ? statusSessionCountLabel(liveSessionCount) : ''
   const compressions = typeof usage.compressions === 'number' ? usage.compressions : 0
-  const costText = typeof usage.cost_usd === 'number' ? `$${usage.cost_usd.toFixed(4)}` : ''
+
   // Dev-only readout (HERMES_DEV_CREDITS). The server omits the key entirely unless the
   // flag is on, so this segment self-hides for normal users. micros→cents is allowed money
   // math (display formatting) — never parseFloat a *_usd. Signed: a mid-session top-up that
   // raises remaining nets a negative Δ (honest).
-
   const devCreditsText =
     typeof usage.dev_credits_spent_micros === 'number'
       ? `Δ ${(usage.dev_credits_spent_micros / 10000).toFixed(1)}¢`
@@ -564,16 +504,31 @@ export function StatusRule({
 
   const showBar = !!bar && fits(SEP + stringWidth(`[${bar}] ${pct != null ? `${pct}%` : ''}`))
   const showDuration = segs.duration && !!sessionStartedAt && fits(SEP + MAX_DURATION_WIDTH)
+
   // Idle clock — time since the last final agent response. Hidden while busy
   // (the FaceTicker's elapsed tail covers the live turn) and before the first
   // turn completes. Shares the duration breakpoint and width reservation.
-  const showIdle = segs.duration && !busy && lastTurnEndedAt != null && fits(SEP + stringWidth('✓ ') + MAX_DURATION_WIDTH)
+  const showIdle =
+    segs.duration && !busy && lastTurnEndedAt != null && fits(SEP + stringWidth('✓ ') + MAX_DURATION_WIDTH)
+
   const showCompressions = segs.compressions && compressions > 0 && fits(SEP + stringWidth(`cmp ${compressions}`))
   const showVoice = segs.voice && !!voiceLabel && fits(SEP + stringWidth(voiceLabel))
   const showSessionCount = !!sessionCountText && fits(SEP + stringWidth(sessionCountText))
   const showBg = segs.bg && bgCount > 0 && fits(SEP + stringWidth(`${bgCount} bg`))
-  const showCostSeg = segs.cost && showCost && !!costText && fits(SEP + stringWidth(costText))
-  // No segs flag / no showCost coupling — it's a server-gated dev readout, lowest priority,
+  const subagentCount = typeof usage.active_subagents === 'number' ? usage.active_subagents : 0
+  const showSubagents = segs.subagents && subagentCount > 0 && fits(SEP + stringWidth(`⛓ ${subagentCount}`))
+
+  // Parked-background reassurance: a top-level delegate_task runs in the
+  // background, so the turn ends (idle) while the subagent keeps working and its
+  // result re-enters as a fresh turn later. When idle with work still in flight,
+  // spell out that the agent resumes on its own — no spinner, nothing to poll.
+  // Width-budgeted like every tail segment, so it drops first on a tight
+  // terminal where ⛓ already carries the signal.
+  const resumeHintText =
+    subagentCount === 1 ? '↩ resumes when subagent finishes' : `↩ resumes when ${subagentCount} subagents finish`
+
+  const showResumeHint = !busy && subagentCount > 0 && fits(SEP + stringWidth(resumeHintText))
+  // Dev-gated readout (HERMES_DEV_CREDITS), lowest priority,
   // so it consumes tail budget LAST and drops first on a narrow terminal.
   const showDevCredits = !!devCreditsText && fits(SEP + stringWidth(devCreditsText))
 
@@ -629,7 +584,7 @@ export function StatusRule({
             {modelText}
           </Text>
           {ctxLabel ? (
-            <Text color={barColor} wrap="truncate-end">
+            <Text color={t.color.muted} wrap="truncate-end">
               {' │ '}
               {ctxLabel}
             </Text>
@@ -679,10 +634,15 @@ export function StatusRule({
             {bgCount} bg
           </Text>
         ) : null}
-        {showCostSeg ? (
+        {showSubagents ? (
           <Text color={t.color.muted} wrap="truncate-end">
+            {' │ '}⛓ {subagentCount}
+          </Text>
+        ) : null}
+        {showResumeHint ? (
+          <Text color={t.color.muted} dim wrap="truncate-end">
             {' │ '}
-            {costText}
+            {resumeHintText}
           </Text>
         ) : null}
         {showDevCredits ? (
@@ -822,7 +782,6 @@ interface StatusRuleProps {
   indicatorStyle?: IndicatorStyle
   notice?: Notice | null
   sessionStartedAt?: null | number
-  showCost: boolean
   status: string
   statusColor: string
   t: Theme

@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { busyIndicatorWidth, ctxBarColor, statusBarSegments, statusRuleWidths } from '../components/appChrome.js'
-import { DEFAULT_THEME } from '../theme.js'
+import { busyIndicatorWidth, statusBarSegments, statusRuleWidths } from '../components/appChrome.js'
 
 describe('statusRuleWidths', () => {
   it('keeps the status rule within the terminal width', () => {
@@ -67,9 +66,9 @@ describe('statusBarSegments', () => {
       bar: true,
       duration: true,
       compressions: true,
-      multiline: false,
       voice: true,
       bg: true,
+      subagents: true,
       cost: true
     })
   })
@@ -78,7 +77,6 @@ describe('statusBarSegments', () => {
     const s = statusBarSegments(60)
 
     expect(s.compactCtx).toBe(true)
-    expect(s.multiline).toBe(true)
     expect(s.bar).toBe(false)
     expect(s.duration).toBe(false)
     expect(s.cost).toBe(false)
@@ -92,6 +90,7 @@ describe('statusBarSegments', () => {
       'compressions',
       'voice',
       'bg',
+      'subagents',
       'cost'
     ]
 
@@ -104,14 +103,6 @@ describe('statusBarSegments', () => {
       expect(visible).toBeLessThanOrEqual(prevCount)
       prevCount = visible
     }
-  })
-})
-
-describe('ctxBarColor', () => {
-  it('maps context pressure to green, yellow, then red', () => {
-    expect(ctxBarColor(42, DEFAULT_THEME)).toBe(DEFAULT_THEME.color.statusGood)
-    expect(ctxBarColor(70, DEFAULT_THEME)).toBe(DEFAULT_THEME.color.statusWarn)
-    expect(ctxBarColor(90, DEFAULT_THEME)).toBe(DEFAULT_THEME.color.statusCritical)
   })
 })
 

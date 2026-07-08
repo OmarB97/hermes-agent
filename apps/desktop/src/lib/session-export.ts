@@ -37,7 +37,6 @@ export async function exportSession(sessionId: string, params: Omit<ExportSessio
 
     const payload = {
       exported_at: new Date().toISOString(),
-      profile: params.profile ?? null,
       session_id: sessionId,
       title: params.title ?? null,
       session: params.session ?? null,

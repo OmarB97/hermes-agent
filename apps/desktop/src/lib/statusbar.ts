@@ -1,22 +1,7 @@
 import { useEffect, useState } from 'react'
 
+import { compactNumber } from '@/lib/format'
 import type { UsageStats } from '@/types/hermes'
-
-export function formatK(value: number): string {
-  if (!Number.isFinite(value) || value <= 0) {
-    return '0'
-  }
-
-  if (value >= 1_000_000) {
-    return `${(value / 1_000_000).toFixed(1)}M`
-  }
-
-  if (value >= 1_000) {
-    return `${(value / 1_000).toFixed(1)}k`
-  }
-
-  return `${Math.round(value)}`
-}
 
 export function formatDuration(elapsedMs: number): string {
   const totalSeconds = Math.max(0, Math.floor(elapsedMs / 1000))
@@ -56,10 +41,10 @@ export function contextBar(percent: number | undefined, width = 10): string {
 
 export function usageContextLabel(usage: UsageStats): string {
   if (usage.context_max) {
-    return `${formatK(usage.context_used ?? 0)}/${formatK(usage.context_max)}`
+    return `${compactNumber(usage.context_used ?? 0)}/${compactNumber(usage.context_max)}`
   }
 
-  return usage.total > 0 ? `${formatK(usage.total)} tok` : ''
+  return usage.total > 0 ? `${compactNumber(usage.total)} tok` : ''
 }
 
 export function contextBarLabel(usage: UsageStats): string {
@@ -70,28 +55,6 @@ export function contextBarLabel(usage: UsageStats): string {
   const pct = Math.max(0, Math.min(100, Math.round(usage.context_percent ?? 0)))
 
   return `[${contextBar(usage.context_percent)}] ${pct}%`
-}
-
-export function contextCapacityClassName(percent: number | undefined): string {
-  const pct = Math.max(0, Math.min(100, percent ?? 0))
-
-  if (pct >= 95) {
-    return 'text-[color-mix(in_srgb,var(--ui-red)_86%,var(--ui-text-tertiary))]'
-  }
-
-  if (pct >= 80) {
-    return 'text-[color-mix(in_srgb,var(--ui-orange)_82%,var(--ui-text-tertiary))]'
-  }
-
-  if (pct >= 50) {
-    return 'text-[color-mix(in_srgb,var(--ui-yellow)_74%,var(--ui-text-tertiary))]'
-  }
-
-  if (pct > 0) {
-    return 'text-[color-mix(in_srgb,var(--ui-green)_52%,var(--ui-text-tertiary))]'
-  }
-
-  return 'text-muted-foreground/80'
 }
 
 export function LiveDuration({ since }: { since: number | null | undefined }) {

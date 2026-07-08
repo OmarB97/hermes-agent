@@ -1,7 +1,7 @@
 // Heuristic JSON → human summary for tool results. Default view; technical
 // mode still gets the raw JSON section.
 
-import { redactSensitiveText } from '@/lib/secret-redaction'
+import { capitalize, normalize } from '@/lib/text'
 
 const WRAPPER_KEYS = ['data', 'result', 'output', 'response', 'payload'] as const
 
@@ -57,19 +57,19 @@ const titleCase = (k: string) =>
   k
     .split(/[_\-.]+/)
     .filter(Boolean)
-    .map(p => `${p[0]?.toUpperCase() ?? ''}${p.slice(1)}`)
+    .map(capitalize)
     .join(' ')
 
 const pluralize = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`
 
 function clipInline(value: string, max = 180): string {
-  const c = redactSensitiveText(value).replace(/\s+/g, ' ').trim()
+  const c = value.replace(/\s+/g, ' ').trim()
 
   return c.length > max ? `${c.slice(0, max - 1)}…` : c
 }
 
 function clipBlock(value: string, maxChars = 1800, maxLines = 18): string {
-  const t = redactSensitiveText(value).trim()
+  const t = value.trim()
 
   if (!t) {
     return ''
@@ -347,7 +347,7 @@ function hasMeaningfulErrorValue(value: unknown): boolean {
   }
 
   if (typeof v === 'string') {
-    return !NON_ERROR_TEXT.has(v.trim().toLowerCase())
+    return !NON_ERROR_TEXT.has(normalize(v))
   }
 
   if (typeof v === 'boolean') {

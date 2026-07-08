@@ -2,7 +2,7 @@ import type { ThreadMessageLike } from '@assistant-ui/react'
 
 import { dedupeGeneratedImageEchoesInParts } from '@/lib/generated-images'
 import { mediaDisplayLabel, mediaMarkdownHref } from '@/lib/media'
-import { redactSensitiveText, redactSensitiveValue } from '@/lib/secret-redaction'
+import { normalize } from '@/lib/text'
 import { parseTodos } from '@/lib/todos'
 import type { SessionMessage, UsageStats } from '@/types/hermes'
 
@@ -19,8 +19,6 @@ export type ChatMessage = {
   hidden?: boolean
   /** Composer attachment ref strings (`@file:...`, `@image:...`) sent with this user message. */
   attachmentRefs?: string[]
-  /** Device a user message was typed on (F-003 sender attribution). */
-  senderDevice?: string
 }
 
 export type GatewayEventPayload = {
@@ -50,12 +48,15 @@ export type GatewayEventPayload = {
   fast?: boolean
   yolo?: boolean
   running?: boolean
-  session_key?: string
   cwd?: string
   branch?: string
   credential_warning?: string
+  install_warning?: string
   personality?: string
   usage?: Partial<UsageStats>
+  // agent.terminal.output — live chunk for a read-only agent terminal tab
+  process_id?: string
+  chunk?: string
   // clarify.request
   request_id?: string
   question?: string
@@ -68,18 +69,18 @@ export type GatewayEventPayload = {
   // secret.request (skill credential capture)
   env_var?: string
   prompt?: string
-  // status.update (gateway lifecycle statuses: compression progress,
-  // background-process notices; kind=process → background process
-  // completion/watch-match)
-  kind?: string
-  // gateway.ready (the emitting gateway's resolved device name)
-  device_name?: string
-  // session.participants (channels Phase 3: who's viewing this session, deduped
-  // by device name with a live-client count). Shape mirrors SessionParticipant.
-  participants?: { device: string; count: number }[]
   // terminal.read.request (GUI agent reading the in-app terminal pane)
   start?: number
   count?: number
+  // status.update (kind=process → background process completion/watch-match)
+  kind?: string
+  // session.title (live auto-title push) — stored session id + generated title
+  session_id?: string
+  title?: string
+  // moa.reference / moa.aggregating (Mixture of Agents per-model relay)
+  label?: string
+  index?: number
+  aggregator?: string
 }
 
 export function textPart(text: string): ChatMessagePart {
@@ -87,7 +88,7 @@ export function textPart(text: string): ChatMessagePart {
 }
 
 export function reasoningPart(text: string): ChatMessagePart {
-  return { type: 'reasoning', text: redactSensitiveText(text) }
+  return { type: 'reasoning', text }
 }
 
 const MEDIA_LINE_RE = /(^|\n)[\t ]*[`"']?MEDIA:\s*(?<line>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|\S+)[`"']?[\t ]*(\n|$)/g
@@ -119,7 +120,7 @@ export function renderMediaTags(text: string): string {
 }
 
 export function assistantTextPart(text: string): ChatMessagePart {
-  return textPart(renderMediaTags(redactSensitiveText(text)))
+  return textPart(renderMediaTags(text))
 }
 
 export function chatMessageText(message: ChatMessage): string {
@@ -173,7 +174,7 @@ function displayContentForMessage(role: SessionMessage['role'], content: unknown
   const textContent = textFromUnknown(content)
 
   if (role !== 'user') {
-    return redactSensitiveText(textContent)
+    return textContent
   }
 
   const marker = textContent.match(ATTACHED_CONTEXT_MARKER_RE)
@@ -231,40 +232,8 @@ export function appendTextPart(parts: ChatMessagePart[], delta: string): ChatMes
   return appendStreamPart(parts, 'text', delta).parts
 }
 
-function appendAssistantParts(parts: ChatMessagePart[], appended: ChatMessagePart[]): ChatMessagePart[] {
-  return appended.reduce<ChatMessagePart[]>((next, part) => {
-    if (part.type === 'text') {
-      return appendAssistantTextPart(next, part.text)
-    }
-
-    return [...next, part]
-  }, parts)
-}
-
-function assistantTurnContinuationParts(parts: ChatMessagePart[]): boolean {
-  return parts.some(part => part.type === 'reasoning' || part.type === 'tool-call')
-}
-
-function shouldAppendToActiveAssistant(active: ChatMessage, nextParts: ChatMessagePart[]): boolean {
-  return assistantTurnContinuationParts(active.parts) || assistantTurnContinuationParts(nextParts)
-}
-
 export function appendReasoningPart(parts: ChatMessagePart[], delta: string): ChatMessagePart[] {
-  const { index, parts: next } = appendStreamPart(parts, 'reasoning', delta)
-  const part = next[index]
-
-  // Keep reasoning transcripts scrubbed of captured secrets (Rule D): redact the
-  // coalesced text, not just the delta, so a secret split across deltas can't slip
-  // through the seam.
-  if (part?.type === 'reasoning') {
-    const redacted = redactSensitiveText(part.text)
-
-    if (redacted !== part.text) {
-      next[index] = { ...part, text: redacted }
-    }
-  }
-
-  return next
+  return appendStreamPart(parts, 'reasoning', delta).parts
 }
 
 export function appendAssistantTextPart(parts: ChatMessagePart[], delta: string): ChatMessagePart[] {
@@ -278,14 +247,12 @@ export function appendAssistantTextPart(parts: ChatMessagePart[], delta: string)
   const mayContainMedia =
     delta.includes('MEDIA:') || delta.includes('DIA:') || delta.includes('EDIA:') || delta.includes('IA:')
 
-  // Redact captured secrets from visible assistant text before any media pass
-  // (Rule D). Redact the coalesced text so a secret spanning deltas is caught.
-  const redacted = redactSensitiveText(part.text)
-  const needsMediaPass = mayContainMedia || redacted.includes('MEDIA:')
-  const nextText = needsMediaPass ? renderMediaTags(redacted) : redacted
+  if (mayContainMedia || part.text.includes('MEDIA:')) {
+    const rendered = renderMediaTags(part.text)
 
-  if (nextText !== part.text) {
-    next[index] = { ...part, text: nextText }
+    if (rendered !== part.text) {
+      next[index] = { ...part, text: rendered }
+    }
   }
 
   return next
@@ -320,7 +287,7 @@ function firstStringField(record: Record<string, unknown>, keys: readonly string
 }
 
 function normalizeToolMatchValue(value: string): string {
-  return value.trim().toLowerCase()
+  return normalize(value)
 }
 
 function collectToolMatchValues(query: string, context: string, preview: string): string[] {
@@ -455,13 +422,13 @@ function toolArgs(payload: GatewayEventPayload | undefined, prevArgs?: unknown):
   const prev = parseMaybeJsonObject(prevArgs)
   const eventArgs = liveToolArgs(payload)
 
-  return redactSensitiveValue({
+  return {
     ...prev,
     ...eventArgs,
     ...(payload?.context ? { context: payload.context } : {}),
     ...(payload?.preview ? { preview: payload.preview } : {}),
     ...carryTodos(payload, prevArgs)
-  }) as Record<string, unknown>
+  }
 }
 
 function toolResult(
@@ -471,7 +438,7 @@ function toolResult(
 ): Record<string, unknown> {
   const parsedResult = parseMaybeJsonObject(payload?.result)
 
-  return redactSensitiveValue({
+  return {
     ...parsedResult,
     ...(payload?.inline_diff ? { inline_diff: payload.inline_diff } : {}),
     ...(payload?.summary ? { summary: payload.summary } : {}),
@@ -480,7 +447,7 @@ function toolResult(
     ...(payload?.duration_s !== undefined ? { duration_s: payload.duration_s } : {}),
     ...carryTodos(payload, prevResult, prevArgs),
     ...(payload?.error ? { error: payload.error } : {})
-  }) as Record<string, unknown>
+  }
 }
 
 export function upsertToolPart(
@@ -580,7 +547,7 @@ function liveToolArgs(payload: GatewayEventPayload | undefined): Record<string, 
 
 function parseStoredToolResult(content: unknown): unknown {
   if (content && typeof content === 'object') {
-    return redactSensitiveValue(content)
+    return content
   }
 
   const textContent = textFromUnknown(content)
@@ -590,9 +557,9 @@ function parseStoredToolResult(content: unknown): unknown {
   }
 
   try {
-    return redactSensitiveValue(JSON.parse(textContent))
+    return JSON.parse(textContent)
   } catch {
-    return redactSensitiveText(textContent)
+    return textContent
   }
 }
 
@@ -605,10 +572,7 @@ function toolPartFromStoredCall(call: unknown, fallbackIndex: number): ChatMessa
     row.name || row.tool_name || fn?.name || (recordFromUnknown(row.input)?.name as string | undefined) || 'tool'
   )
 
-  const args = redactSensitiveValue(firstNonEmptyObject(fn?.arguments, row.arguments, row.args, row.input)) as Record<
-    string,
-    unknown
-  >
+  const args = firstNonEmptyObject(fn?.arguments, row.arguments, row.args, row.input)
 
   return {
     type: 'tool-call',
@@ -684,7 +648,7 @@ function applyStoredToolResultToParts(parts: ChatMessagePart[], toolMessage: Ses
 
 function storedToolMessagePart(toolMessage: SessionMessage, fallbackIndex: number): ChatMessagePart {
   const name = toolMessage.tool_name || toolMessage.name || 'tool'
-  const context = redactSensitiveText(textFromUnknown(toolMessage.context || toolMessage.text || toolMessage.content || ''))
+  const context = textFromUnknown(toolMessage.context || toolMessage.text || toolMessage.content || '')
   const args = context ? { context } : {}
 
   return {
@@ -758,7 +722,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       return false
     }
 
-    active.parts = appendAssistantParts(active.parts, parts)
+    active.parts = [...active.parts, ...parts]
     active.timestamp = timestamp ?? active.timestamp
 
     return true
@@ -856,8 +820,11 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
           ? result[activeAssistantIndex]
           : null
 
-      if (activeAssistant && shouldAppendToActiveAssistant(activeAssistant, parts)) {
-        activeAssistant.parts = appendAssistantParts(activeAssistant.parts, parts)
+      const currentHasToolCall = parts.some(part => part.type === 'tool-call')
+      const activeHasToolCall = Boolean(activeAssistant?.parts.some(part => part.type === 'tool-call'))
+
+      if (activeAssistant && (currentHasToolCall || activeHasToolCall)) {
+        activeAssistant.parts = [...activeAssistant.parts, ...parts]
         activeAssistant.timestamp = message.timestamp ?? activeAssistant.timestamp
 
         return
@@ -866,17 +833,11 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       flushPendingTools(index)
     }
 
-    const senderDevice =
-      message.role === 'user' && typeof message.sender_device === 'string' && message.sender_device.trim()
-        ? message.sender_device.trim()
-        : undefined
-
     result.push({
       id: `${message.timestamp || Date.now()}-${index}-${message.role}`,
       role: message.role,
       parts,
-      timestamp: message.timestamp,
-      ...(senderDevice ? { senderDevice } : {})
+      timestamp: message.timestamp
     })
 
     activeAssistantIndex = message.role === 'assistant' ? result.length - 1 : null

@@ -2,12 +2,12 @@ import { useQuery } from '@tanstack/react-query'
 import { useState } from 'react'
 
 import { useI18n } from '@/i18n'
+import { requestModelOptions } from '@/lib/model-options'
 import { currentPickerSelection } from '@/lib/model-status-label'
-import type { ModelOptionProvider, ModelOptionsResponse, ModelPricing } from '@/types/hermes'
+import { normalize } from '@/lib/text'
+import type { ModelOptionProvider, ModelPricing } from '@/types/hermes'
 
 import type { HermesGateway } from '../hermes'
-import { getGlobalModelOptions } from '../hermes'
-import { modelDescription, routerHostSummary, type RouterHostSummary } from '../lib/model-metadata'
 import { cn } from '../lib/utils'
 import { startManualOnboarding } from '../store/onboarding'
 
@@ -55,15 +55,7 @@ export function ModelPickerDialog({
 
   const modelOptions = useQuery({
     queryKey: ['model-options', sessionId || 'global'],
-    queryFn: () => {
-      if (gw && sessionId) {
-        return gw.request<ModelOptionsResponse>('model.options', {
-          session_id: sessionId
-        })
-      }
-
-      return getGlobalModelOptions()
-    },
+    queryFn: () => requestModelOptions({ gateway: gw, sessionId }),
     enabled: open
   })
 
@@ -109,12 +101,7 @@ export function ModelPickerDialog({
         </DialogHeader>
 
         <Command className="rounded-none bg-card" shouldFilter={false}>
-          <CommandInput
-            autoFocus
-            onValueChange={setSearch}
-            placeholder={copy.search}
-            value={search}
-          />
+          <CommandInput autoFocus onValueChange={setSearch} placeholder={copy.search} value={search} />
           <CommandList className="max-h-96">
             {!loading && !error && <CommandEmpty>{copy.noModels}</CommandEmpty>}
             <ModelResults
@@ -180,7 +167,7 @@ function ModelResults({
     return <div className="px-4 py-6 text-sm text-muted-foreground">{copy.noAuthenticatedProviders}</div>
   }
 
-  const q = search.trim().toLowerCase()
+  const q = normalize(search)
 
   const matches = (provider: ModelOptionProvider, model: string) =>
     !q ||
@@ -217,8 +204,6 @@ function ModelResults({
             {models.map(model => {
               const isCurrent = model === currentModel && provider.slug === currentProvider
               const price = provider.pricing?.[model]
-              const host = routerHostSummary(provider, model)
-              const description = modelDescription(provider, model)
               const locked = unavailable.has(model)
 
               return (
@@ -239,19 +224,9 @@ function ModelResults({
                   value={`${provider.slug}:${model}`}
                 >
                   <span className="min-w-0 flex-1 truncate">{model}</span>
-                  {description && (
-                    <span
-                      className={cn(
-                        'min-w-0 shrink-[2] truncate font-sans text-[0.62rem]',
-                        isCurrent ? 'text-primary-foreground/70' : 'text-muted-foreground'
-                      )}
-                      title={description}
-                    >
-                      {description}
-                    </span>
+                  {locked && (
+                    <span className="shrink-0 text-[0.62rem] uppercase tracking-wide opacity-80">{copy.pro}</span>
                   )}
-                  {host && <ModelHostChip host={host} isCurrent={isCurrent} />}
-                  {locked && <span className="shrink-0 text-[0.62rem] uppercase tracking-wide opacity-80">{copy.pro}</span>}
                   <ModelPrice isCurrent={isCurrent} price={price} />
                 </CommandItem>
               )
@@ -265,20 +240,6 @@ function ModelResults({
         )
       })}
     </>
-  )
-}
-
-function ModelHostChip({ host, isCurrent }: { host: RouterHostSummary; isCurrent: boolean }) {
-  return (
-    <span
-      className={cn(
-        'shrink-0 rounded-sm px-1 py-0.5 text-[0.62rem] font-semibold tabular-nums',
-        isCurrent ? 'bg-primary-foreground/20' : 'bg-muted text-muted-foreground'
-      )}
-      title={host.title}
-    >
-      {host.label}
-    </span>
   )
 }
 

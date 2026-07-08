@@ -1,8 +1,7 @@
-import type { ConnectionState, GatewayEvent } from '@hermes/shared'
+import { type ConnectionState, type GatewayEvent, resolveGatewayWsUrl } from '@hermes/shared'
 import { atom } from 'nanostores'
 
 import { HermesGateway } from '@/hermes'
-import { resolveGatewayWsUrl } from '@/lib/gateway-ws-url'
 import { setGatewayState } from '@/store/session'
 
 // ── Multi-profile gateway routing ──────────────────────────────────────────
@@ -57,51 +56,14 @@ interface Secondary {
   // While true the entry auto-reconnects on drop; pruning flips it off so a
   // deliberate close doesn't trigger the backoff loop.
   wantOpen: boolean
-  // ── Remote-gateway backends (channels Phase 2) ──────────────────────────
-  // A local secondary resolves its ws URL through the Electron main's
-  // per-profile backend (desktop.getConnection(profile)). A REMOTE secondary
-  // attaches to ANOTHER device's gateway discovered via session presence: its
-  // ws URL is the advertised endpoint directly (+ optional token), with no
-  // local backend process to spawn or keep alive. `endpoint` set ⇒ remote.
-  endpoint?: string
-  token?: string
 }
 
 const secondaries = new Map<string, Secondary>()
-
-// Remote backends are keyed by their ws endpoint URL, which always contains
-// "://"; local profile keys never do, so the two namespaces can't collide.
-export function isRemoteBackendKey(key: string): boolean {
-  return key.includes('://')
-}
-
-// Build the dialable ws URL for a remote gateway from its advertised endpoint.
-// The dashboard's auth accepts a ``?token=`` query param (browsers can't set
-// WebSocket headers); append it without clobbering an existing query string.
-export function remoteGatewayWsUrl(endpoint: string, token?: string): string {
-  const base = endpoint.trim()
-
-  if (!token) {
-    return base
-  }
-
-  const sep = base.includes('?') ? '&' : '?'
-
-  return `${base}${sep}token=${encodeURIComponent(token)}`
-}
 
 let activeKey = 'default'
 
 export function isActivePrimary(): boolean {
   return activeKey === primaryProfile
-}
-
-// True when outbound requests currently route to a REMOTE gateway (another
-// device's dashboard, attached via ensureGatewayForEndpoint). Prompt flows use
-// this to attach this device's identity — the remote gateway's auto-stamp
-// would otherwise attribute the message to the remote host.
-export function activeBackendIsRemote(): boolean {
-  return isRemoteBackendKey(activeKey)
 }
 
 export function activeGateway(): HermesGateway | null {
@@ -141,14 +103,6 @@ function clearTimer(entry: Secondary): void {
 }
 
 async function openSecondary(entry: Secondary): Promise<void> {
-  // Remote backend: dial the advertised endpoint directly. There is no local
-  // backend process, so we skip getConnection / touchBackend entirely.
-  if (entry.endpoint) {
-    await entry.gateway.connect(remoteGatewayWsUrl(entry.endpoint, entry.token))
-
-    return
-  }
-
   const desktop = window.hermesDesktop
 
   if (!desktop) {
@@ -196,25 +150,23 @@ async function reconnectSecondary(entry: Secondary): Promise<void> {
   }
 }
 
-function createSecondary(key: string, remote?: { endpoint: string; token?: string }): Secondary {
+function createSecondary(profile: string): Secondary {
   const gateway = new HermesGateway()
 
   const entry: Secondary = {
-    profile: key,
+    profile,
     gateway,
     offEvent: () => {},
     offState: () => {},
     reconnectTimer: null,
     reconnectAttempt: 0,
     reconnecting: false,
-    wantOpen: true,
-    endpoint: remote?.endpoint,
-    token: remote?.token
+    wantOpen: true
   }
 
   entry.offEvent = gateway.onEvent(event => config?.onEvent(event))
   entry.offState = gateway.onState(state => {
-    reportGatewayState(key, state)
+    reportGatewayState(profile, state)
 
     if (state === 'open') {
       entry.reconnectAttempt = 0
@@ -224,7 +176,7 @@ function createSecondary(key: string, remote?: { endpoint: string; token?: strin
     }
   })
 
-  secondaries.set(key, entry)
+  secondaries.set(profile, entry)
 
   return entry
 }
@@ -244,131 +196,6 @@ export async function ensureGatewayForProfile(profile: string): Promise<void> {
 
   if (!entry) {
     entry = createSecondary(key)
-  }
-
-  entry.wantOpen = true
-
-  if (!isOpen(entry.gateway)) {
-    clearTimer(entry)
-    entry.reconnectAttempt = 0
-
-    try {
-      await openSecondary(entry)
-    } catch {
-      scheduleReconnect(entry)
-    }
-  }
-
-  setActive(key)
-}
-
-async function openSecondaryIfNeeded(entry: Secondary): Promise<void> {
-  entry.wantOpen = true
-
-  if (isOpen(entry.gateway)) {
-    return
-  }
-
-  clearTimer(entry)
-  entry.reconnectAttempt = 0
-
-  try {
-    await openSecondary(entry)
-  } catch {
-    scheduleReconnect(entry)
-  }
-}
-
-// Resolve a profile backend without making it the active/focused gateway.
-// Bulk fan-out uses this so prompts/stops sent to other sessions do not flicker
-// the foreground chat through each selected profile.
-export async function gatewayForProfile(profile: string): Promise<HermesGateway | null> {
-  const key = normKey(profile)
-
-  if (key === primaryProfile) {
-    return primaryGateway
-  }
-
-  let entry = secondaries.get(key)
-
-  if (!entry) {
-    entry = createSecondary(key)
-  }
-
-  await openSecondaryIfNeeded(entry)
-
-  return isOpen(entry.gateway) ? entry.gateway : null
-}
-
-// Resolve a remote endpoint backend without making it active.
-export async function gatewayForEndpoint(endpoint: string, token?: string): Promise<HermesGateway | null> {
-  const key = endpoint.trim()
-
-  if (!key) {
-    return null
-  }
-
-  let entry = secondaries.get(key)
-
-  if (!entry) {
-    entry = createSecondary(key, { endpoint: key, token })
-  } else {
-    entry.token = token
-  }
-
-  await openSecondaryIfNeeded(entry)
-
-  return isOpen(entry.gateway) ? entry.gateway : null
-}
-
-export async function requestGatewayForProfile<T>(
-  profile: string,
-  method: string,
-  params: Record<string, unknown> = {}
-): Promise<T> {
-  const gateway = await gatewayForProfile(profile)
-
-  if (!gateway) {
-    throw new Error(`Hermes gateway unavailable for profile ${normKey(profile)}`)
-  }
-
-  return gateway.request<T>(method, params)
-}
-
-export async function requestGatewayForEndpoint<T>(
-  endpoint: string,
-  method: string,
-  params: Record<string, unknown> = {},
-  token?: string
-): Promise<T> {
-  const gateway = await gatewayForEndpoint(endpoint, token)
-
-  if (!gateway) {
-    throw new Error('Hermes gateway unavailable for remote session')
-  }
-
-  return gateway.request<T>(method, params)
-}
-
-// Make a REMOTE gateway (another device's dashboard, discovered via session
-// presence) the active backend — the channels Phase 2 counterpart to
-// ensureGatewayForProfile. Keyed by endpoint URL so repeated attaches reuse
-// one socket; the token is refreshed each call (presence tickets rotate).
-// Reuses the same fanout-feeding event handler and reconnect/backoff loop as
-// local secondaries, so a remote session streams exactly like a local one.
-export async function ensureGatewayForEndpoint(endpoint: string, token?: string): Promise<void> {
-  const key = endpoint.trim()
-
-  if (!key) {
-    return
-  }
-
-  let entry = secondaries.get(key)
-
-  if (!entry) {
-    entry = createSecondary(key, { endpoint: key, token })
-  } else {
-    entry.token = token // refresh a rotated ticket before (re)connecting
   }
 
   entry.wantOpen = true

@@ -150,6 +150,7 @@ export interface McpServerStatus {
 export interface SessionInfo {
   cwd?: string
   fast?: boolean
+  install_warning?: string
   lazy?: boolean
   mcp_servers?: McpServerStatus[]
   model: string
@@ -167,6 +168,7 @@ export interface SessionInfo {
 }
 
 export interface Usage {
+  active_subagents?: number
   calls: number
   compressions?: number
   context_max?: number
@@ -179,15 +181,6 @@ export interface Usage {
   output: number
   reasoning?: number
   total: number
-}
-
-export interface TokenUsagePayload {
-  context_length?: unknown
-  context_pct?: unknown
-  context_tokens?: unknown
-  input_tokens?: unknown
-  output_tokens?: unknown
-  total_tokens?: unknown
 }
 
 export interface SudoReq {

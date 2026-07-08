@@ -4,13 +4,7 @@ import { useCallback } from 'react'
 import { getGlobalModelInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { notifyError } from '@/store/notifications'
-import {
-  $activeSessionId,
-  $currentModel,
-  $currentProvider,
-  setCurrentModel,
-  setCurrentProvider
-} from '@/store/session'
+import { $activeSessionId, $currentModel, $currentProvider, setCurrentModel, setCurrentProvider } from '@/store/session'
 import type { ModelOptionsResponse } from '@/types/hermes'
 
 interface ModelSelection {
@@ -58,10 +52,6 @@ export function useModelControls({ activeSessionId, queryClient, requestGateway 
 
       const result = await getGlobalModelInfo()
 
-      // A resumed/live session owns the footer model state. Global config
-      // refreshes (gateway boot, profile swap, settings save) must not clobber
-      // the active chat's runtime model/provider in the status bar. Re-check
-      // after the await since a session may have gone live during the fetch.
       if ($activeSessionId.get() || (!force && $currentModel.get())) {
         return
       }

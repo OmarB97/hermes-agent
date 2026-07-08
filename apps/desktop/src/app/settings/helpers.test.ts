@@ -132,13 +132,47 @@ describe('settings helpers', () => {
       // KIMI_CN_ likewise must beat KIMI_.
       expect(providerGroup('KIMI_CN_API_KEY')).toBe('Kimi (China)')
       expect(providerGroup('KIMI_API_KEY')).toBe('Kimi / Moonshot')
-      // HERMES_QWEN_ and HERMES_GEMINI_ both share the HERMES_ stem.
+      // HERMES_QWEN_ shares the HERMES_ stem with other integrations.
       expect(providerGroup('HERMES_QWEN_BASE_URL')).toBe('DashScope (Qwen)')
-      expect(providerGroup('HERMES_GEMINI_CLIENT_ID')).toBe('Gemini')
+      expect(providerGroup('GEMINI_API_KEY')).toBe('Gemini')
     })
 
     it('falls back to "Other" for un-grouped env vars', () => {
       expect(providerGroup('SOMETHING_RANDOM')).toBe('Other')
+    })
+  })
+
+  describe('enumOptionsFor — backend selector dropdowns', () => {
+    const config: HermesConfigRecord = {}
+
+    it('renders a dropdown for the TTS provider including xAI (Grok)', () => {
+      const opts = enumOptionsFor('tts.provider', 'edge', config)
+      expect(opts).toBeDefined()
+      expect(opts).toContain('xai')
+      expect(opts).toContain('edge')
+      expect(opts).toContain('elevenlabs')
+    })
+
+    it('renders a dropdown for the STT provider including xAI (Grok)', () => {
+      const opts = enumOptionsFor('stt.provider', 'local', config)
+      expect(opts).toEqual(['local', 'groq', 'openai', 'mistral', 'xai', 'elevenlabs'])
+    })
+
+    it('renders dropdowns for per-backend model/device sub-fields', () => {
+      expect(enumOptionsFor('stt.openai.model', 'whisper-1', config)).toContain('gpt-4o-transcribe')
+      expect(enumOptionsFor('tts.openai.model', 'gpt-4o-mini-tts', config)).toContain('tts-1-hd')
+      expect(enumOptionsFor('tts.neutts.device', 'cpu', config)).toEqual(['cpu', 'cuda', 'mps'])
+    })
+
+    it('renders a dropdown for the terminal execution backend', () => {
+      const opts = enumOptionsFor('terminal.backend', 'local', config)
+      expect(opts).toEqual(['local', 'docker', 'singularity', 'modal', 'daytona', 'ssh'])
+    })
+
+    it('appends a hand-typed value not in the known list so it stays selected', () => {
+      const opts = enumOptionsFor('tts.provider', 'my-custom-command-tts', config)
+      expect(opts).toContain('my-custom-command-tts')
+      expect(opts).toContain('xai')
     })
   })
 })
