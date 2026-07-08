@@ -920,6 +920,56 @@ def test_custom_providers_discover_models_false_keeps_explicit_subset(monkeypatc
                 "gateway-model-a": {"context_length": 128000},
                 "gateway-model-b": {"context_length": 128000},
             },
+        }
+    ]
+
+    providers = list_authenticated_providers(
+        current_provider="openrouter",
+        current_base_url="https://openrouter.ai/api/v1",
+        custom_providers=custom_providers,
+        max_models=50,
+    )
+
+    gateway_prov = next(
+        (
+            p
+            for p in providers
+            if p.get("api_url") == "https://gateway.example.com/v1"
+        ),
+        None,
+    )
+
+    assert gateway_prov is not None, "Custom provider group not found in results"
+    assert calls == [], (
+        "fetch_api_models must NOT be called when discover_models is false"
+    )
+    assert gateway_prov["models"] == [
+        "gateway-model-a",
+        "gateway-model-b",
+    ], "Explicit models: subset must be preserved when discovery is disabled"
+    assert gateway_prov["total_models"] == 2
+
+
+def test_custom_providers_carry_live_router_metadata(monkeypatch):
+    """AI-router custom endpoints should expose host metadata to GUI pickers."""
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
+
+    def fake_probe_api_models(api_key, base_url, timeout=5.0, api_mode=None):
+        return {
+            "models": ["qwen3.6-35b", "qwen3.6-27b"],
+            "model_metadata": {
+                "qwen3.6-35b": {
+                    "router_backend": "llama-swap",
+                    "router_host": "ko-mac",
+                    "router_hosts": ["ko-mac", "ko-taro"],
+                },
+                "qwen3.6-27b": {
+                    "router_backend": "llama-swap",
+                    "router_host": "ko-taro",
+                    "router_hosts": ["ko-taro"],
+                },
+            },
             "probed_url": "https://ai-router.example.com/v1/models",
             "resolved_base_url": "https://ai-router.example.com/v1",
             "suggested_base_url": None,
@@ -942,24 +992,11 @@ def test_custom_providers_discover_models_false_keeps_explicit_subset(monkeypatc
         max_models=50,
     )
 
-    gateway_prov = next(
-        (
-            p
-            for p in providers
-            if p.get("api_url") == "https://gateway.example.com/v1"
-        ),
-        None,
-    )
+    row = next(provider for provider in providers if provider["api_url"] == "https://ai-router.example.com/v1")
+    assert row["models"] == ["qwen3.6-35b", "qwen3.6-27b"]
+    assert row["model_metadata"]["qwen3.6-35b"]["router_host"] == "ko-mac"
+    assert row["model_metadata"]["qwen3.6-35b"]["router_hosts"] == ["ko-mac", "ko-taro"]
 
-    assert gateway_prov is not None, "Custom provider group not found in results"
-    assert calls == [], (
-        "fetch_api_models must NOT be called when discover_models is false"
-    )
-    assert gateway_prov["models"] == [
-        "gateway-model-a",
-        "gateway-model-b",
-    ], "Explicit models: subset must be preserved when discovery is disabled"
-    assert gateway_prov["total_models"] == 2
 
 
 def test_custom_providers_discover_models_false_string_is_normalised(monkeypatch):
