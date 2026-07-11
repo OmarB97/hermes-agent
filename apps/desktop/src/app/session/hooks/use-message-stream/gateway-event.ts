@@ -29,6 +29,7 @@ import {
   $currentModel,
   $currentProvider,
   sessionMatchesStoredId,
+  $localDeviceName,
   setCurrentBranch,
   setCurrentCwd,
   setCurrentFastMode,
@@ -36,6 +37,7 @@ import {
   setCurrentReasoningEffort,
   setCurrentServiceTier,
   setCurrentUsage,
+  setLocalDeviceName,
   setSessions,
   setTurnStartedAt,
   setYoloActive
@@ -181,6 +183,13 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
       }
 
       if (event.type === 'gateway.ready') {
+        const rawDeviceName = (payload as { device_name?: unknown } | undefined)?.device_name
+        const deviceName = typeof rawDeviceName === 'string' ? rawDeviceName.trim() : ''
+
+        if (deviceName && !$localDeviceName.get()) {
+          setLocalDeviceName(deviceName)
+        }
+
         return
       } else if (event.type === 'session.info') {
         // Apply session-scoped fields when the event targets the active
