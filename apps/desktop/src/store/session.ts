@@ -136,6 +136,16 @@ function updateAtom<T>(store: AppAtom<T>, next: Updater<T>) {
 export const sessionPinId = (session: Pick<SessionInfo, '_lineage_root_id' | 'id'>): string =>
   session._lineage_root_id ?? session.id
 
+type SessionAliasSource = Pick<SessionInfo, '_lineage_root_id' | 'id'> & { _lineage_ids?: string[] | null }
+
+export const sessionAliasIds = (session: SessionAliasSource): string[] => {
+  const aliases = [session.id, session._lineage_root_id, ...(session._lineage_ids ?? [])].filter(
+    (id): id is string => typeof id === 'string' && id.length > 0
+  )
+
+  return [...new Set(aliases)]
+}
+
 /** True when a stored/lineage id resolves to this session — it matches either
  *  the live id or the stable lineage root (see sessionPinId). The one place the
  *  "same conversation across compression" test lives. */
