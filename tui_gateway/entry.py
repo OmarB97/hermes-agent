@@ -360,6 +360,22 @@ def main():
         _log_exit("startup write failed (broken stdout pipe before first event)")
         sys.exit(0)
 
+    # Keep an auto skin synchronized with the host appearance while preserving
+    # the resilient stdin loop below.
+    try:
+        from hermes_cli.skin_engine import start_appearance_watcher
+
+        def _on_appearance_change(new_skin_name: str) -> None:
+            write_json({
+                "jsonrpc": "2.0",
+                "method": "event",
+                "params": {"type": "skin.changed", "payload": resolve_skin()},
+            })
+
+        start_appearance_watcher(_on_appearance_change)
+    except Exception:
+        pass
+
     while True:
         raw = sys.stdin.readline()
         if not raw:
@@ -368,7 +384,6 @@ def main():
             if not handle_spurious_eof(_recovery_times, _log_exit):
                 break
             continue
-
         line = raw.strip()
         if not line:
             continue
