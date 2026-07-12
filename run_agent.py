@@ -1326,6 +1326,16 @@ class AIAgent:
         """
         stale_base, uses_implicit_default = self._resolved_api_call_stale_timeout_base()
         base_url = getattr(self, "_base_url", None) or self.base_url or ""
+        has_explicit_timeout = (
+            get_provider_stale_timeout(self.provider, self.model) is not None
+            or os.getenv("HERMES_API_CALL_STALE_TIMEOUT") is not None
+        )
+        if not has_explicit_timeout and base_url and is_local_endpoint(base_url):
+            from agent.chat_completion_helpers import _dflash_local_stale_timeout
+
+            dflash_timeout = _dflash_local_stale_timeout(api_payload, self.model)
+            if dflash_timeout is not None:
+                return dflash_timeout
         if uses_implicit_default and base_url and is_local_endpoint(base_url):
             return float("inf")
 
@@ -2809,6 +2819,10 @@ class AIAgent:
             if session_has_running_agent:
                 running_agent.interrupt(new_message.text)
         """
+        # A fallback notice belongs only to the turn that activated it. If
+        # that turn is cancelled, never let the next primary success announce
+        # a stale provider switch.
+        self._pending_fallback_notice = None
         self._interrupt_requested = True
         self._interrupt_message = message
         # A cron turn performs its API request on the conversation thread to
@@ -2865,6 +2879,9 @@ class AIAgent:
 
     def clear_interrupt(self) -> None:
         """Clear any pending interrupt request and the per-thread tool interrupt signal."""
+        # ``clear_interrupt`` is the common turn-finalizer path, including
+        # cancellations noticed outside ``interrupt()`` itself.
+        self._pending_fallback_notice = None
         self._interrupt_requested = False
         self._interrupt_message = None
         self._interrupt_thread_signal_pending = False
