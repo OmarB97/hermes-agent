@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it } from 'vitest'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { $approvalModes, approvalModeForProfile } from '@/store/approval-mode'
 import { $activeGatewayProfile } from '@/store/profile'
+import { $currentFallbackPolicy, setCurrentFallbackPolicy } from '@/store/session'
 import type { SessionInfo } from '@/types/hermes'
 
 import {
@@ -35,6 +36,17 @@ describe('applyRuntimeInfo approval mode', () => {
 
     expect(approvalModeForProfile('work')).toBe('smart')
     expect(approvalModeForProfile('default')).toBe('smart')
+  })
+})
+
+describe('applyRuntimeInfo fallback policy', () => {
+  it('hydrates the effective fallback policy on cold resume', () => {
+    setCurrentFallbackPolicy('')
+
+    expect(applyRuntimeInfo({ fallback_policy: 'local-only' })).toMatchObject({ fallbackPolicy: 'local-only' })
+    expect($currentFallbackPolicy.get()).toBe('local-only')
+
+    setCurrentFallbackPolicy('')
   })
 })
 

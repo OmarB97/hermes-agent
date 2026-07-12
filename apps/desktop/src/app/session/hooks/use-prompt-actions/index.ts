@@ -8,6 +8,7 @@ import { stripAnsi } from '@/lib/ansi'
 import { type ChatMessage, textPart } from '@/lib/chat-messages'
 import { pathLabel, SLASH_COMMAND_RE } from '@/lib/chat-runtime'
 import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
+import { countTranscriptMessages, pruneFallbackNoticesAfter } from '@/lib/fallback-notices'
 import { triggerHaptic } from '@/lib/haptics'
 import { setMutableRef } from '@/lib/mutable-ref'
 import { normalize } from '@/lib/text'
@@ -646,7 +647,7 @@ export function usePromptActions({
       }
 
       clearNotifications()
-      updateSessionState(activeSessionId, state => applyReloadOptimistic(state, plan))
+      const regenerateState = updateSessionState(activeSessionId, state => applyReloadOptimistic(state, plan))
 
       try {
         await requestGateway(
@@ -654,6 +655,13 @@ export function usePromptActions({
           { session_id: activeSessionId, text: plan.text, truncate_before_user_ordinal: plan.truncateOrdinal },
           PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
         )
+
+        if (regenerateState.storedSessionId) {
+          pruneFallbackNoticesAfter(
+            regenerateState.storedSessionId,
+            countTranscriptMessages($messages.get().slice(0, plan.userIndex))
+          )
+        }
       } catch (err) {
         updateSessionState(activeSessionId, state => ({
           ...state,
@@ -703,10 +711,17 @@ export function usePromptActions({
       setMutableRef(busyRef, true)
       setBusy(true)
       setAwaitingResponse(true)
-      updateSessionState(sessionId, state => applyRewindOptimistic(state, plan.sourceIndex))
+      const rewindState = updateSessionState(sessionId, state => applyRewindOptimistic(state, plan.sourceIndex))
 
       try {
         await submitRewindPrompt(sessionId, plan.text, plan.truncateOrdinal, busyRef.current || $busy.get())
+
+        if (rewindState.storedSessionId) {
+          pruneFallbackNoticesAfter(
+            rewindState.storedSessionId,
+            countTranscriptMessages(messages.slice(0, plan.sourceIndex))
+          )
+        }
       } catch (err) {
         // The rewind never landed (e.g. the gateway stayed busy past the retry
         // deadline). Roll the optimistic truncation back to the full original
@@ -749,13 +764,22 @@ export function usePromptActions({
       setMutableRef(busyRef, true)
       setBusy(true)
       setAwaitingResponse(true)
-      updateSessionState(sessionId, state => applyRewindOptimistic(state, plan.sourceIndex, plan.editedMessage))
+      const editState = updateSessionState(sessionId, state =>
+        applyRewindOptimistic(state, plan.sourceIndex, plan.editedMessage)
+      )
 
       const isStaleTargetError = (err: unknown) =>
         /no longer in session history|not in session history/i.test(err instanceof Error ? err.message : String(err))
 
       try {
         await submitRewindPrompt(sessionId, plan.text, plan.truncateOrdinal, busyRef.current || $busy.get())
+
+        if (plan.truncateOrdinal !== undefined && editState.storedSessionId) {
+          pruneFallbackNoticesAfter(
+            editState.storedSessionId,
+            countTranscriptMessages(messages.slice(0, plan.sourceIndex))
+          )
+        }
       } catch (err) {
         let surfaced = err
 

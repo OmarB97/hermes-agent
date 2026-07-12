@@ -1646,6 +1646,14 @@ class CLICommandsMixin:
         _cprint("  You can continue chatting — results will appear when done.\n")
 
         turn_route = self._resolve_turn_agent_config(prompt)
+        fallback_decisions = []
+
+        def _background_status(kind: str, text: str | None = None) -> None:
+            if kind != "fallback":
+                return
+            message = str(text or "").strip()
+            if message and message not in fallback_decisions:
+                fallback_decisions.append(message)
 
         def run_background():
             set_sudo_password_callback(self._sudo_password_callback)
@@ -1682,6 +1690,11 @@ class CLICommandsMixin:
                     provider_data_collection=self._provider_data_collection,
                     openrouter_min_coding_score=self._openrouter_min_coding_score,
                     fallback_model=self._fallback_model,
+                    fallback_chain_from_config=True,
+                    initial_fallback_entry=getattr(
+                        self, "_initial_fallback_entry", None
+                    ),
+                    status_callback=_background_status,
                 )
                 # Silence raw spinner; route thinking through TUI widget when no foreground agent is active.
                 bg_agent._print_fn = lambda *_a, **_kw: None
@@ -1715,6 +1728,8 @@ class CLICommandsMixin:
                 _cprint(f"  ✅ Background task #{task_num} complete")
                 _cprint(f"  Prompt: \"{prompt[:60]}{'...' if len(prompt) > 60 else ''}\"")
                 ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
+                for decision in fallback_decisions:
+                    _cprint(f"  {decision}")
                 if response:
                     try:
                         from hermes_cli.skin_engine import get_active_skin
@@ -1752,6 +1767,8 @@ class CLICommandsMixin:
                     self._app.invalidate()
                     time.sleep(0.05)
                 print()
+                for decision in fallback_decisions:
+                    _cprint(f"  {decision}")
                 _cprint(f"  ❌ Background task #{task_num} failed: {e}")
             finally:
                 try:

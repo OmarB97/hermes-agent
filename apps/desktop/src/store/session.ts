@@ -302,6 +302,9 @@ export const $resumeFailedSessionId = atom<string | null>(null)
 export const $resumeExhaustedSessionId = atom<string | null>(null)
 export const $currentModel = atom(storedString(COMPOSER_MODEL_KEY) ?? '')
 export const $currentProvider = atom(storedString(COMPOSER_PROVIDER_KEY) ?? '')
+// Effective per-session fallback policy reflected from session.info. The
+// durable source is backend config; this atom only mirrors the focused session.
+export const $currentFallbackPolicy = atom<'' | 'any' | 'local-only' | 'off'>('')
 export const $currentReasoningEffort = atom(storedString(COMPOSER_EFFORT_KEY) ?? '')
 export const $currentServiceTier = atom('')
 export const $currentFastMode = atom(storedBoolean(COMPOSER_FAST_KEY, false))
@@ -407,6 +410,9 @@ export const markComposerSelectionManual = (): void => {
   composerSelectionGeneration += 1
   setCurrentModelSource('manual')
 }
+
+export const setCurrentFallbackPolicy = (next: Updater<'' | 'any' | 'local-only' | 'off'>) =>
+  updateAtom($currentFallbackPolicy, next)
 
 export const setCurrentReasoningEffort = (next: Updater<string>) => {
   updateAtom($currentReasoningEffort, next)

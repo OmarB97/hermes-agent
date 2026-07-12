@@ -1,9 +1,25 @@
-"""Helpers for reading the effective fallback provider chain from config."""
+"""Helpers for reading and enforcing the fallback provider policy."""
 
 from __future__ import annotations
 
 import os
 from typing import Any
+
+
+FALLBACK_POLICIES = ("off", "local-only", "any")
+DEFAULT_FALLBACK_POLICY = "any"
+_BUILTIN_LOCAL_PROVIDER_IDS = frozenset({"custom", "local", "lmstudio"})
+
+
+def get_fallback_policy(config: dict[str, Any] | None) -> str:
+    """Return the configured policy, failing closed on invalid input."""
+    config = config or {}
+    if "fallback_policy" not in config:
+        return DEFAULT_FALLBACK_POLICY
+    value = config.get("fallback_policy")
+    if isinstance(value, str) and value in FALLBACK_POLICIES:
+        return value
+    return "off"
 
 
 def _normalized_base_url(value: Any) -> str:
@@ -13,13 +29,7 @@ def _normalized_base_url(value: Any) -> str:
 
 
 def resolve_entry_api_key(entry: dict[str, Any] | None) -> str | None:
-    """API key for one fallback entry: inline ``api_key``, else ``key_env``.
-
-    Mirrors the custom-provider convention (``key_env`` names the env var
-    holding the key; ``api_key_env`` accepted as an alias). Returns None when
-    neither yields a non-empty value, letting ``resolve_runtime_provider``
-    fall through to the provider's standard credential resolution.
-    """
+    """Resolve an entry API key from inline config or its named env var."""
     if not isinstance(entry, dict):
         return None
     inline = str(entry.get("api_key") or "").strip()
@@ -47,15 +57,12 @@ def _iter_fallback_entries(raw: Any) -> list[dict[str, Any]]:
         model = str(entry.get("model") or "").strip()
         if not provider or not model:
             continue
-
         normalized = dict(entry)
         normalized["provider"] = provider
         normalized["model"] = model
-
         base_url = _normalized_base_url(entry.get("base_url"))
         if base_url:
             normalized["base_url"] = base_url
-
         entries.append(normalized)
     return entries
 
@@ -68,19 +75,92 @@ def _entry_identity(entry: dict[str, Any]) -> tuple[str, str, str]:
     )
 
 
-def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
-    """Return the effective fallback chain merged across old and new config keys.
+def _resolve_fallback_provider_definition(
+    entry: dict[str, Any],
+    config: dict[str, Any],
+):
+    provider = str(entry.get("provider") or "").strip()
+    if not provider:
+        return None
+    try:
+        from hermes_cli.config import get_compatible_custom_providers
+        from hermes_cli.providers import resolve_provider_full
 
-    ``fallback_providers`` remains the primary source of truth and keeps its
-    order. Legacy ``fallback_model`` entries are appended afterwards unless
-    they target the same provider/model/base_url route as an earlier entry.
-    The returned list always contains fresh dict copies.
-    """
+        return resolve_provider_full(
+            provider,
+            user_providers=config.get("providers")
+            if isinstance(config.get("providers"), dict)
+            else None,
+            custom_providers=get_compatible_custom_providers(config),
+        )
+    except Exception:
+        return None
 
+
+def fallback_entry_endpoint(
+    entry: dict[str, Any],
+    config: dict[str, Any] | None = None,
+) -> str:
+    """Resolve an entry endpoint from explicit URL or provider metadata."""
+    explicit = _normalized_base_url(entry.get("base_url"))
+    if explicit:
+        return explicit
+
+    config = config or {}
+    resolved = _resolve_fallback_provider_definition(entry, config)
+    if resolved is None:
+        return ""
+    env_name = str(getattr(resolved, "base_url_env_var", "") or "").strip()
+    if env_name:
+        env_url = _normalized_base_url(os.getenv(env_name))
+        if env_url:
+            return env_url
+    return _normalized_base_url(getattr(resolved, "base_url", ""))
+
+
+def fallback_entry_is_local(
+    entry: dict[str, Any],
+    config: dict[str, Any] | None = None,
+) -> bool:
+    """Return whether provider metadata proves that an entry is local."""
+    config = config or {}
+    endpoint = fallback_entry_endpoint(entry, config)
+    if not endpoint:
+        return False
+    try:
+        from agent.model_metadata import is_local_endpoint
+
+        if not is_local_endpoint(endpoint):
+            return False
+        resolved = _resolve_fallback_provider_definition(entry, config)
+        if (
+            resolved is not None
+            and getattr(resolved, "source", "") != "user-config"
+            and str(getattr(resolved, "id", "") or "").strip().lower()
+            not in _BUILTIN_LOCAL_PROVIDER_IDS
+        ):
+            return False
+        canonical_endpoint = _normalized_base_url(
+            getattr(resolved, "base_url", "") if resolved is not None else ""
+        )
+        if (
+            canonical_endpoint
+            and getattr(resolved, "source", "") != "user-config"
+            and not is_local_endpoint(canonical_endpoint)
+        ):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def get_configured_fallback_chain(
+    config: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Return the ordered configured chain before policy filtering."""
     config = config or {}
     chain: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
-
     for key in ("fallback_providers", "fallback_model"):
         for entry in _iter_fallback_entries(config.get(key)):
             identity = _entry_identity(entry)
@@ -88,5 +168,31 @@ def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
                 continue
             seen.add(identity)
             chain.append(entry)
+    return chain
 
+
+def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Return routes eligible under ``off | local-only | any``."""
+    config = config or {}
+    policy = get_fallback_policy(config)
+    if policy == "off":
+        return []
+    chain = get_configured_fallback_chain(config)
+    if policy == "local-only":
+        return [entry for entry in chain if fallback_entry_is_local(entry, config)]
+    return chain
+
+
+def filter_fallback_chain_for_policy(
+    entries: Any,
+    config: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Apply the effective policy to a caller-supplied fallback chain."""
+    config = config or {}
+    policy = get_fallback_policy(config)
+    if policy == "off":
+        return []
+    chain = _iter_fallback_entries(entries)
+    if policy == "local-only":
+        return [entry for entry in chain if fallback_entry_is_local(entry, config)]
     return chain

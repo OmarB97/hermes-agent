@@ -998,6 +998,9 @@ def _ensure_hermes_home_managed(home: Path):
 DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
+    # Cross-provider fallback safety boundary. Compatibility default is
+    # ``any``; supported values are exactly: off | local-only | any.
+    "fallback_policy": "any",
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
@@ -5639,6 +5642,15 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                         f"custom_providers[{i}] is missing 'base_url' field",
                         "Add the API endpoint URL, e.g.: base_url: https://api.example.com/v1",
                     ))
+
+    # ── fallback_policy: exact failover boundary ─────────────────────────
+    fallback_policy = config.get("fallback_policy", "any")
+    if fallback_policy not in {"off", "local-only", "any"}:
+        issues.append(ConfigIssue(
+            "error",
+            "fallback_policy must be exactly one of: off, local-only, any",
+            "Set the top-level field, e.g. `fallback_policy: local-only`",
+        ))
 
     # ── fallback_model: single dict OR list of dicts (chain) ─────────────
     fb = config.get("fallback_model")

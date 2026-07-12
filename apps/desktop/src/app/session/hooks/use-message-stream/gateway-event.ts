@@ -9,6 +9,12 @@ import { translateNow } from '@/i18n'
 import { type GatewayEventPayload, textPart } from '@/lib/chat-messages'
 import { coerceGatewayText, coerceThinkingText, normalizePersonalityValue } from '@/lib/chat-runtime'
 import { playCompletionSound } from '@/lib/completion-sound'
+import {
+  countTranscriptMessages,
+  createFallbackNotice,
+  deferFallbackNotice,
+  persistFallbackNotice
+} from '@/lib/fallback-notices'
 import { resolveGatewayEventSessionId } from '@/lib/gateway-events'
 import { triggerHaptic } from '@/lib/haptics'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
@@ -32,6 +38,7 @@ import {
   $localDeviceName,
   setCurrentBranch,
   setCurrentCwd,
+  setCurrentFallbackPolicy,
   setCurrentFastMode,
   setCurrentPersonality,
   setCurrentReasoningEffort,
@@ -51,7 +58,13 @@ import type { RpcEvent } from '@/types/hermes'
 
 import type { ClientSessionState } from '../../../types'
 
-import { hasSessionInfoStatePatch, sessionInfoStatePatch, SUBAGENT_EVENT_TYPES, toTodoPayload } from './utils'
+import {
+  fallbackStatusText,
+  hasSessionInfoStatePatch,
+  sessionInfoStatePatch,
+  SUBAGENT_EVENT_TYPES,
+  toTodoPayload
+} from './utils'
 
 const COMPACTION_RESUME_EVENT_TYPES = new Set([
   'message.delta',
@@ -235,6 +248,10 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           // (or a stale session model) and would silently revert the dropdown.
           // Active-session model/provider still flows through the session state
           // cache via updateSessionState → syncRuntimeMetadataToView below.
+
+          if (statePatch.fallbackPolicy) {
+            setCurrentFallbackPolicy(statePatch.fallbackPolicy)
+          }
 
           if (typeof payload?.cwd === 'string') {
             // The active session's agent can relocate itself (new repo/worktree
@@ -736,7 +753,46 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // The process is untouched — this only drops the view.
         closeAgentTerminalByProc(payload?.process_id ?? '')
       } else if (event.type === 'status.update') {
-        if (sessionId && payload?.kind === 'compacting') {
+        const fallbackText = fallbackStatusText(payload)
+
+        if (sessionId && fallbackText) {
+          flushQueuedDeltas(sessionId)
+          const notice = createFallbackNotice(fallbackText)
+
+          const nextState = updateSessionState(sessionId, state => {
+            const streamIndex = state.streamId ? state.messages.findIndex(message => message.id === state.streamId) : -1
+            const messages = [...state.messages]
+
+            // Keep the decision before the response produced by the selected
+            // fallback, even when an empty pending assistant bubble already
+            // exists for this turn.
+            if (streamIndex >= 0) {
+              messages.splice(streamIndex, 0, notice)
+            } else {
+              messages.push(notice)
+            }
+
+            return { ...state, messages }
+          })
+
+          if (nextState.storedSessionId) {
+            const noticeIndex = nextState.messages.findIndex(message => message.id === notice.id)
+
+            const beforeMessageCount = countTranscriptMessages(
+              noticeIndex >= 0 ? nextState.messages.slice(0, noticeIndex) : nextState.messages
+            )
+
+            persistFallbackNotice(nextState.storedSessionId, notice, beforeMessageCount)
+          } else {
+            const noticeIndex = nextState.messages.findIndex(message => message.id === notice.id)
+
+            const beforeMessageCount = countTranscriptMessages(
+              noticeIndex >= 0 ? nextState.messages.slice(0, noticeIndex) : nextState.messages
+            )
+
+            deferFallbackNotice(sessionId, notice, beforeMessageCount)
+          }
+        } else if (sessionId && payload?.kind === 'compacting') {
           setSessionCompacting(sessionId, true)
           compactedTurnRef.current.add(sessionId)
         } else if (sessionId && payload?.kind === 'process') {

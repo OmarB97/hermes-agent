@@ -3811,6 +3811,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
     info: dict = {
         "model": mirror.get("model", getattr(agent, "model", "")),
         "provider": mirror.get("provider", getattr(agent, "provider", "")),
+        "fallback_policy": getattr(agent, "_fallback_policy", "any"),
         "reasoning_effort": reasoning_effort,
         "service_tier": service_tier,
         "fast": service_tier == "priority",
@@ -4613,15 +4614,35 @@ def _parse_tui_skills_env() -> list[str]:
 def _load_fallback_model():
     """Return the configured fallback chain for TUI-created agents.
 
-    Delegates to the shared ``get_fallback_chain`` helper so the TUI path
+    Delegates to the shared configured-chain helper so the TUI path
     stays in parity with ``HermesCLI.__init__`` and ``gateway/run.py``:
     ``fallback_providers`` is the primary source of truth and keeps its
     order, with legacy ``fallback_model`` entries merged in afterwards
     (deduped on provider/model/base_url).
     """
-    from hermes_cli.fallback_config import get_fallback_chain
+    from hermes_cli.fallback_config import get_configured_fallback_chain
 
-    return get_fallback_chain(_load_cfg())
+    return get_configured_fallback_chain(_load_cfg())
+
+
+def _load_effective_fallback_model():
+    """Return only routes eligible under the active fallback policy."""
+    from hermes_cli.fallback_config import (
+        fallback_entry_is_local,
+        get_fallback_policy,
+    )
+
+    cfg = _load_cfg()
+    policy = get_fallback_policy(cfg)
+    if policy == "off":
+        return []
+    chain = _load_fallback_model() or []
+    if policy == "local-only":
+        return [
+            entry for entry in chain
+            if isinstance(entry, dict) and fallback_entry_is_local(entry, cfg)
+        ]
+    return chain
 
 
 def _agent_fallback_model(agent):
@@ -4635,6 +4656,10 @@ def _agent_fallback_model(agent):
 
 def _background_agent_kwargs(agent, task_id: str) -> dict:
     cfg = _load_cfg()
+    active_fallback_entry = (
+        getattr(agent, "_active_fallback_entry", None)
+        or getattr(agent, "_init_fallback_entry", None)
+    )
 
     return {
         "base_url": getattr(agent, "base_url", None) or None,
@@ -4668,6 +4693,10 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "platform": "tui",
         "session_db": _get_db(),
         "fallback_model": _agent_fallback_model(agent),
+        "fallback_chain_from_config": getattr(
+            agent, "_fallback_chain_from_config", False
+        ),
+        "initial_fallback_entry": active_fallback_entry,
     }
 
 
@@ -4916,6 +4945,8 @@ class _RuntimeFallbackResolution(NamedTuple):
     runtime: dict
     selected_model: str | None
     used_fallback: bool
+    initial_fallback_decision: str | None = None
+    initial_fallback_entry: dict | None = None
 
 
 def _resolve_runtime_with_fallback(
@@ -4939,7 +4970,7 @@ def _resolve_runtime_with_fallback(
             False,
         )
     except AuthError as primary_exc:
-        fb_chain = _load_fallback_model() or []
+        fb_chain = _load_effective_fallback_model() or []
         for entry in fb_chain:
             if not isinstance(entry, dict):
                 continue
@@ -4968,10 +4999,49 @@ def _resolve_runtime_with_fallback(
                     fb_provider,
                     fb_model,
                 )
-                return _RuntimeFallbackResolution(runtime, fb_model, True)
+                from hermes_cli.fallback_config import get_fallback_policy
+
+                policy = get_fallback_policy(_load_cfg())
+                primary_model = str(
+                    kwargs.get("target_model") or "configured model"
+                )
+                primary_provider = str(
+                    kwargs.get("requested") or "primary provider"
+                )
+                decision = (
+                    f"🔄 Fallback policy {policy}: {primary_model} via "
+                    f"{primary_provider} could not initialize (reason: "
+                    f"{primary_exc}); switching to {entry.get('model')} via "
+                    f"{fb_provider}."
+                )
+                return _RuntimeFallbackResolution(
+                    runtime,
+                    fb_model,
+                    True,
+                    decision,
+                    dict(entry),
+                )
             except Exception:
                 continue
-        raise
+        from hermes_cli.fallback_config import get_fallback_policy
+
+        policy = get_fallback_policy(_load_cfg())
+        if policy == "off":
+            detail = "Fallback policy off: no backup provider was attempted."
+        elif policy == "local-only":
+            detail = (
+                "Fallback policy local-only: no usable local backup route remained."
+            )
+        else:
+            detail = (
+                "Fallback policy any: no usable configured backup route remained."
+            )
+        raise AuthError(
+            f"{primary_exc}\n{detail}",
+            provider=getattr(primary_exc, "provider", ""),
+            code=getattr(primary_exc, "code", None),
+            relogin_required=getattr(primary_exc, "relogin_required", False),
+        ) from primary_exc
 
 
 def _make_agent(
@@ -5111,7 +5181,7 @@ def _make_agent(
             model = resolution.selected_model
     _pr = _load_provider_routing()
     return AIAgent(
-        model=model,
+        model=runtime.get("model") or model,
         max_iterations=_cfg_max_turns(cfg, 90),
         provider=runtime.get("provider"),
         base_url=runtime.get("base_url"),
@@ -5155,6 +5225,9 @@ def _make_agent(
         skip_context_files=is_truthy_value(os.environ.get("HERMES_IGNORE_RULES")),
         skip_memory=is_truthy_value(os.environ.get("HERMES_IGNORE_RULES")),
         fallback_model=_load_fallback_model(),
+        fallback_chain_from_config=True,
+        initial_fallback_decision=resolution.initial_fallback_decision,
+        initial_fallback_entry=resolution.initial_fallback_entry,
         **_agent_cbs(sid),
     )
 
@@ -11113,7 +11186,12 @@ def _(rid, params: dict) -> dict:
             from run_agent import AIAgent
 
             result = AIAgent(
-                **_background_agent_kwargs(session["agent"], task_id)
+                **_background_agent_kwargs(session["agent"], task_id),
+                status_callback=lambda kind, text=None: _status_update(
+                    parent,
+                    str(kind),
+                    None if text is None else str(text),
+                ),
             ).run_conversation(
                 user_message=text,
                 task_id=task_id,

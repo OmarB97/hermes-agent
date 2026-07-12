@@ -6,6 +6,7 @@ import { revealTreePane } from '@/components/pane-shell/tree/store'
 import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { type ChatMessage, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
+import { restoreFallbackNotices } from '@/lib/fallback-notices'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { clearQueuedPrompts } from '@/store/composer-queue'
@@ -33,6 +34,7 @@ import {
   setCurrentBranch,
   setCurrentCwd,
   setCurrentCwdTransient,
+  setCurrentFallbackPolicy,
   setCurrentServiceTier,
   setCurrentUsage,
   setFreshDraftReady,
@@ -137,9 +139,10 @@ function applyStoredUsage(stored: { input_tokens?: number | null; output_tokens?
 function reconcileAuthoritativeMessages(
   authoritativeMessages: SessionResumeResponse['messages'],
   previousMessages: ChatMessage[],
+  storedSessionId: string,
   liveProjection?: Pick<SessionResumeResponse, 'inflight' | 'queued' | 'session_id'>
 ): ChatMessage[] {
-  const authoritative = toChatMessages(authoritativeMessages)
+  const authoritative = restoreFallbackNotices(storedSessionId, toChatMessages(authoritativeMessages))
   const withLiveProjection = liveProjection ? appendLiveSessionProjection(authoritative, liveProjection) : authoritative
   const reconciled = reconcileResumeMessages(withLiveProjection, previousMessages)
   const withPendingTurn = preserveLocalPendingTurnMessages(reconciled, previousMessages)
@@ -300,6 +303,7 @@ export function useSessionActions({
       // refreshCurrentModel). Only $currentServiceTier (a live-session mirror)
       // is cleared.
       setCurrentServiceTier('')
+      setCurrentFallbackPolicy('')
       setYoloActive(false)
       setNewChatWorkspaceTarget(hasWorkspaceTarget ? workspaceTarget : undefined)
 
@@ -806,15 +810,19 @@ export function useSessionActions({
           if (prefetchPromise) {
             const storedMessages = await prefetchPromise
 
-            if (isCurrentResume()) {
-              const previousMessages = resumedSameSelectedSession
-                ? preserveLocalPendingTurnMessages($messages.get(), resumeStartMessages)
-                : $messages.get()
+              if (isCurrentResume()) {
+                const previousMessages = resumedSameSelectedSession
+                  ? preserveLocalPendingTurnMessages($messages.get(), resumeStartMessages)
+                  : $messages.get()
 
-              localSnapshot = reconcileAuthoritativeMessages(storedMessages.messages, previousMessages)
-              prefetchApplied = true
-              prefetchedMessageCount = storedMessages.messages.length
-              prefetchedStoredSessionId = storedMessages.session_id || storedSessionId
+                localSnapshot = reconcileAuthoritativeMessages(
+                  storedMessages.messages,
+                  previousMessages,
+                  storedSessionId
+                )
+                prefetchApplied = true
+                prefetchedMessageCount = storedMessages.messages.length
+                prefetchedStoredSessionId = storedMessages.session_id || storedSessionId
 
               if (!chatMessageArraysEquivalent($messages.get(), localSnapshot)) {
                 setMessages(localSnapshot)
@@ -850,13 +858,18 @@ export function useSessionActions({
           prefetchMatchesResumedSession &&
           !hasLiveProjection &&
           resumed.messages.length <= prefetchedMessageCount
-            ? localSnapshot
-            : (() => {
+              ? localSnapshot
+              : (() => {
                 const previousMessages = resumedSameSelectedSession
                   ? preserveLocalPendingTurnMessages(currentMessages, resumeStartMessages)
                   : currentMessages
 
-                const resumedMessages = reconcileAuthoritativeMessages(resumed.messages, previousMessages, resumed)
+                const resumedMessages = reconcileAuthoritativeMessages(
+                  resumed.messages,
+                  previousMessages,
+                  storedSessionId,
+                  resumed
+                )
 
                 return chatMessageArraysEquivalent(currentMessages, resumedMessages) ? currentMessages : resumedMessages
               })()
@@ -923,7 +936,7 @@ export function useSessionActions({
             ? preserveLocalPendingTurnMessages($messages.get(), resumeStartMessages)
             : $messages.get()
 
-          setMessages(reconcileAuthoritativeMessages(fallback.messages, previousMessages))
+          setMessages(reconcileAuthoritativeMessages(fallback.messages, previousMessages, storedSessionId))
         } catch (e) {
           // Fallback also failed: nothing to paint. Leave whatever messages are
           // already shown and fall through to arm the resume-failure latch so
