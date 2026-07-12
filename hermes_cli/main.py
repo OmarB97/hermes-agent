@@ -4455,7 +4455,10 @@ def cmd_cron(args):
     """Cron job management."""
     from hermes_cli.cron import cron_command
 
-    cron_command(args)
+    result = cron_command(args)
+    if isinstance(result, int) and result != 0:
+        raise SystemExit(result)
+    return result
 
 
 def cmd_webhook(args):
@@ -13342,6 +13345,7 @@ def cmd_claw(args):
     from hermes_cli.claw import claw_command
 
     claw_command(args)
+
 
 
 def main():

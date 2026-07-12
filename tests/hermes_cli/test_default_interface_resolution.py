@@ -236,6 +236,7 @@ class TestParserFlags:
         assert "--tui" in inherited
 
 
+
 # ---------------------------------------------------------------------------
 # config default — shipped default preserves classic behavior
 # ---------------------------------------------------------------------------
