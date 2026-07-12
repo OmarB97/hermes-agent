@@ -4259,7 +4259,10 @@ def cmd_cron(args):
     """Cron job management."""
     from hermes_cli.cron import cron_command
 
-    cron_command(args)
+    result = cron_command(args)
+    if isinstance(result, int) and result != 0:
+        raise SystemExit(result)
+    return result
 
 
 def cmd_webhook(args):
@@ -13056,14 +13059,22 @@ _POST_SUBCOMMAND_TOP_LEVEL_VALUE_FLAGS = frozenset(
 )
 
 
+def _parser_option_strings(parser) -> set[str]:  # noqa: ANN001
+    """Collect native options from a parser and every nested subparser."""
+    options: set[str] = set()
+    for action in getattr(parser, "_actions", []):
+        options.update(getattr(action, "option_strings", []))
+        choices = getattr(action, "choices", None)
+        if isinstance(choices, dict):
+            for child in choices.values():
+                options.update(_parser_option_strings(child))
+    return options
+
+
 def _subcommand_option_strings(subparsers) -> dict[str, set[str]]:  # noqa: ANN001
     choices = getattr(subparsers, "choices", {}) or {}
     return {
-        name: {
-            option
-            for action in getattr(parser, "_actions", [])
-            for option in getattr(action, "option_strings", [])
-        }
+        name: _parser_option_strings(parser)
         for name, parser in choices.items()
     }
 

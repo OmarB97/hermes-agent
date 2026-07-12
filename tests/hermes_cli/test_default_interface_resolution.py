@@ -238,6 +238,45 @@ class TestPostSubcommandGlobalFlagHoisting:
         assert args.command == "chat"
         assert args.provider == "gmi"
 
+    def test_nested_cron_edit_keeps_native_provider_and_model_flags(self):
+        from hermes_cli._parser import build_top_level_parser
+        from hermes_cli.subcommands.cron import build_cron_parser
+
+        parser, subparsers, _chat = build_top_level_parser()
+        build_cron_parser(subparsers, cmd_cron=lambda args: args)
+        original = [
+            "cron",
+            "edit",
+            "job-id",
+            "--provider",
+            "ai-router",
+            "--model",
+            "qwen3.6-27b-nvfp4",
+        ]
+
+        argv = m._hoist_post_subcommand_global_flags(
+            original,
+            set(subparsers.choices.keys()),
+            m._subcommand_option_strings(subparsers),
+        )
+        args = parser.parse_args(argv)
+
+        assert argv == original
+        assert args.command == "cron"
+        assert args.cron_command == "edit"
+        assert args.provider == "ai-router"
+        assert args.model == "qwen3.6-27b-nvfp4"
+
+    def test_cron_failure_exits_nonzero(self, monkeypatch):
+        from hermes_cli import cron as cron_module
+
+        monkeypatch.setattr(cron_module, "cron_command", lambda _args: 1)
+
+        with pytest.raises(SystemExit) as exc:
+            m.cmd_cron(object())
+
+        assert exc.value.code == 1
+
     def test_double_dash_stops_global_flag_hoisting(self):
         _parser, subparsers = self._dashboard_parser()
         argv = ["dashboard", "--", "--tui"]
