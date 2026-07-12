@@ -12,6 +12,7 @@ Verifies that:
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
 
 from agent.error_classifier import FailoverReason
 from run_agent import AIAgent
@@ -121,6 +122,16 @@ class TestRestorePrimaryRuntime:
         agent = _make_agent()
         assert agent._fallback_activated is False
         assert agent._restore_primary_runtime() is False
+
+    def test_restore_clears_pending_notice_without_changing_policy(self):
+        agent = _make_agent()
+        agent._fallback_policy = "local-only"
+        agent._pending_fallback_notice = "stale switch"
+
+        assert agent._restore_primary_runtime() is False
+
+        assert agent._pending_fallback_notice is None
+        assert agent._fallback_policy == "local-only"
 
     def test_restores_model_and_provider(self):
         agent = _make_agent(
@@ -619,8 +630,8 @@ class TestRestoreInRunConversation:
         assert agent.provider == "custom"
         assert agent.base_url == "https://my-llm.example.com/v1"
 
-    def test_successful_fallback_notice_emits_exactly_once_with_reason(self):
-        """Real fallback activation leaves one explainable success notice."""
+    def test_runtime_fallback_decision_emits_immediately_once_with_reason(self):
+        """Runtime fallback reports its non-terminal decision before use."""
         agent = _make_agent(
             fallback_model={
                 "provider": "openrouter",
@@ -629,7 +640,7 @@ class TestRestoreInRunConversation:
             provider="custom",
         )
         emitted = []
-        agent._emit_status = emitted.append
+        agent._emit_fallback_status = emitted.append
         primary_model = agent.model
         primary_provider = agent.provider
 
@@ -643,15 +654,19 @@ class TestRestoreInRunConversation:
             ) is True
 
         expected = (
-            f"🔄 Switched to fallback model: {primary_model} via "
-            f"{primary_provider} → anthropic/claude-sonnet-4 via openrouter "
-            f"(reason: server error)"
+            f"🔄 Fallback policy any: {primary_model} via {primary_provider} failed "
+            f"(reason: server error); switching to "
+            f"anthropic/claude-sonnet-4 via openrouter."
         )
-        assert agent._pending_fallback_notice == expected
-        assert "(reason: server error)" in agent._retry_status_buffer[-1][1]
+        assert emitted == [expected]
+        assert agent._pending_fallback_notice is None
+        assert not any(
+            "switching to fallback" in text.lower()
+            for _kind, text in getattr(agent, "_retry_status_buffer", [])
+        )
 
-        # This is the production successful-response ordering.
-        agent._emit_pending_fallback_notice()
+        # A successful response only drops retry chatter; it cannot emit a
+        # second fallback decision.
         agent._clear_status_buffer()
         agent._emit_pending_fallback_notice()
 
@@ -668,7 +683,7 @@ class TestRestoreInRunConversation:
             provider="custom",
         )
         emitted = []
-        agent._emit_status = emitted.append
+        agent._emit_fallback_status = emitted.append
 
         mock_client = _mock_resolve()
         with patch(
@@ -678,7 +693,8 @@ class TestRestoreInRunConversation:
             assert agent._try_activate_fallback(
                 reason=FailoverReason.timeout,
             ) is True
-        assert agent._pending_fallback_notice is not None
+        assert len(emitted) == 1
+        assert agent._pending_fallback_notice is None
 
         agent.interrupt("cancel current turn")
         assert agent._pending_fallback_notice is None
@@ -691,7 +707,7 @@ class TestRestoreInRunConversation:
         # Simulate the next primary response succeeding.
         agent._emit_pending_fallback_notice()
         agent._clear_status_buffer()
-        assert emitted == []
+        assert len(emitted) == 1
 
     def test_primary_restore_clears_unemitted_prior_turn_notice(self):
         """Restore itself is a hard boundary for fallback-notice lifetime."""
@@ -703,7 +719,7 @@ class TestRestoreInRunConversation:
             provider="custom",
         )
         emitted = []
-        agent._emit_status = emitted.append
+        agent._emit_fallback_status = emitted.append
 
         mock_client = _mock_resolve()
         with patch(
@@ -713,14 +729,15 @@ class TestRestoreInRunConversation:
             assert agent._try_activate_fallback(
                 reason=FailoverReason.timeout,
             ) is True
-        assert agent._pending_fallback_notice is not None
+        assert len(emitted) == 1
+        assert agent._pending_fallback_notice is None
 
         with patch("run_agent.OpenAI", return_value=MagicMock()):
             assert agent._restore_primary_runtime() is True
         assert agent._pending_fallback_notice is None
 
         agent._emit_pending_fallback_notice()
-        assert emitted == []
+        assert len(emitted) == 1
 
 
 # =============================================================================
@@ -767,6 +784,38 @@ class TestRateLimitCooldown:
 
         assert result is True
         assert agent._fallback_activated is False
+
+    @pytest.mark.parametrize(
+        ("policy", "refreshed_chain"),
+        [("off", []), ("any", [])],
+    )
+    def test_policy_or_chain_removal_overrides_cooldown(
+        self, policy, refreshed_chain
+    ):
+        """A cached fallback cannot outlive the refreshed routing boundary."""
+        agent = _make_agent(
+            fallback_model={
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4",
+            },
+        )
+        mock_client = _mock_resolve()
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(mock_client, None),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        agent._rate_limited_until = time.monotonic() + 60
+        agent._fallback_policy = policy
+        agent._fallback_chain = refreshed_chain
+
+        with patch("run_agent.OpenAI", return_value=MagicMock()):
+            assert agent._restore_primary_runtime() is True
+
+        assert agent._fallback_activated is False
+        assert agent._active_fallback_entry is None
+        assert agent._fallback_restore_required is False
 
     def test_cooldown_set_on_rate_limit_reason(self):
         """_try_activate_fallback with rate_limit reason sets _rate_limited_until."""

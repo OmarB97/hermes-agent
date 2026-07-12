@@ -1,9 +1,9 @@
 """Tests for the retry/fallback status buffer helpers on AIAgent.
 
 These helpers defer noisy retry chatter (rate-limit retries and compression
-attempts) so users only see the trace when everything ultimately fails. On
-successful recovery the noisy buffer is dropped, while a durable provider /
-model fallback switch is surfaced exactly once.
+attempts) so users only see the trace when everything ultimately fails.
+Runtime fallback decisions bypass this buffer and are emitted immediately;
+init-time decisions may be queued until a gateway renderer is attached.
 """
 
 from __future__ import annotations
@@ -135,32 +135,31 @@ def test_mixed_kinds_replay_through_correct_channels():
     assert warns == ["warn-1"]
 
 
-def test_pending_fallback_notice_emitted_once_on_success():
-    """Successful fallback keeps one switch notice while dropping retry noise."""
+def test_pending_init_fallback_notice_emitted_once_before_request():
+    """A queued init decision uses the structured fallback channel once."""
     agent = _make_bare_agent()
     emitted = []
-    agent._emit_status = lambda msg: emitted.append(msg)
+    agent._emit_fallback_status = lambda msg: emitted.append(msg)
 
-    agent._buffer_status("🔄 Primary model failed — switching to fallback: m2 via p2")
     agent._pending_fallback_notice = (
-        "🔄 Switched to fallback model: m1 via p1 → m2 via p2"
+        "🔄 Fallback policy any: m1 via p1 could not initialize; switching to m2 via p2."
     )
 
     agent._emit_pending_fallback_notice()
-    agent._clear_status_buffer()
 
-    assert emitted == ["🔄 Switched to fallback model: m1 via p1 → m2 via p2"]
-    assert agent._retry_status_buffer == []
+    assert emitted == [
+        "🔄 Fallback policy any: m1 via p1 could not initialize; switching to m2 via p2."
+    ]
     assert agent._pending_fallback_notice is None
 
     agent._emit_pending_fallback_notice()
-    assert emitted == ["🔄 Switched to fallback model: m1 via p1 → m2 via p2"]
+    assert len(emitted) == 1
 
 
 def test_pending_fallback_notice_noop_when_unset():
     agent = _make_bare_agent()
     emitted = []
-    agent._emit_status = lambda msg: emitted.append(msg)
+    agent._emit_fallback_status = lambda msg: emitted.append(msg)
 
     agent._emit_pending_fallback_notice()
 
@@ -197,7 +196,7 @@ def test_pending_fallback_notice_survives_emit_callback_error():
         seen.append(msg)
         raise RuntimeError("simulated callback failure")
 
-    agent._emit_status = boom
+    agent._emit_fallback_status = boom
     agent._pending_fallback_notice = (
         "🔄 Switched to fallback model: m1 via p1 → m2 via p2"
     )

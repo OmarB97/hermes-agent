@@ -1006,7 +1006,7 @@ def run_conversation(
         # Live context bar: surface the request-size estimate BEFORE the API
         # call so long tool batches show movement (#126 desktop feature).
         _emit_preflight_token_usage(
-            agent, approx_request_tokens, messages_len=len(messages)
+            agent, request_pressure_tokens, messages_len=len(messages)
         )
 
         _runtime_context_error = _ollama_context_limit_error(
@@ -1165,7 +1165,7 @@ def run_conversation(
                             f"⏳ {_nous_msg} Trying fallback..."
                         )
                         agent._buffer_status(f"⏳ {_nous_msg}")
-                        if agent._try_activate_fallback():
+                        if agent._try_activate_fallback(FailoverReason.rate_limit):
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -1511,7 +1511,7 @@ def run_conversation(
                     # rather than retrying with extended backoff.
                     if agent._fallback_index < len(agent._fallback_chain):
                         agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
-                    if agent._try_activate_fallback():
+                    if agent._try_activate_fallback("invalid response"):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -1584,7 +1584,7 @@ def run_conversation(
                         # Try fallback before giving up
                         if agent._has_pending_fallback():
                             agent._buffer_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
-                        if agent._try_activate_fallback():
+                        if agent._try_activate_fallback("invalid response"):
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -1740,7 +1740,7 @@ def run_conversation(
                         agent._buffer_status(
                             "⚠️ Model declined to respond (safety refusal) — trying fallback..."
                         )
-                    if agent._try_activate_fallback():
+                    if agent._try_activate_fallback(FailoverReason.content_policy_blocked):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -1901,15 +1901,12 @@ def run_conversation(
                             _cf_terminated
                             and agent._fallback_index < len(agent._fallback_chain)
                         ):
-                            agent._vprint(
-                                f"{agent.log_prefix}🛡️  Content filter terminated "
-                                f"stream — activating fallback provider...",
-                                force=True,
-                            )
-                            agent._emit_status(
+                            agent._buffer_status(
                                 "Content filter terminated stream; switching to fallback..."
                             )
-                            if agent._try_activate_fallback():
+                            if agent._try_activate_fallback(
+                                FailoverReason.content_policy_blocked
+                            ):
                                 # Roll the partial content (if any was already
                                 # appended in a prior continuation pass) back to
                                 # the last clean turn so the fallback provider
@@ -3766,7 +3763,7 @@ def run_conversation(
                             agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if agent._try_activate_fallback(reason=classified.reason):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -3964,7 +3961,7 @@ def run_conversation(
                     # Try fallback before giving up entirely
                     if agent._has_pending_fallback():
                         agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if agent._try_activate_fallback(reason=classified.reason):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -5042,17 +5039,12 @@ def run_conversation(
                             agent.provider,
                         )
                         agent._buffer_status(
-                            "⚠️ Model returning empty responses — "
-                            "switching to fallback provider..."
+                            "⚠️ Model returned empty responses after retry exhaustion."
                         )
-                        if agent._try_activate_fallback():
+                        if agent._try_activate_fallback("empty response"):
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             agent._empty_content_retries = 0
-                            agent._buffer_status(
-                                f"↻ Switched to fallback: {agent.model} "
-                                f"({agent.provider})"
-                            )
                             logger.info(
                                 "Fallback activated after empty responses: "
                                 "now using %s on %s",
@@ -5063,6 +5055,7 @@ def run_conversation(
                     # Exhausted retries and fallback chain (or no
                     # fallback configured).  Fall through to the
                     # "(empty)" terminal.
+                    agent._emit_fallback_policy_terminal_status("empty response")
                     # Surface the buffered retry/fallback trace so the
                     # user can see what was attempted before "(empty)".
                     agent._flush_status_buffer()
@@ -5110,10 +5103,9 @@ def run_conversation(
                 # Reset retry counter/signature on successful content
                 agent._empty_content_retries = 0
                 agent._thinking_prefill_retries = 0
-                # Successful content reached — surface a fallback switch once
-                # before dropping transient retry noise from earlier attempts.
-                # This is status-only and does not mutate prompt context.
-                agent._emit_pending_fallback_notice()
+                # Successful content reached. The fallback decision, if any,
+                # was already emitted before the fallback request; only noisy
+                # retry chatter remains buffered here.
                 agent._clear_status_buffer()
 
                 from agent.agent_runtime_helpers import (
