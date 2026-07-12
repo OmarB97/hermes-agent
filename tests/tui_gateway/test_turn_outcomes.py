@@ -1,5 +1,6 @@
 import contextlib
 import queue
+import sys
 import threading
 import types
 
@@ -516,6 +517,67 @@ def test_notification_sync_failure_restores_current_and_entire_batch_tail(
     assert len(turn_harness.db.rows) == 1
 
 
+def test_notification_batch_requeues_full_tail_after_first_dispatch_starts(
+    turn_harness, monkeypatch
+):
+    session = _session(_Agent(None))
+    session["running"] = False
+    notifications = [
+        ({"id": "event-1"}, "first"),
+        ({"id": "event-2"}, "second"),
+        ({"id": "event-3"}, "third"),
+    ]
+    completion_queue = queue.Queue()
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *_args, **_kwargs: None)
+
+    server._dispatch_notification_batch(
+        "request-notification",
+        "runtime-session",
+        session,
+        notifications,
+        completion_queue,
+    )
+
+    assert session["running"] is True
+    assert [completion_queue.get_nowait(), completion_queue.get_nowait()] == [
+        notifications[1][0],
+        notifications[2][0],
+    ]
+    assert completion_queue.empty()
+
+
+def test_goal_dispatch_sync_failure_restores_behind_queued_user_work(
+    turn_harness, monkeypatch
+):
+    session = _session(_Agent(None))
+    session["running"] = False
+    session["queued_prompt"] = {
+        "text": "new user work",
+        "transport": "desktop-client",
+    }
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("dispatch exploded")),
+    )
+
+    assert not server._dispatch_goal_continuation(
+        "request-goal", "runtime-session", session, "continue the goal"
+    )
+
+    assert session["queued_prompt"] == {
+        "text": "new user work\n\ncontinue the goal",
+        "transport": "desktop-client",
+    }
+    assert session["running"] is False
+    assert session["inflight_turn"] is None
+    outcomes = [
+        args[2] for args in turn_harness.emitted if args[0] == "turn.outcome"
+    ]
+    assert [outcome["status"] for outcome in outcomes] == ["failed"]
+    assert len(turn_harness.db.rows) == 1
+
+
 def test_completion_freezes_before_delayed_message_complete_delivery(
     turn_harness, monkeypatch
 ):
@@ -594,10 +656,43 @@ def test_stop_freezes_cancellation_before_agent_completion(
     )
     agent.interrupt = lambda: None
     session = _session(agent)
+    session["pending_title"] = "must not be applied"
     server._start_inflight_turn(session, "run")
     server._sessions["runtime-session"] = session
     monkeypatch.setattr(server.threading, "Thread", REAL_THREAD)
     monkeypatch.setattr(server, "_clear_pending", lambda *_args: None)
+    side_effects = []
+
+    class _GoalManager:
+        def __init__(self, **_kwargs):
+            pass
+
+        def is_active(self):
+            return True
+
+        def evaluate_after_turn(self, *_args, **_kwargs):
+            side_effects.append("goal")
+            return {"should_continue": False}
+
+    class _TitleDb:
+        def set_session_title(self, *_args, **_kwargs):
+            side_effects.append("title")
+            return True
+
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.goals",
+        types.SimpleNamespace(
+            GoalManager=_GoalManager,
+            gather_background_processes=lambda: [],
+        ),
+    )
+    monkeypatch.setattr(server, "_get_db", lambda: _TitleDb())
+    monkeypatch.setattr(
+        server,
+        "_voice_tts_enabled",
+        lambda: side_effects.append("tts-check") or False,
+    )
     try:
         server._run_prompt_submit(
             "request-race", "runtime-session", session, "run"
@@ -628,6 +723,8 @@ def test_stop_freezes_cancellation_before_agent_completion(
     ]
     assert [payload["status"] for payload in completes] == ["interrupted"]
     assert len(turn_harness.db.rows) == 1
+    assert side_effects == []
+    assert session["pending_title"] == "must not be applied"
 
 
 def test_inflight_snapshot_carries_turn_identity():

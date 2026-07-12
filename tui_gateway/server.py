@@ -5780,6 +5780,35 @@ def _dispatch_notification_batch(
             return
 
 
+def _dispatch_goal_continuation(
+    rid,
+    sid: str,
+    session: dict,
+    prompt: str,
+) -> bool:
+    """Claim a goal turn, preserving it behind any user work on sync failure."""
+    with session["history_lock"]:
+        if session.get("running"):
+            return False
+        turn = _begin_prompt_dispatch_locked(session, prompt)
+    return _dispatch_claimed_prompt(
+        rid,
+        sid,
+        session,
+        prompt,
+        turn,
+        failure_context="goal continuation",
+        # A user prompt can queue after this automatic turn is claimed.
+        # Restore the goal behind it so user work still wins.
+        restore_on_failure=lambda: _enqueue_prompt(
+            session,
+            prompt,
+            (session.get("queued_prompt") or {}).get("transport")
+            or session.get("transport"),
+        ),
+    )
+
+
 def _inflight_snapshot(session: dict) -> dict | None:
     turn = session.get("inflight_turn")
     if not isinstance(turn, dict):
@@ -10337,6 +10366,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     if frozen_status in {"failed", "timed_out"}
                     else "complete"
                 )
+                status = payload["status"]
             _emit("message.complete", sid, payload)
             _finalize_turn_outcome(
                 sid, session, result=result, turn=terminal_turn
@@ -10524,26 +10554,11 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         # prompt.submit sets running=True under the history_lock and
         # we check that guard before re-firing.
         if goal_followup:
-            with session["history_lock"]:
-                if session.get("running"):
-                    # User already sent something — their turn wins,
-                    # the judge will re-run on the next turn anyway.
-                    return
-                goal_turn = _begin_prompt_dispatch_locked(session, goal_followup)
-            _dispatch_claimed_prompt(
+            _dispatch_goal_continuation(
                 rid,
                 sid,
                 session,
                 goal_followup,
-                goal_turn,
-                failure_context="goal continuation",
-                # A user prompt can queue after this automatic turn is
-                # claimed. Restore the goal behind it so user work still wins.
-                restore_on_failure=lambda: _enqueue_prompt(
-                    session,
-                    goal_followup,
-                    session.get("transport"),
-                ),
             )
 
         # Drain completion notifications that arrived during this turn.
