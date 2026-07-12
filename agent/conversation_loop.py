@@ -1006,7 +1006,7 @@ def run_conversation(
         # Live context bar: surface the request-size estimate BEFORE the API
         # call so long tool batches show movement (#126 desktop feature).
         _emit_preflight_token_usage(
-            agent, approx_request_tokens, messages_len=len(messages)
+            agent, request_pressure_tokens, messages_len=len(messages)
         )
 
         _runtime_context_error = _ollama_context_limit_error(
@@ -1901,12 +1901,7 @@ def run_conversation(
                             _cf_terminated
                             and agent._fallback_index < len(agent._fallback_chain)
                         ):
-                            agent._vprint(
-                                f"{agent.log_prefix}🛡️  Content filter terminated "
-                                f"stream — activating fallback provider...",
-                                force=True,
-                            )
-                            agent._emit_status(
+                            agent._buffer_status(
                                 "Content filter terminated stream; switching to fallback..."
                             )
                             if agent._try_activate_fallback(
@@ -5044,17 +5039,12 @@ def run_conversation(
                             agent.provider,
                         )
                         agent._buffer_status(
-                            "⚠️ Model returning empty responses — "
-                            "switching to fallback provider..."
+                            "⚠️ Model returned empty responses after retry exhaustion."
                         )
                         if agent._try_activate_fallback("empty response"):
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             agent._empty_content_retries = 0
-                            agent._buffer_status(
-                                f"↻ Switched to fallback: {agent.model} "
-                                f"({agent.provider})"
-                            )
                             logger.info(
                                 "Fallback activated after empty responses: "
                                 "now using %s on %s",
@@ -5113,10 +5103,9 @@ def run_conversation(
                 # Reset retry counter/signature on successful content
                 agent._empty_content_retries = 0
                 agent._thinking_prefill_retries = 0
-                # Successful content reached — surface a fallback switch once
-                # before dropping transient retry noise from earlier attempts.
-                # This is status-only and does not mutate prompt context.
-                agent._emit_pending_fallback_notice()
+                # Successful content reached. The fallback decision, if any,
+                # was already emitted before the fallback request; only noisy
+                # retry chatter remains buffered here.
                 agent._clear_status_buffer()
 
                 from agent.agent_runtime_helpers import (

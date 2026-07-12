@@ -5,6 +5,7 @@ import type { NavigateFunction } from 'react-router-dom'
 import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
+import { restoreFallbackNotices } from '@/lib/fallback-notices'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { clearQueuedPrompts } from '@/store/composer-queue'
 import { $pinnedSessionIds } from '@/store/layout'
@@ -26,6 +27,7 @@ import {
   setBusy,
   setCurrentBranch,
   setCurrentCwd,
+  setCurrentFallbackPolicy,
   setCurrentServiceTier,
   setCurrentUsage,
   setFreshDraftReady,
@@ -144,6 +146,7 @@ export function useSessionActions({
       // refreshCurrentModel). Only $currentServiceTier (a live-session mirror)
       // is cleared.
       setCurrentServiceTier('')
+      setCurrentFallbackPolicy('')
       setYoloActive(false)
       // In a project → the repo's default-branch (main worktree) checkout; not in
       // a project → detached. So cmd-n "knows" the project instead of inheriting
@@ -492,7 +495,10 @@ export function useSessionActions({
             const storedMessages = await prefetchPromise
 
             if (isCurrentResume()) {
-              localSnapshot = preserveLocalAssistantErrors(toChatMessages(storedMessages.messages), $messages.get())
+              localSnapshot = preserveLocalAssistantErrors(
+                restoreFallbackNotices(storedSessionId, toChatMessages(storedMessages.messages)),
+                $messages.get()
+              )
 
               if (!chatMessageArraysEquivalent($messages.get(), localSnapshot)) {
                 setMessages(localSnapshot)
@@ -521,7 +527,10 @@ export function useSessionActions({
             ? localSnapshot
             : (() => {
                 const resumedMessages = preserveLocalAssistantErrors(
-                  reconcileResumeMessages(toChatMessages(resumed.messages), currentMessages),
+                  reconcileResumeMessages(
+                    restoreFallbackNotices(storedSessionId, toChatMessages(resumed.messages)),
+                    currentMessages
+                  ),
                   currentMessages
                 )
 
@@ -586,7 +595,12 @@ export function useSessionActions({
             return
           }
 
-          setMessages(preserveLocalAssistantErrors(toChatMessages(fallback.messages), $messages.get()))
+          setMessages(
+            preserveLocalAssistantErrors(
+              restoreFallbackNotices(storedSessionId, toChatMessages(fallback.messages)),
+              $messages.get()
+            )
+          )
         } catch (e) {
           // Fallback also failed: nothing to paint. Leave whatever messages are
           // already shown and fall through to arm the resume-failure latch so

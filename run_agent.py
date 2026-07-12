@@ -479,6 +479,9 @@ class AIAgent:
         parent_session_id: str = None,
         iteration_budget: "IterationBudget" = None,
         fallback_model: Dict[str, Any] = None,
+        fallback_chain_from_config: Optional[bool] = None,
+        initial_fallback_decision: str = None,
+        initial_fallback_entry: Dict[str, Any] = None,
         credential_pool=None,
         checkpoints_enabled: bool = False,
         checkpoint_max_snapshots: int = 20,
@@ -554,6 +557,9 @@ class AIAgent:
             parent_session_id=parent_session_id,
             iteration_budget=iteration_budget,
             fallback_model=fallback_model,
+            fallback_chain_from_config=fallback_chain_from_config,
+            initial_fallback_decision=initial_fallback_decision,
+            initial_fallback_entry=initial_fallback_entry,
             credential_pool=credential_pool,
             checkpoints_enabled=checkpoints_enabled,
             checkpoint_max_snapshots=checkpoint_max_snapshots,
@@ -997,13 +1003,14 @@ class AIAgent:
             pass
 
     def _emit_pending_fallback_notice(self) -> None:
-        """Surface the one-shot fallback-switch notice after recovery.
+        """Surface an init-time fallback decision exactly once before use.
 
-        Transient retry chatter remains buffered, but a provider/model switch
-        is a durable runtime change. ``try_activate_fallback`` records the
-        notice; the successful response path emits it exactly once before
-        clearing the noisy buffer. Terminal failure instead flushes that
-        buffer, which already contains the switch line.
+        Gateway render callbacks are commonly attached after ``AIAgent``
+        construction, so init/auth fallback cannot emit to them immediately.
+        The constructor queues that decision here and the turn preflight emits
+        it before the first request to the selected fallback. Runtime fallback
+        decisions are emitted immediately by ``try_activate_fallback`` and do
+        not use this slot.
         """
         try:
             notice = getattr(self, "_pending_fallback_notice", None)
@@ -1011,7 +1018,7 @@ class AIAgent:
                 # Clear first so a callback error cannot leave a stale notice
                 # to be emitted on a later turn.
                 self._pending_fallback_notice = None
-                self._emit_status(notice)
+                self._emit_fallback_status(notice)
         except Exception:
             # Status delivery must never break the conversation loop.
             pass
@@ -1023,8 +1030,9 @@ class AIAgent:
         was tried before the turn gave up.
         """
         try:
-            # The buffered trace already contains the fallback switch line.
-            # Discard the one-shot success notice to prevent a later duplicate.
+            # A queued init-time decision should already have been emitted by
+            # the turn preflight. Clear defensively at terminal exhaustion so
+            # it can never leak into a later turn.
             self._pending_fallback_notice = None
             buf = getattr(self, "_retry_status_buffer", None)
             if not buf:
@@ -4839,17 +4847,63 @@ class AIAgent:
         emit_fallback_policy_terminal_status(self, reason)
 
     def _refresh_fallback_policy(self) -> str:
-        """Refresh the policy for cached agents at the start of every turn."""
+        """Refresh the effective policy and ordered chain once per turn."""
         try:
             from hermes_cli.config import load_config_readonly
-            from hermes_cli.fallback_config import get_fallback_policy
+            from hermes_cli.fallback_config import (
+                filter_fallback_chain_for_policy,
+                get_configured_fallback_chain,
+                get_fallback_policy,
+            )
 
-            policy = get_fallback_policy(load_config_readonly())
+            config = load_config_readonly()
+            policy = get_fallback_policy(config)
+            configured_chain = get_configured_fallback_chain(config)
+            if getattr(self, "_fallback_chain_from_config", False):
+                seed = configured_chain
+                chain = filter_fallback_chain_for_policy(seed, config)
+                chain_from_config = True
+            else:
+                seed = list(
+                    getattr(self, "_fallback_chain_seed", None)
+                    or getattr(self, "_fallback_chain", None)
+                    or []
+                )
+                chain = filter_fallback_chain_for_policy(seed, config)
+                chain_from_config = False
         except Exception:
             policy = "off"
+            seed = list(
+                getattr(self, "_fallback_chain_seed", None)
+                or getattr(self, "_fallback_chain", None)
+                or []
+            )
+            chain = []
+            chain_from_config = getattr(self, "_fallback_chain_from_config", False)
+        excluded_providers = {
+            str(provider).strip().lower()
+            for provider in (
+                getattr(self, "_fallback_excluded_providers", None) or set()
+            )
+            if str(provider).strip()
+        }
+        if excluded_providers:
+            chain = [
+                entry
+                for entry in chain
+                if str(entry.get("provider") or "").strip().lower()
+                not in excluded_providers
+            ]
         self._fallback_policy = policy
+        self._fallback_chain_seed = [dict(entry) for entry in seed]
+        self._fallback_chain_from_config = chain_from_config
+        self._fallback_chain = [dict(entry) for entry in chain]
+        self._fallback_model = (
+            self._fallback_chain[0] if self._fallback_chain else None
+        )
+        self._fallback_index = 0
+        self._unavailable_fallback_keys = set()
         self._fallback_terminal_status_emitted = False
-        self._pending_fallback_notice = None
         return policy
 
     def _has_pending_fallback(self) -> bool:

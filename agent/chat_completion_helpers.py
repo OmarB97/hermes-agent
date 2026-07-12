@@ -1703,6 +1703,7 @@ def try_activate_fallback(
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True
+        agent._active_fallback_entry = dict(fb)
 
         # Rebind the credential pool to the fallback provider when the provider
         # changes.  Keeping the primary pool attached would make downstream
@@ -1832,22 +1833,6 @@ def try_activate_fallback(
         # answering, so "what model are you?" doesn't report the primary.
         rewrite_prompt_model_identity(agent, fb_model, fb_provider)
 
-        _reason_value = getattr(reason, "value", reason) if reason is not None else ""
-        _reason_label = str(_reason_value).replace("_", " ").strip()
-        _reason_suffix = f" (reason: {_reason_label})" if _reason_label else ""
-        agent._buffer_status(
-            f"🔄 Primary model failed — switching to fallback: "
-            f"{fb_model} via {fb_provider}{_reason_suffix}"
-        )
-        # Retry chatter is dropped on successful recovery, but the provider /
-        # model switch is a durable state change operators must still see.
-        # The success path emits this one-shot notice before clearing buffered
-        # retry noise; terminal failure flushes the buffered switch line and
-        # discards this pending duplicate instead.
-        agent._pending_fallback_notice = (
-            f"🔄 Switched to fallback model: {old_model} via {old_provider} "
-            f"→ {fb_model} via {fb_provider}{_reason_suffix}"
-        )
         logger.info(
             "Fallback activated: %s → %s (%s)",
             old_model, fb_model, fb_provider,

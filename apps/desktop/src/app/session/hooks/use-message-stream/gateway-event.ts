@@ -8,6 +8,12 @@ import { translateNow } from '@/i18n'
 import { type GatewayEventPayload, textPart } from '@/lib/chat-messages'
 import { coerceGatewayText, coerceThinkingText, normalizePersonalityValue } from '@/lib/chat-runtime'
 import { playCompletionSound } from '@/lib/completion-sound'
+import {
+  countTranscriptMessages,
+  createFallbackNotice,
+  deferFallbackNotice,
+  persistFallbackNotice
+} from '@/lib/fallback-notices'
 import { gatewayEventRequiresSessionId } from '@/lib/gateway-events'
 import { triggerHaptic } from '@/lib/haptics'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
@@ -26,6 +32,7 @@ import {
   $localDeviceName,
   setCurrentBranch,
   setCurrentCwd,
+  setCurrentFallbackPolicy,
   setCurrentFastMode,
   setCurrentModel,
   setCurrentPersonality,
@@ -138,6 +145,10 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
           if (providerChanged) {
             setCurrentProvider(payload!.provider || '')
+          }
+
+          if (statePatch.fallbackPolicy) {
+            setCurrentFallbackPolicy(statePatch.fallbackPolicy)
           }
 
           if (typeof payload?.cwd === 'string') {
@@ -573,16 +584,10 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
         if (sessionId && fallbackText) {
           flushQueuedDeltas(sessionId)
-          updateSessionState(sessionId, state => {
-            const notice = {
-              id: `fallback-status-${Date.now()}`,
-              role: 'system' as const,
-              parts: [textPart(fallbackText)],
-              timestamp: Math.floor(Date.now() / 1000)
-            }
-            const streamIndex = state.streamId
-              ? state.messages.findIndex(message => message.id === state.streamId)
-              : -1
+          const notice = createFallbackNotice(fallbackText)
+
+          const nextState = updateSessionState(sessionId, state => {
+            const streamIndex = state.streamId ? state.messages.findIndex(message => message.id === state.streamId) : -1
             const messages = [...state.messages]
 
             // Keep the decision before the response produced by the selected
@@ -596,6 +601,24 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
             return { ...state, messages }
           })
+
+          if (nextState.storedSessionId) {
+            const noticeIndex = nextState.messages.findIndex(message => message.id === notice.id)
+
+            const beforeMessageCount = countTranscriptMessages(
+              noticeIndex >= 0 ? nextState.messages.slice(0, noticeIndex) : nextState.messages
+            )
+
+            persistFallbackNotice(nextState.storedSessionId, notice, beforeMessageCount)
+          } else {
+            const noticeIndex = nextState.messages.findIndex(message => message.id === notice.id)
+
+            const beforeMessageCount = countTranscriptMessages(
+              noticeIndex >= 0 ? nextState.messages.slice(0, noticeIndex) : nextState.messages
+            )
+
+            deferFallbackNotice(sessionId, notice, beforeMessageCount)
+          }
         } else if (sessionId && payload?.kind === 'compacting') {
           setSessionCompacting(sessionId, true)
           compactedTurnRef.current.add(sessionId)

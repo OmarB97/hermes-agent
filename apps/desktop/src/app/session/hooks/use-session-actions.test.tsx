@@ -371,6 +371,7 @@ describe('resumeSession failure recovery', () => {
             branch: '',
             busy: false,
             cwd: '',
+            fallbackPolicy: '',
             fast: false,
             interrupted: false,
             messages: [],

@@ -3,6 +3,7 @@ from __future__ import annotations
 from hermes_cli import fallback_config
 from hermes_cli import models as models_mod
 from hermes_cli.fallback_config import (
+    filter_fallback_chain_for_policy,
     get_configured_fallback_chain,
     get_fallback_chain,
     get_fallback_policy,
@@ -293,3 +294,27 @@ def test_local_only_never_fetches_remote_promotions(monkeypatch):
     }
 
     assert get_fallback_chain(cfg) == cfg["fallback_providers"]
+
+
+def test_supplied_init_chain_is_filtered_by_policy():
+    entries = [
+        {"provider": "openrouter", "model": "remote"},
+        {
+            "provider": "custom",
+            "model": "local",
+            "base_url": "http://127.0.0.1:8000/v1",
+        },
+    ]
+
+    assert filter_fallback_chain_for_policy(
+        entries,
+        {"fallback_policy": "off"},
+    ) == []
+    assert filter_fallback_chain_for_policy(
+        entries,
+        {"fallback_policy": "local-only"},
+    ) == [entries[1]]
+    assert filter_fallback_chain_for_policy(
+        entries,
+        {"fallback_policy": "any"},
+    ) == entries
