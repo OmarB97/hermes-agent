@@ -981,6 +981,26 @@ class AIAgent:
         except Exception:
             pass
 
+    def _emit_pending_fallback_notice(self) -> None:
+        """Surface the one-shot fallback-switch notice after recovery.
+
+        Transient retry chatter remains buffered, but a provider/model switch
+        is a durable runtime change. ``try_activate_fallback`` records the
+        notice; the successful response path emits it exactly once before
+        clearing the noisy buffer. Terminal failure instead flushes that
+        buffer, which already contains the switch line.
+        """
+        try:
+            notice = getattr(self, "_pending_fallback_notice", None)
+            if notice:
+                # Clear first so a callback error cannot leave a stale notice
+                # to be emitted on a later turn.
+                self._pending_fallback_notice = None
+                self._emit_status(notice)
+        except Exception:
+            # Status delivery must never break the conversation loop.
+            pass
+
     def _flush_status_buffer(self) -> None:
         """Emit buffered retry messages — call on terminal failure.
 
@@ -988,6 +1008,9 @@ class AIAgent:
         was tried before the turn gave up.
         """
         try:
+            # The buffered trace already contains the fallback switch line.
+            # Discard the one-shot success notice to prevent a later duplicate.
+            self._pending_fallback_notice = None
             buf = getattr(self, "_retry_status_buffer", None)
             if not buf:
                 return
@@ -2680,6 +2703,10 @@ class AIAgent:
             if session_has_running_agent:
                 running_agent.interrupt(new_message.text)
         """
+        # A fallback notice belongs only to the turn that activated it. If
+        # that turn is cancelled, never let the next primary success announce
+        # a stale provider switch.
+        self._pending_fallback_notice = None
         self._interrupt_requested = True
         self._interrupt_message = message
         # Signal all tools to abort any in-flight operations immediately.
@@ -2726,6 +2753,9 @@ class AIAgent:
 
     def clear_interrupt(self) -> None:
         """Clear any pending interrupt request and the per-thread tool interrupt signal."""
+        # ``clear_interrupt`` is the common turn-finalizer path, including
+        # cancellations noticed outside ``interrupt()`` itself.
+        self._pending_fallback_notice = None
         self._interrupt_requested = False
         self._interrupt_message = None
         self._interrupt_thread_signal_pending = False
