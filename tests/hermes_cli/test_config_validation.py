@@ -179,6 +179,18 @@ class TestFallbackModelValidation:
         })
         assert issues == []
 
+    def test_fallback_policy_accepts_exact_supported_values(self):
+        for policy in ("off", "local-only", "any"):
+            assert validate_config_structure({"fallback_policy": policy}) == []
+
+    def test_fallback_policy_rejects_typos_and_case_variants(self):
+        for policy in ("local", "ANY", True, None):
+            issues = validate_config_structure({"fallback_policy": policy})
+            assert any(
+                issue.severity == "error" and "fallback_policy" in issue.message
+                for issue in issues
+            )
+
 
 class TestMissingModelSection:
     """Warn when custom_providers exists but model section is missing."""

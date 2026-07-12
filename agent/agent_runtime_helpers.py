@@ -1167,7 +1167,6 @@ def restore_primary_runtime(agent) -> bool:
     # too (no active fallback or cooldown), so a later primary success cannot
     # emit a stale notice from an interrupted/abandoned prior turn.
     agent._pending_fallback_notice = None
-
     if not agent._fallback_activated:
         # Reset the chain index even when no fallback was activated this
         # turn.  Without this, a turn where _try_activate_fallback() was
