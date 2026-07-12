@@ -402,12 +402,22 @@ export interface SessionMessagesResponse {
   turn_outcomes?: SessionTurnOutcome[]
 }
 
+export interface SessionInflightTurn {
+  assistant?: string
+  streaming?: boolean
+  turn_id?: string
+  user?: string
+}
+
 export interface SessionResumeResponse {
+  inflight?: null | SessionInflightTurn
   info?: SessionRuntimeInfo
   message_count: number
   messages: SessionMessage[]
   resumed: string
+  running?: boolean
   session_id: string
+  status?: string
 }
 
 export interface SessionRuntimeInfo {

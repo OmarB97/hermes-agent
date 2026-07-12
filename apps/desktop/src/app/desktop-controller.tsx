@@ -591,7 +591,7 @@ export function DesktopController() {
     }
   }, [activeSessionIdRef, busyRef, selectedStoredSessionIdRef, updateSessionState])
 
-  const { handleGatewayEvent } = useMessageStream({
+  const { handleGatewayEvent, hydrateTurnOutcomeState } = useMessageStream({
     activeSessionIdRef,
     hydrateFromStoredSession,
     queryClient,
@@ -628,6 +628,7 @@ export function DesktopController() {
     creatingSessionRef,
     ensureSessionState,
     getRouteToken,
+    hydrateTurnOutcomeState,
     navigate,
     requestGateway,
     runtimeIdByStoredSessionIdRef,

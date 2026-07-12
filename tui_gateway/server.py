@@ -5452,8 +5452,7 @@ def _derive_turn_outcome(session: dict, result: Any) -> dict:
     }
 
 
-def _finalize_turn_outcome(
-    sid: str,
+def _freeze_turn_outcome(
     session: dict,
     *,
     result: Any = None,
@@ -5461,7 +5460,12 @@ def _finalize_turn_outcome(
     reason: str | None = None,
     turn: dict | None = None,
 ) -> dict | None:
-    """Persist and emit the one terminal outcome owned by the active turn ID."""
+    """Classify one turn exactly once without performing persistence or I/O.
+
+    Callers that race with ``session.interrupt`` freeze while holding the
+    session history lock.  Whichever side owns that lock first decides the
+    terminal classification; later Stop/completion paths reuse this cached row.
+    """
     turn = turn if isinstance(turn, dict) else session.get("inflight_turn")
     if not isinstance(turn, dict):
         return None
@@ -5498,7 +5502,33 @@ def _finalize_turn_outcome(
             while len(cached) > 64:
                 cached.pop(next(iter(cached)))
             session["_last_turn_outcome"] = outcome
+        return outcome
 
+
+def _finalize_turn_outcome(
+    sid: str,
+    session: dict,
+    *,
+    result: Any = None,
+    status: str | None = None,
+    reason: str | None = None,
+    turn: dict | None = None,
+) -> dict | None:
+    """Persist and emit the one terminal outcome owned by the active turn ID."""
+    outcome = _freeze_turn_outcome(
+        session,
+        result=result,
+        status=status,
+        reason=reason,
+        turn=turn,
+    )
+    if outcome is None:
+        return None
+    turn_id = str(outcome.get("id") or "")
+
+    outcome_lock = session.setdefault("_turn_outcome_lock", threading.Lock())
+    with outcome_lock:
+        cached = session.setdefault("_turn_outcomes_by_id", {})
         emitted = session.setdefault("_emitted_turn_outcome_ids", [])
         should_emit = turn_id not in emitted
         if should_emit:
@@ -5584,6 +5614,64 @@ def _enqueue_prompt(
     session["queued_prompt"] = {"text": text, "transport": target_transport}
 
 
+def _begin_prompt_dispatch_locked(
+    session: dict, text: Any, transport: Any = None
+) -> dict:
+    """Claim one idle session and create its turn identity.
+
+    The caller must hold ``history_lock``.  Keeping the running flag, transport,
+    and turn ID in one critical section prevents two post-turn producers from
+    both believing they own the next dispatch.
+    """
+    session["running"] = True
+    if transport is not None:
+        session["transport"] = transport
+    _start_inflight_turn(session, text)
+    return session["inflight_turn"]
+
+
+def _dispatch_claimed_prompt(
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    turn: dict,
+    *,
+    failure_context: str,
+    restore_on_failure=None,
+) -> bool:
+    """Start one already-claimed turn or fail it loudly and release ownership."""
+    try:
+        _run_prompt_submit(rid, sid, session, text)
+        return True
+    except Exception as exc:
+        reason = f"{failure_context} dispatch failed: {type(exc).__name__}: {exc}"
+        print(f"[tui_gateway] {reason}", file=sys.stderr)
+        _finalize_turn_outcome(
+            sid,
+            session,
+            status="failed",
+            reason=reason,
+            turn=turn,
+        )
+        with session["history_lock"]:
+            if restore_on_failure is not None:
+                try:
+                    restore_on_failure()
+                except Exception as restore_exc:
+                    print(
+                        f"[tui_gateway] {failure_context} restore failed: "
+                        f"{type(restore_exc).__name__}: {restore_exc}",
+                        file=sys.stderr,
+                    )
+            current = session.get("inflight_turn")
+            if isinstance(current, dict) and current.get("id") == turn.get("id"):
+                _clear_inflight_turn(session)
+            session["running"] = False
+            session["last_active"] = time.time()
+        return False
+
+
 def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any) -> dict:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -5636,20 +5724,60 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if not queued or session.get("running"):
             return False
         session["queued_prompt"] = None
-        session["running"] = True
-        if queued.get("transport") is not None:
-            session["transport"] = queued["transport"]
-    try:
-        _run_prompt_submit(rid, sid, session, queued["text"])
-    except Exception as exc:
-        print(
-            f"[tui_gateway] queued prompt dispatch failed: "
-            f"{type(exc).__name__}: {exc}",
-            file=sys.stderr,
+        turn = _begin_prompt_dispatch_locked(
+            session,
+            queued["text"],
+            queued.get("transport"),
         )
-        with session["history_lock"]:
-            session["running"] = False
+
+    def _restore_queued_prompt() -> None:
+        _enqueue_prompt(
+            session,
+            queued["text"],
+            queued.get("transport"),
+            front=True,
+        )
+
+    _dispatch_claimed_prompt(
+        rid,
+        sid,
+        session,
+        queued["text"],
+        turn,
+        failure_context="queued prompt",
+        restore_on_failure=_restore_queued_prompt,
+    )
     return True
+
+
+def _dispatch_notification_batch(
+    rid,
+    sid: str,
+    session: dict,
+    notifications: list[tuple[dict, str]],
+    completion_queue,
+) -> None:
+    """Dispatch owned notifications without losing an unclaimed batch tail."""
+    for index, (event, text) in enumerate(notifications):
+        with session["history_lock"]:
+            if session.get("running"):
+                for pending_event, _pending_text in notifications[index:]:
+                    completion_queue.put(pending_event)
+                return
+            turn = _begin_prompt_dispatch_locked(session, text)
+        dispatched = _dispatch_claimed_prompt(
+            rid,
+            sid,
+            session,
+            text,
+            turn,
+            failure_context="completion notification",
+            restore_on_failure=lambda e=event: completion_queue.put(e),
+        )
+        if not dispatched:
+            for pending_event, _pending_text in notifications[index + 1 :]:
+                completion_queue.put(pending_event)
+            return
 
 
 def _inflight_snapshot(session: dict) -> dict | None:
@@ -5664,6 +5792,7 @@ def _inflight_snapshot(session: dict) -> dict | None:
     return {
         "assistant": assistant,
         "streaming": streaming,
+        "turn_id": str(turn.get("id") or ""),
         "user": user,
     }
 
@@ -9462,10 +9591,8 @@ def _(rid, params: dict) -> dict:
                     )
                 except Exception as exc:
                     print(f"[tui_gateway] prompt.submit: replace_messages failed: {exc}", file=sys.stderr)
-        session["running"] = True
-        session["_turn_cancel_requested"] = False
+        _begin_prompt_dispatch_locked(session, text)
         session["last_active"] = time.time()
-        _start_inflight_turn(session, text)
 
     # Persist the DB row lazily, now that the user has actually sent a message.
     _ensure_session_db_row(session)
@@ -9506,7 +9633,17 @@ def _(rid, params: dict) -> dict:
                 session["running"] = False
                 _clear_inflight_turn(session)
             return
-        _run_prompt_submit(rid, sid, session, text)
+        with session["history_lock"]:
+            initial_turn = session.get("inflight_turn")
+        if isinstance(initial_turn, dict):
+            _dispatch_claimed_prompt(
+                rid,
+                sid,
+                session,
+                text,
+                initial_turn,
+                failure_context="initial prompt",
+            )
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck
@@ -9758,7 +9895,7 @@ def _notification_poller_loop(
                 process_registry.completion_queue.put(evt)
                 _requeued = True
             else:
-                session["running"] = True
+                notification_turn = _begin_prompt_dispatch_locked(session, text)
         if _requeued:
             # Back off before re-polling: the re-queued event keeps the queue
             # non-empty, so without a sleep this loop spins at full speed
@@ -9767,17 +9904,16 @@ def _notification_poller_loop(
             continue
 
         rid = f"__notif__{int(time.time() * 1000)}"
-        try:
-            _emit("message.start", sid)
-            _run_prompt_submit(rid, sid, session, text)
-        except Exception as exc:
-            print(
-                f"[tui_gateway] notification poller dispatch failed: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-            with session["history_lock"]:
-                session["running"] = False
+        if not _dispatch_claimed_prompt(
+            rid,
+            sid,
+            session,
+            text,
+            notification_turn,
+            failure_context="notification poller",
+            restore_on_failure=lambda e=evt: process_registry.completion_queue.put(e),
+        ):
+            time.sleep(0.25)
 
     # Drain any remaining events after stop signal (process all pending
     # before exiting so nothing is lost on shutdown). Events owned by other
@@ -9816,20 +9952,19 @@ def _notification_poller_loop(
             if session.get("running"):
                 process_registry.completion_queue.put(evt)
                 break
-            session["running"] = True
+            notification_turn = _begin_prompt_dispatch_locked(session, text)
 
         rid = f"__notif__{int(time.time() * 1000)}"
-        try:
-            _emit("message.start", sid)
-            _run_prompt_submit(rid, sid, session, text)
-        except Exception as exc:
-            print(
-                f"[tui_gateway] notification poller dispatch failed: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-            with session["history_lock"]:
-                session["running"] = False
+        if not _dispatch_claimed_prompt(
+            rid,
+            sid,
+            session,
+            text,
+            notification_turn,
+            failure_context="notification shutdown drain",
+            restore_on_failure=lambda e=evt: deferred.append(e),
+        ):
+            break
 
     # Hand any other sessions' events back to the shared queue.
     for evt in deferred:
@@ -10183,7 +10318,25 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             payload["turn_id"] = (session.get("inflight_turn") or {}).get("id")
             with session["history_lock"]:
                 terminal_turn = session.get("inflight_turn")
+                # Freeze completion while holding the same lock Stop uses to
+                # request cancellation.  A Stop after this boundary cannot
+                # relabel an already-produced answer as cancelled merely
+                # because message.complete delivery is still in progress.
+                frozen_outcome = _freeze_turn_outcome(
+                    session,
+                    result=result,
+                    turn=terminal_turn,
+                )
                 _clear_inflight_turn(session)
+            if frozen_outcome is not None:
+                frozen_status = str(frozen_outcome.get("status") or "")
+                payload["status"] = (
+                    "interrupted"
+                    if frozen_status == "cancelled"
+                    else "error"
+                    if frozen_status in {"failed", "timed_out"}
+                    else "complete"
+                )
             _emit("message.complete", sid, payload)
             _finalize_turn_outcome(
                 sid, session, result=result, turn=terminal_turn
@@ -10376,18 +10529,22 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     # User already sent something — their turn wins,
                     # the judge will re-run on the next turn anyway.
                     return
-                session["running"] = True
-            try:
-                _emit("message.start", sid)
-                _run_prompt_submit(rid, sid, session, goal_followup)
-            except Exception as _cont_exc:
-                print(
-                    f"[tui_gateway] goal continuation dispatch failed: "
-                    f"{type(_cont_exc).__name__}: {_cont_exc}",
-                    file=sys.stderr,
-                )
-                with session["history_lock"]:
-                    session["running"] = False
+                goal_turn = _begin_prompt_dispatch_locked(session, goal_followup)
+            _dispatch_claimed_prompt(
+                rid,
+                sid,
+                session,
+                goal_followup,
+                goal_turn,
+                failure_context="goal continuation",
+                # A user prompt can queue after this automatic turn is
+                # claimed. Restore the goal behind it so user work still wins.
+                restore_on_failure=lambda: _enqueue_prompt(
+                    session,
+                    goal_followup,
+                    session.get("transport"),
+                ),
+            )
 
         # Drain completion notifications that arrived during this turn.
         # The background poller handles between-turn delivery; this is
@@ -10400,26 +10557,17 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             # adopt another session's (or an orphan's) delegation payload,
             # while a post-compression session still claims its own
             # pre-compression dispatches (#55578).
-            for _evt, synth in process_registry.drain_notifications(
+            drained_notifications = process_registry.drain_notifications(
                 session_key=session.get("session_key", ""),
                 owns_event=lambda e: _session_owns_notification_event(sid, session, e),
-            ):
-                with session["history_lock"]:
-                    if session.get("running"):
-                        process_registry.completion_queue.put(_evt)
-                        break
-                    session["running"] = True
-                try:
-                    _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, synth)
-                except Exception as _n_exc:
-                    print(
-                        f"[tui_gateway] completion notification dispatch failed: "
-                        f"{type(_n_exc).__name__}: {_n_exc}",
-                        file=sys.stderr,
-                    )
-                    with session["history_lock"]:
-                        session["running"] = False
+            )
+            _dispatch_notification_batch(
+                rid,
+                sid,
+                session,
+                drained_notifications,
+                process_registry.completion_queue,
+            )
         except Exception as _drain_exc:
             print(
                 f"[tui_gateway] completion queue drain failed: "

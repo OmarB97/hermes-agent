@@ -1298,6 +1298,56 @@ describe('createGatewayEventHandler', () => {
     expect(appended.filter(message => message.text.includes('delayed prior failure'))).toHaveLength(1)
   })
 
+  it('hydrates the resumed turn id and dedupes persisted outcome replay', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    turnController.hydrateTurnOutcomes(
+      { streaming: true, turn_id: 'live-turn' },
+      [
+        {
+          role: 'system',
+          text: 'turn:failed · provider/model · stored failure',
+          turn_outcome: { id: 'stored-turn' }
+        }
+      ]
+    )
+    patchUiState({ busy: true })
+
+    onEvent({
+      payload: {
+        id: 'stored-turn',
+        status: 'failed',
+        text: 'turn:failed · provider/model · stored failure'
+      },
+      type: 'turn.outcome'
+    } as any)
+    onEvent({
+      payload: {
+        id: 'old-turn',
+        status: 'failed',
+        text: 'turn:failed · provider/model · delayed old failure'
+      },
+      type: 'turn.outcome'
+    } as any)
+
+    expect(getUiState().busy).toBe(true)
+    expect(appended.filter(message => message.text.includes('stored failure'))).toHaveLength(0)
+    expect(appended.filter(message => message.text.includes('delayed old failure'))).toHaveLength(1)
+
+    onEvent({
+      payload: {
+        id: 'live-turn',
+        status: 'completed',
+        text: 'turn:completed · provider/model · response delivered'
+      },
+      type: 'turn.outcome'
+    } as any)
+
+    expect(getUiState().busy).toBe(false)
+    expect(appended.filter(message => message.text.startsWith('turn:completed'))).toHaveLength(1)
+  })
+
   it('persists an abandoned (timed-out) clarify into the transcript when the clarify tool completes', () => {
     const appended: Msg[] = []
     const onEvent = createGatewayEventHandler(buildCtx(appended))

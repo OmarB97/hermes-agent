@@ -1,5 +1,5 @@
 import type { QueryClient } from '@tanstack/react-query'
-import { type MutableRefObject, useCallback, useRef } from 'react'
+import { type MutableRefObject, useCallback } from 'react'
 
 import { writeAgentTerminalChunk } from '@/app/right-sidebar/terminal/agent-terminal-stream'
 import { readActiveTerminal } from '@/app/right-sidebar/terminal/buffer'
@@ -64,6 +64,7 @@ import {
 
 interface GatewayEventDeps {
   activeSessionIdRef: MutableRefObject<string | null>
+  activeTurnIdsRef: MutableRefObject<Map<string, string>>
   compactedTurnRef: MutableRefObject<Set<string>>
   lastCwdInfoSessionRef: MutableRefObject<string | null>
   nativeSubagentSessionsRef: MutableRefObject<Set<string>>
@@ -75,6 +76,7 @@ interface GatewayEventDeps {
   queryClient: QueryClient
   refreshHermesConfig: () => Promise<void>
   sessionInterrupted: (sessionId: string) => boolean
+  seenTurnOutcomeIdsRef: MutableRefObject<Set<string>>
   updateSessionState: (
     sessionId: string,
     updater: (state: ClientSessionState) => ClientSessionState,
@@ -94,6 +96,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
     appendAssistantDelta,
     appendReasoningDelta,
     activeSessionIdRef,
+    activeTurnIdsRef,
     compactedTurnRef,
     lastCwdInfoSessionRef,
     nativeSubagentSessionsRef,
@@ -103,12 +106,10 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
     queryClient,
     refreshHermesConfig,
     sessionInterrupted,
+    seenTurnOutcomeIdsRef,
     updateSessionState,
     upsertToolCall
   } = deps
-
-  const activeTurnIdsRef = useRef(new Map<string, string>())
-  const seenTurnOutcomeIdsRef = useRef(new Set<string>())
 
   return useCallback(
     (event: RpcEvent) => {
@@ -797,6 +798,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
       appendAssistantDelta,
       appendReasoningDelta,
       activeSessionIdRef,
+      activeTurnIdsRef,
       compactedTurnRef,
       completeAssistantMessage,
       failAssistantMessage,
@@ -806,6 +808,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
       queryClient,
       refreshHermesConfig,
       sessionInterrupted,
+      seenTurnOutcomeIdsRef,
       updateSessionState,
       upsertToolCall
     ]

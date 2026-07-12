@@ -1,10 +1,15 @@
 import contextlib
+import queue
 import threading
 import types
 
 import pytest
 
 from tui_gateway import server
+
+
+REAL_DRAIN_QUEUED_PROMPT = server._drain_queued_prompt
+REAL_THREAD = threading.Thread
 
 
 class _ImmediateThread:
@@ -437,6 +442,201 @@ def test_duplicate_finalize_retries_failed_persistence_without_reemitting(
     assert flaky.attempts == 2
     assert len(flaky.rows) == 1
     assert [args[0] for args in turn_harness.emitted].count("turn.outcome") == 1
+
+
+def test_queued_dispatch_sync_failure_restores_prompt_and_fails_loudly_once(
+    turn_harness, monkeypatch
+):
+    session = _session(_Agent(None))
+    session["running"] = False
+    session["queued_prompt"] = {
+        "text": "do not lose this prompt",
+        "transport": "desktop-client",
+    }
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("dispatch exploded")),
+    )
+
+    assert REAL_DRAIN_QUEUED_PROMPT(
+        "request-queued", "runtime-session", session
+    )
+
+    outcomes = [
+        args[2] for args in turn_harness.emitted if args[0] == "turn.outcome"
+    ]
+    assert session["queued_prompt"] == {
+        "text": "do not lose this prompt",
+        "transport": "desktop-client",
+    }
+    assert session["running"] is False
+    assert session["inflight_turn"] is None
+    assert len(outcomes) == 1
+    assert outcomes[0]["status"] == "failed"
+    assert "dispatch exploded" in outcomes[0]["reason"]
+    assert len(turn_harness.db.rows) == 1
+
+
+def test_notification_sync_failure_restores_current_and_entire_batch_tail(
+    turn_harness, monkeypatch
+):
+    session = _session(_Agent(None))
+    session["running"] = False
+    notifications = [
+        ({"id": "event-1"}, "first"),
+        ({"id": "event-2"}, "second"),
+        ({"id": "event-3"}, "third"),
+    ]
+    completion_queue = queue.Queue()
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("dispatch exploded")),
+    )
+
+    server._dispatch_notification_batch(
+        "request-notification",
+        "runtime-session",
+        session,
+        notifications,
+        completion_queue,
+    )
+
+    restored = [completion_queue.get_nowait() for _ in range(3)]
+    outcomes = [
+        args[2] for args in turn_harness.emitted if args[0] == "turn.outcome"
+    ]
+    assert restored == [event for event, _text in notifications]
+    assert completion_queue.empty()
+    assert session["running"] is False
+    assert session["inflight_turn"] is None
+    assert len(outcomes) == 1
+    assert outcomes[0]["status"] == "failed"
+    assert len(turn_harness.db.rows) == 1
+
+
+def test_completion_freezes_before_delayed_message_complete_delivery(
+    turn_harness, monkeypatch
+):
+    complete_blocked = threading.Event()
+    release_complete = threading.Event()
+    agent = _Agent(
+        {
+            "completed": True,
+            "final_response": "complete answer",
+            "messages": [{"role": "assistant", "content": "complete answer"}],
+        }
+    )
+    agent.interrupt = lambda: None
+    session = _session(agent)
+    server._start_inflight_turn(session, "run")
+    server._sessions["runtime-session"] = session
+    monkeypatch.setattr(server.threading, "Thread", REAL_THREAD)
+    monkeypatch.setattr(server, "_clear_pending", lambda *_args: None)
+
+    def emit(*args):
+        turn_harness.emitted.append(args)
+        if args[0] == "message.complete":
+            complete_blocked.set()
+            assert release_complete.wait(2)
+
+    monkeypatch.setattr(server, "_emit", emit)
+    try:
+        server._run_prompt_submit(
+            "request-race", "runtime-session", session, "run"
+        )
+        run_thread = session["_run_thread"]
+        assert complete_blocked.wait(2)
+        response = server.handle_request(
+            {
+                "id": "request-stop",
+                "method": "session.interrupt",
+                "params": {"session_id": "runtime-session"},
+            }
+        )
+        release_complete.set()
+        run_thread.join(2)
+    finally:
+        release_complete.set()
+        server._sessions.pop("runtime-session", None)
+
+    outcomes = [
+        args[2] for args in turn_harness.emitted if args[0] == "turn.outcome"
+    ]
+    assert response["result"]["status"] == "interrupted"
+    assert not run_thread.is_alive()
+    assert [outcome["status"] for outcome in outcomes] == ["completed"]
+    completes = [
+        args[2] for args in turn_harness.emitted if args[0] == "message.complete"
+    ]
+    assert [payload["status"] for payload in completes] == ["complete"]
+    assert len(turn_harness.db.rows) == 1
+
+
+def test_stop_freezes_cancellation_before_agent_completion(
+    turn_harness, monkeypatch
+):
+    agent_entered = threading.Event()
+    release_agent = threading.Event()
+
+    def wait_for_release():
+        agent_entered.set()
+        assert release_agent.wait(2)
+
+    agent = _Agent(
+        {
+            "completed": True,
+            "final_response": "late answer",
+            "messages": [{"role": "assistant", "content": "late answer"}],
+        },
+        on_run=wait_for_release,
+    )
+    agent.interrupt = lambda: None
+    session = _session(agent)
+    server._start_inflight_turn(session, "run")
+    server._sessions["runtime-session"] = session
+    monkeypatch.setattr(server.threading, "Thread", REAL_THREAD)
+    monkeypatch.setattr(server, "_clear_pending", lambda *_args: None)
+    try:
+        server._run_prompt_submit(
+            "request-race", "runtime-session", session, "run"
+        )
+        run_thread = session["_run_thread"]
+        assert agent_entered.wait(2)
+        response = server.handle_request(
+            {
+                "id": "request-stop",
+                "method": "session.interrupt",
+                "params": {"session_id": "runtime-session"},
+            }
+        )
+        release_agent.set()
+        run_thread.join(2)
+    finally:
+        release_agent.set()
+        server._sessions.pop("runtime-session", None)
+
+    outcomes = [
+        args[2] for args in turn_harness.emitted if args[0] == "turn.outcome"
+    ]
+    assert response["result"]["status"] == "interrupted"
+    assert not run_thread.is_alive()
+    assert [outcome["status"] for outcome in outcomes] == ["cancelled"]
+    completes = [
+        args[2] for args in turn_harness.emitted if args[0] == "message.complete"
+    ]
+    assert [payload["status"] for payload in completes] == ["interrupted"]
+    assert len(turn_harness.db.rows) == 1
+
+
+def test_inflight_snapshot_carries_turn_identity():
+    session = _session(_Agent(None))
+    server._start_inflight_turn(session, "resume me")
+
+    snapshot = server._inflight_snapshot(session)
+
+    assert snapshot["turn_id"] == session["inflight_turn"]["id"]
 
 
 def test_display_projection_inserts_outcomes_without_mutating_prompt_history():

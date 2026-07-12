@@ -20,6 +20,10 @@ export interface GatewayTranscriptMessage {
   name?: string
   role: 'assistant' | 'system' | 'tool' | 'user'
   text?: string
+  turn_outcome?: {
+    id?: string
+    turn_id?: string
+  }
 }
 
 // ── Commands / completion ────────────────────────────────────────────
@@ -261,6 +265,7 @@ export interface SessionActiveListResponse {
 export interface SessionInflightTurn {
   assistant?: string
   streaming?: boolean
+  turn_id?: string
   user?: string
 }
 

@@ -6,13 +6,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ClientSessionState } from '@/app/types'
 import { chatMessageText, textPart } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
-import type { RpcEvent } from '@/types/hermes'
+import type { RpcEvent, SessionInflightTurn } from '@/types/hermes'
 
 import { useMessageStream } from './index'
 
 const SID = 'session-1'
 
 let handleEvent: ((event: RpcEvent) => void) | null = null
+
+let hydrateTurnOutcomeState:
+  | ((sessionId: string, inflight?: null | SessionInflightTurn, messages?: ClientSessionState['messages']) => void)
+  | null = null
+
 let states: Map<string, ClientSessionState>
 
 function Harness() {
@@ -40,7 +45,8 @@ function Harness() {
 
   useEffect(() => {
     handleEvent = stream.handleGatewayEvent
-  }, [stream.handleGatewayEvent])
+    hydrateTurnOutcomeState = stream.hydrateTurnOutcomeState
+  }, [stream.handleGatewayEvent, stream.hydrateTurnOutcomeState])
 
   return null
 }
@@ -55,6 +61,7 @@ const send = (event: RpcEvent) => act(() => handleEvent!(event))
 describe('useMessageStream terminal turn outcomes', () => {
   beforeEach(() => {
     handleEvent = null
+    hydrateTurnOutcomeState = null
     states = new Map()
   })
 
@@ -124,5 +131,65 @@ describe('useMessageStream terminal turn outcomes', () => {
     expect(current.busy).toBe(true)
     expect(current.awaitingResponse).toBe(true)
     expect(current.messages.filter(message => message.id === 'turn-outcome:old-turn')).toHaveLength(1)
+  })
+
+  it('seeds the resumed active turn before delayed outcomes arrive', async () => {
+    await mountStream()
+    states.set(SID, {
+      ...createClientSessionState(),
+      awaitingResponse: true,
+      busy: true
+    })
+
+    act(() => hydrateTurnOutcomeState!(SID, { streaming: true, turn_id: 'live-turn' }))
+
+    send({
+      payload: {
+        id: 'old-turn',
+        status: 'failed',
+        text: 'turn:failed · provider/model · delayed prior failure'
+      },
+      session_id: SID,
+      type: 'turn.outcome'
+    })
+
+    expect(states.get(SID)).toMatchObject({ awaitingResponse: true, busy: true })
+
+    send({
+      payload: {
+        id: 'live-turn',
+        status: 'completed',
+        text: 'turn:completed · provider/model · response delivered'
+      },
+      session_id: SID,
+      type: 'turn.outcome'
+    })
+
+    expect(states.get(SID)).toMatchObject({ awaitingResponse: false, busy: false })
+  })
+
+  it('seeds hydrated outcome ids so a concurrent replay stays deduplicated', async () => {
+    await mountStream()
+
+    const hydratedOutcome = {
+      id: 'turn-outcome:stored-turn',
+      role: 'system' as const,
+      parts: [textPart('turn:failed · provider/model · stored failure')]
+    }
+
+    states.set(SID, createClientSessionState(null, [hydratedOutcome]))
+
+    act(() => hydrateTurnOutcomeState!(SID, null, [hydratedOutcome]))
+    send({
+      payload: {
+        id: 'stored-turn',
+        status: 'failed',
+        text: 'turn:failed · provider/model · stored failure'
+      },
+      session_id: SID,
+      type: 'turn.outcome'
+    })
+
+    expect(states.get(SID)?.messages).toEqual([hydratedOutcome])
   })
 })

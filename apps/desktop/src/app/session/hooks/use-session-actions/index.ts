@@ -4,7 +4,7 @@ import type { NavigateFunction } from 'react-router-dom'
 
 import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
+import { type ChatMessage, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
 import { restoreFallbackNotices } from '@/lib/fallback-notices'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { clearQueuedPrompts } from '@/store/composer-queue'
@@ -84,6 +84,11 @@ interface SessionActionsOptions {
   creatingSessionRef: MutableRefObject<boolean>
   ensureSessionState: (sessionId: string, storedSessionId?: string | null) => ClientSessionState
   getRouteToken: () => string
+  hydrateTurnOutcomeState: (
+    sessionId: string,
+    inflight?: SessionResumeResponse['inflight'],
+    messages?: ChatMessage[]
+  ) => void
   navigate: NavigateFunction
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
   runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>>
@@ -105,6 +110,7 @@ export function useSessionActions({
   creatingSessionRef,
   ensureSessionState,
   getRouteToken,
+  hydrateTurnOutcomeState,
   navigate,
   requestGateway,
   runtimeIdByStoredSessionIdRef,
@@ -563,7 +569,8 @@ export function useSessionActions({
 
         patchSessionWorkspace(storedSessionId, runtimeInfo?.cwd)
 
-        resumedRunning = Boolean((resumed as { running?: boolean }).running)
+        resumedRunning = Boolean(resumed.running)
+        hydrateTurnOutcomeState(resumed.session_id, resumed.inflight, messagesForView)
 
         updateSessionState(
           resumed.session_id,
@@ -653,6 +660,7 @@ export function useSessionActions({
       activeSessionIdRef,
       busyRef,
       copy,
+      hydrateTurnOutcomeState,
       requestGateway,
       runtimeIdByStoredSessionIdRef,
       selectedStoredSessionIdRef,

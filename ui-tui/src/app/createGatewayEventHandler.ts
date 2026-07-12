@@ -90,9 +90,6 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
   let pendingThinkingStatus = ''
   let thinkingStatusTimer: null | ReturnType<typeof setTimeout> = null
   let startupPromptSubmitted = false
-  let activeTurnId = ''
-  const seenTurnOutcomeIds = new Set<string>()
-
   // Request IDs of clarify prompts we've already flushed to the transcript as
   // an abandoned-prompt record, so the tool.complete and message.complete
   // paths can't both persist the same prompt twice.
@@ -457,9 +454,9 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       }
 
       case 'message.start':
-        activeTurnId = String(ev.payload?.turn_id ?? '').trim()
         resetAgentsNudgeTurnState()
         turnController.startMessage()
+        turnController.startTurnOutcome(ev.payload?.turn_id)
 
         return
       case 'status.update': {
@@ -927,7 +924,6 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         return
       case 'message.complete': {
         const { finalMessages, finalText, wasInterrupted } = turnController.recordMessageComplete(ev.payload ?? {})
-        activeTurnId = ''
 
         if (!wasInterrupted) {
           const msgs: Msg[] = finalMessages.length ? finalMessages : [{ role: 'assistant', text: finalText }]
@@ -954,21 +950,15 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         const turnId = String(ev.payload?.turn_id ?? ev.payload?.id ?? '').trim()
         const text = String(ev.payload?.text ?? '').trim()
 
-        if (!turnId || !text || seenTurnOutcomeIds.has(turnId)) {
+        if (!turnId || !text) {
           return
         }
 
-        seenTurnOutcomeIds.add(turnId)
+        const { duplicate, settlesCurrentTurn } = turnController.acceptTurnOutcome(turnId)
 
-        if (seenTurnOutcomeIds.size > 256) {
-          const oldest = seenTurnOutcomeIds.values().next().value
-
-          if (oldest) {
-            seenTurnOutcomeIds.delete(oldest)
-          }
+        if (duplicate) {
+          return
         }
-
-        const settlesCurrentTurn = !activeTurnId || activeTurnId === turnId
 
         if (settlesCurrentTurn) {
           const { finalMessages, wasInterrupted } = turnController.recordMessageComplete({})
@@ -977,7 +967,6 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
             finalMessages.forEach(appendMessage)
           }
 
-          activeTurnId = ''
           setStatus('ready')
         }
 
