@@ -1,9 +1,9 @@
 """Tests for the retry/fallback status buffer helpers on AIAgent.
 
-These helpers defer noisy retry chatter (rate-limit retries, fallback
-switches, compression attempts) so users only see the trace when
-everything ultimately fails.  On successful recovery the buffer is
-silently dropped.
+These helpers defer noisy retry chatter (rate-limit retries and compression
+attempts) so users only see the trace when everything ultimately fails. On
+successful recovery the noisy buffer is dropped, while a durable provider /
+model fallback switch is surfaced exactly once.
 """
 
 from __future__ import annotations
@@ -133,6 +133,79 @@ def test_mixed_kinds_replay_through_correct_channels():
     assert statuses == ["status-1", "status-2"]
     assert vprints == [("vprint-1", True)]
     assert warns == ["warn-1"]
+
+
+def test_pending_fallback_notice_emitted_once_on_success():
+    """Successful fallback keeps one switch notice while dropping retry noise."""
+    agent = _make_bare_agent()
+    emitted = []
+    agent._emit_status = lambda msg: emitted.append(msg)
+
+    agent._buffer_status("🔄 Primary model failed — switching to fallback: m2 via p2")
+    agent._pending_fallback_notice = (
+        "🔄 Switched to fallback model: m1 via p1 → m2 via p2"
+    )
+
+    agent._emit_pending_fallback_notice()
+    agent._clear_status_buffer()
+
+    assert emitted == ["🔄 Switched to fallback model: m1 via p1 → m2 via p2"]
+    assert agent._retry_status_buffer == []
+    assert agent._pending_fallback_notice is None
+
+    agent._emit_pending_fallback_notice()
+    assert emitted == ["🔄 Switched to fallback model: m1 via p1 → m2 via p2"]
+
+
+def test_pending_fallback_notice_noop_when_unset():
+    agent = _make_bare_agent()
+    emitted = []
+    agent._emit_status = lambda msg: emitted.append(msg)
+
+    agent._emit_pending_fallback_notice()
+
+    assert emitted == []
+
+
+def test_flush_discards_pending_fallback_notice():
+    """Terminal failure flushes the switch trace without a later duplicate."""
+    agent = _make_bare_agent()
+    emitted = []
+    agent._emit_status = lambda msg: emitted.append(msg)
+
+    agent._buffer_status("🔄 Primary model failed — switching to fallback: m2 via p2")
+    agent._pending_fallback_notice = (
+        "🔄 Switched to fallback model: m1 via p1 → m2 via p2"
+    )
+
+    agent._flush_status_buffer()
+
+    assert emitted == ["🔄 Primary model failed — switching to fallback: m2 via p2"]
+    assert agent._pending_fallback_notice is None
+
+    emitted.clear()
+    agent._emit_pending_fallback_notice()
+    assert emitted == []
+
+
+def test_pending_fallback_notice_survives_emit_callback_error():
+    """A failed status callback must not leave a stale notice for another turn."""
+    agent = _make_bare_agent()
+    seen = []
+
+    def boom(msg):
+        seen.append(msg)
+        raise RuntimeError("simulated callback failure")
+
+    agent._emit_status = boom
+    agent._pending_fallback_notice = (
+        "🔄 Switched to fallback model: m1 via p1 → m2 via p2"
+    )
+
+    agent._emit_pending_fallback_notice()
+
+    assert seen == ["🔄 Switched to fallback model: m1 via p1 → m2 via p2"]
+    assert agent._pending_fallback_notice is None
 
 
 def test_flush_swallows_callback_exceptions():
