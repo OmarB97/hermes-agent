@@ -90,6 +90,8 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
   let pendingThinkingStatus = ''
   let thinkingStatusTimer: null | ReturnType<typeof setTimeout> = null
   let startupPromptSubmitted = false
+  let activeTurnId = ''
+  const seenTurnOutcomeIds = new Set<string>()
 
   // Request IDs of clarify prompts we've already flushed to the transcript as
   // an abandoned-prompt record, so the tool.complete and message.complete
@@ -455,6 +457,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       }
 
       case 'message.start':
+        activeTurnId = String(ev.payload?.turn_id ?? '').trim()
         resetAgentsNudgeTurnState()
         turnController.startMessage()
 
@@ -924,6 +927,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         return
       case 'message.complete': {
         const { finalMessages, finalText, wasInterrupted } = turnController.recordMessageComplete(ev.payload ?? {})
+        activeTurnId = ''
 
         if (!wasInterrupted) {
           const msgs: Msg[] = finalMessages.length ? finalMessages : [{ role: 'assistant', text: finalText }]
@@ -942,6 +946,42 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         if (ev.payload?.usage) {
           patchUiState(state => ({ ...state, usage: { ...state.usage, ...ev.payload!.usage } }))
         }
+
+        return
+      }
+
+      case 'turn.outcome': {
+        const turnId = String(ev.payload?.turn_id ?? ev.payload?.id ?? '').trim()
+        const text = String(ev.payload?.text ?? '').trim()
+
+        if (!turnId || !text || seenTurnOutcomeIds.has(turnId)) {
+          return
+        }
+
+        seenTurnOutcomeIds.add(turnId)
+
+        if (seenTurnOutcomeIds.size > 256) {
+          const oldest = seenTurnOutcomeIds.values().next().value
+
+          if (oldest) {
+            seenTurnOutcomeIds.delete(oldest)
+          }
+        }
+
+        const settlesCurrentTurn = !activeTurnId || activeTurnId === turnId
+
+        if (settlesCurrentTurn) {
+          const { finalMessages, wasInterrupted } = turnController.recordMessageComplete({})
+
+          if (!wasInterrupted) {
+            finalMessages.forEach(appendMessage)
+          }
+
+          activeTurnId = ''
+          setStatus('ready')
+        }
+
+        appendMessage({ role: 'system', text })
 
         return
       }

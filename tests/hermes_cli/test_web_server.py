@@ -1505,6 +1505,18 @@ class TestWebServerEndpoints:
             db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (now - 4, "desktop-tip"))
             db.replace_messages("desktop-root", [])
             db.append_message(session_id="desktop-tip", role="user", content="after compression")
+            db.record_turn_outcome(
+                "desktop-tip",
+                "desktop-turn",
+                user_ordinal=0,
+                status="failed",
+                reason="HTTP 502 after retries",
+                model="model",
+                provider="provider",
+                text="turn:failed · provider/model · HTTP 502 after retries",
+                started_at=now - 3,
+                completed_at=now - 2,
+            )
             db._conn.commit()
         finally:
             db.close()
@@ -1514,6 +1526,9 @@ class TestWebServerEndpoints:
         payload = resp.json()
         assert payload["session_id"] == "desktop-tip"
         assert [m["content"] for m in payload["messages"]] == ["after compression"]
+        assert [row["turn_id"] for row in payload["turn_outcomes"]] == [
+            "desktop-turn"
+        ]
 
     def test_get_sessions_archived_is_boolean(self):
         from hermes_state import SessionDB

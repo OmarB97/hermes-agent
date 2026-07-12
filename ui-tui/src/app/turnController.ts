@@ -293,7 +293,7 @@ class TurnController {
   // while `interrupted`) instead of racing the still-unwinding turn — the race
   // duplicated the user bubble, leaked a "queued: …" note, and surfaced the
   // cancelled turn's "[interrupted]" reply.
-  interruptTurn({ appendMessage, gw, sid, sys }: InterruptDeps, opts: { keepBusy?: boolean } = {}) {
+  interruptTurn({ appendMessage, gw, sid }: InterruptDeps, opts: { keepBusy?: boolean } = {}) {
     this.interrupted = true
     gw.request<SessionInterruptResponse>('session.interrupt', { session_id: sid }).catch(() => {})
 
@@ -315,18 +315,14 @@ class TurnController {
       appendMessage(msg)
     }
 
-    // Always surface an interruption indicator — if there's an in-flight
-    // `partial` or pending tools, fold them into a single assistant message;
-    // otherwise emit a sys note so the transcript always records that the
-    // turn was cancelled, even when only prior `segments` were preserved.
+    // Preserve partial content, but do not synthesize an interruption marker.
+    // The gateway's canonical turn.outcome is the one terminal record.
     if (partial || tools.length) {
       appendMessage({
         role: 'assistant',
-        text: partial ? `${partial}\n\n*[interrupted]*` : '*[interrupted]*',
+        text: partial,
         ...(tools.length && { tools })
       })
-    } else {
-      sys('interrupted')
     }
 
     this.clearStatusTimer()

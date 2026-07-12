@@ -150,6 +150,7 @@ export type {
   SessionRuntimeInfo,
   SessionSearchResponse,
   SessionSearchResult,
+  SessionTurnOutcome,
   SkillHubInstalledEntry,
   SkillHubPreview,
   SkillHubResult,

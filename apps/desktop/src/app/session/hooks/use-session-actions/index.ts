@@ -496,7 +496,10 @@ export function useSessionActions({
 
             if (isCurrentResume()) {
               localSnapshot = preserveLocalAssistantErrors(
-                restoreFallbackNotices(storedSessionId, toChatMessages(storedMessages.messages)),
+                restoreFallbackNotices(
+                  storedSessionId,
+                  toChatMessages(storedMessages.messages, storedMessages.turn_outcomes)
+                ),
                 $messages.get()
               )
 
@@ -597,7 +600,7 @@ export function useSessionActions({
 
           setMessages(
             preserveLocalAssistantErrors(
-              restoreFallbackNotices(storedSessionId, toChatMessages(fallback.messages)),
+              restoreFallbackNotices(storedSessionId, toChatMessages(fallback.messages, fallback.turn_outcomes)),
               $messages.get()
             )
           )

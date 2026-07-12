@@ -1,5 +1,5 @@
 import type { QueryClient } from '@tanstack/react-query'
-import { type MutableRefObject, useCallback } from 'react'
+import { type MutableRefObject, useCallback, useRef } from 'react'
 
 import { writeAgentTerminalChunk } from '@/app/right-sidebar/terminal/agent-terminal-stream'
 import { readActiveTerminal } from '@/app/right-sidebar/terminal/buffer'
@@ -106,6 +106,9 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
     updateSessionState,
     upsertToolCall
   } = deps
+
+  const activeTurnIdsRef = useRef(new Map<string, string>())
+  const seenTurnOutcomeIdsRef = useRef(new Set<string>())
 
   return useCallback(
     (event: RpcEvent) => {
@@ -264,6 +267,13 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         setSessionCompacting(sessionId, false)
         compactedTurnRef.current.delete(sessionId)
         nativeSubagentSessionsRef.current.delete(sessionId)
+        const turnId = String(payload?.turn_id || payload?.id || '').trim()
+
+        if (turnId) {
+          activeTurnIdsRef.current.set(sessionId, turnId)
+        } else {
+          activeTurnIdsRef.current.delete(sessionId)
+        }
 
         if (isActiveEvent) {
           triggerHaptic('streamStart')
@@ -373,6 +383,84 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
         if (payload?.usage) {
           setCurrentUsage(current => ({ ...current, ...payload.usage }))
+        }
+      } else if (event.type === 'turn.outcome') {
+        if (!sessionId) {
+          return
+        }
+
+        const turnId = String(payload?.turn_id || payload?.id || '').trim()
+        const outcomeText = coerceGatewayText(payload?.text).trim()
+
+        if (!turnId || !outcomeText || seenTurnOutcomeIdsRef.current.has(turnId)) {
+          return
+        }
+
+        seenTurnOutcomeIdsRef.current.add(turnId)
+
+        if (seenTurnOutcomeIdsRef.current.size > 256) {
+          const oldest = seenTurnOutcomeIdsRef.current.values().next().value
+
+          if (oldest) {
+            seenTurnOutcomeIdsRef.current.delete(oldest)
+          }
+        }
+
+        const activeTurnId = activeTurnIdsRef.current.get(sessionId)
+        // A delayed outcome still belongs in the transcript, but it must not
+        // settle a newer turn that has already started in the same session.
+        const settlesCurrentTurn = !activeTurnId || activeTurnId === turnId
+
+        if (settlesCurrentTurn) {
+          activeTurnIdsRef.current.delete(sessionId)
+          clearAllPrompts(sessionId)
+          clearClarifyRequest(undefined, sessionId)
+          clearActiveSessionTodos(sessionId)
+          setSessionCompacting(sessionId, false)
+          compactedTurnRef.current.delete(sessionId)
+          flushQueuedDeltas(sessionId)
+        }
+
+        updateSessionState(sessionId, state => {
+          const messageId = `turn-outcome:${turnId}`
+
+          const settledMessages =
+            settlesCurrentTurn && state.streamId
+              ? state.messages.map(message =>
+                  message.id === state.streamId ? { ...message, pending: false } : message
+                )
+              : state.messages
+
+          const messages = settledMessages.some(message => message.id === messageId)
+            ? settledMessages
+            : [
+                ...settledMessages,
+                {
+                  id: messageId,
+                  role: 'system' as const,
+                  parts: [textPart(outcomeText)],
+                  timestamp:
+                    typeof payload?.completed_at === 'number' ? payload.completed_at : Math.floor(Date.now() / 1000)
+                }
+              ]
+
+          return settlesCurrentTurn
+            ? {
+                ...state,
+                messages,
+                awaitingResponse: false,
+                busy: false,
+                needsInput: false,
+                pendingBranchGroup: null,
+                streamId: null,
+                turnStartedAt: null
+              }
+            : { ...state, messages }
+        })
+
+        if (settlesCurrentTurn && isActiveEvent) {
+          setTurnStartedAt(null)
+          setPetActivity({ reasoning: false, toolRunning: false })
         }
       } else if (event.type === 'session.title') {
         // Live auto-title push (titler runs async, after the turn's refresh).
