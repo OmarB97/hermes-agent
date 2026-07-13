@@ -791,6 +791,36 @@ class TestDistributionDoctor:
 
 class TestFreshActivationRace:
 
+    def test_receipt_failure_cannot_race_activation_into_dangling_pointer(
+        self, profile_env, monkeypatch
+    ):
+        staged = _make_staging_dir(profile_env, "late-activation-race")
+        activation_errors = []
+
+        def activate_during_receipt(*args, **kwargs):
+            from hermes_cli.profiles import set_active_profile
+
+            try:
+                set_active_profile("late-activation-race")
+            except ValueError as exc:
+                activation_errors.append(str(exc))
+            raise OSError("injected receipt failure after activation attempt")
+
+        monkeypatch.setattr(
+            "hermes_cli.profile_distribution._atomic_write_json",
+            activate_during_receipt,
+        )
+
+        with pytest.raises(DistributionError, match="rolled back"):
+            install_distribution(str(staged), name="late-activation-race")
+
+        from hermes_cli.profiles import get_active_profile, get_profile_dir
+
+        assert activation_errors
+        assert "distribution transaction" in activation_errors[0]
+        assert get_active_profile() == "default"
+        assert not get_profile_dir("late-activation-race").exists()
+
     def test_concurrent_activation_retains_committed_profile(
         self, profile_env, monkeypatch
     ):
