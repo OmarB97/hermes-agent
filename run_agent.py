@@ -597,27 +597,67 @@ class AIAgent:
         """Create session DB row on first use. Disables _session_db on failure."""
         if getattr(self, "_persist_disabled", False):
             return
-        if self._session_db_created or not self._session_db:
+        if not self._session_db:
             return
-        source = _session_source_for_agent(self.platform)
+        needs_telemetry_bind = (
+            getattr(self, "_session_telemetry_hydrated_session_id", None)
+            != self.session_id
+        )
+        if not self._session_db_created:
+            source = _session_source_for_agent(self.platform)
+            try:
+                self._session_db.create_session(
+                    session_id=self.session_id,
+                    source=source,
+                    model=self.model,
+                    model_config=self._session_init_model_config,
+                    system_prompt=self._cached_system_prompt,
+                    user_id=None,
+                    parent_session_id=self._parent_session_id,
+                    cwd=_launch_cwd_for_session(source),
+                )
+                self._session_db_created = True
+            except Exception as e:
+                # Transient failure (e.g. SQLite lock). Keep _session_db alive —
+                # _session_db_created stays False so next run_conversation() retries.
+                logger.warning(
+                    "Session DB creation failed (will retry next turn): %s", e
+                )
+                return
+
+        # A resumed row is authoritative for cumulative counters and latest
+        # snapshots. Hydrate before turn_context's early JSON persistence can
+        # project the reset_session_state() zeros over that durable truth.
         try:
-            self._session_db.create_session(
-                session_id=self.session_id,
-                source=source,
-                model=self.model,
-                model_config=self._session_init_model_config,
-                system_prompt=self._cached_system_prompt,
-                user_id=None,
-                parent_session_id=self._parent_session_id,
-                cwd=_launch_cwd_for_session(source),
+            from agent.session_telemetry import hydrate_agent_session_telemetry
+
+            hydrate_agent_session_telemetry(self)
+        except Exception:
+            logger.debug(
+                "Session telemetry hydration failed (session=%s)",
+                self.session_id,
+                exc_info=True,
             )
-            self._session_db_created = True
-        except Exception as e:
-            # Transient failure (e.g. SQLite lock). Keep _session_db alive —
-            # _session_db_created stays False so next run_conversation() retries.
-            logger.warning(
-                "Session DB creation failed (will retry next turn): %s", e
-            )
+
+        # Persist the compressor's currently resolved cap as soon as the row
+        # exists. Persisted caps have no model/config provenance, so hydration
+        # only uses one when the current runtime has no positive resolution.
+        if needs_telemetry_bind:
+            try:
+                context_length = int(
+                    getattr(
+                        getattr(self, "context_compressor", None),
+                        "context_length",
+                        0,
+                    )
+                    or 0
+                )
+                if context_length > 0:
+                    self._session_db.set_context_length(
+                        self.session_id, context_length
+                    )
+            except Exception:
+                pass
 
     def _transition_context_engine_session(
         self,
@@ -724,6 +764,12 @@ class AIAgent:
         self.session_cache_write_tokens = 0
         self.session_reasoning_tokens = 0
         self.session_api_calls = 0
+        self.pending_prompt_tokens = 0
+        self._pending_generation = 0
+        self._pending_owner = None
+        self._pending_started_at = 0.0
+        self._session_telemetry_hydrated_session_id = None
+        self._session_json_pending_compaction_epoch = 0
         self.session_estimated_cost_usd = 0.0
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
@@ -2608,7 +2654,29 @@ class AIAgent:
             return redacted
         return content
 
-    def _save_session_log(self, messages: List[Dict[str, Any]] = None):
+    def _save_session_log(
+        self,
+        messages: List[Dict[str, Any]] = None,
+        *,
+        allow_compaction_shrink: bool = False,
+    ):
+        """Serialize a JSON compatibility projection with pending DB state."""
+        if not getattr(self, "_session_json_enabled", False):
+            return
+        from agent.session_telemetry import pending_projection_guard
+
+        with pending_projection_guard(self):
+            return self._save_session_log_locked(
+                messages,
+                allow_compaction_shrink=allow_compaction_shrink,
+            )
+
+    def _save_session_log_locked(
+        self,
+        messages: List[Dict[str, Any]] = None,
+        *,
+        allow_compaction_shrink: bool = False,
+    ):
         """Optional per-session JSON snapshot writer.
 
         Gated by ``sessions.write_json_snapshots`` (default False).  state.db
@@ -2621,7 +2689,10 @@ class AIAgent:
         ``_clean_session_content`` to convert REASONING_SCRATCHPAD to think
         tags).  The truncation guard ("don't overwrite a larger log with
         fewer messages") is preserved so resume + branch don't clobber a
-        fuller existing snapshot.
+        fuller existing snapshot. A successful context compaction may opt into
+        a shrink only when its compression epoch is newer than the snapshot's;
+        this lets the compacted transcript become the live JSON prefix without
+        turning arbitrary partial-history writes into destructive overwrites.
         """
         if not getattr(self, "_session_json_enabled", False):
             return
@@ -2642,12 +2713,86 @@ class AIAgent:
             return
 
         try:
+            from agent.session_telemetry import (
+                sync_pending_from_canonical,
+                sync_telemetry_from_canonical,
+                telemetry_counter,
+                telemetry_json_fields,
+            )
+
+            # The caller holds pending_projection_guard, so this canonical read
+            # and the atomic JSON write cannot race a begin/clear transition in
+            # another Hermes process using the same state database.
+            writer_epoch = telemetry_counter(
+                getattr(
+                    getattr(self, "context_compressor", None),
+                    "compression_count",
+                    0,
+                )
+            )
+            telemetry_bound = (
+                getattr(
+                    self,
+                    "_session_telemetry_hydrated_session_id",
+                    None,
+                )
+                == self.session_id
+            )
+            if telemetry_bound:
+                sync_telemetry_from_canonical(self)
+            else:
+                sync_pending_from_canonical(self)
+            telemetry = telemetry_json_fields(self)
+            pending_compaction_epoch = telemetry_counter(
+                getattr(self, "_session_json_pending_compaction_epoch", 0)
+            )
+            telemetry_projection_keys = tuple(telemetry)
+
+            def _write_telemetry_fenced_snapshot(payload):
+                atomic_json_write(
+                    log_file,
+                    payload,
+                    indent=2,
+                    default=str,
+                )
+                # The cross-process guard prevents a conforming peer from
+                # mutating SQLite here. Re-read anyway as a generation fence
+                # against legacy/direct DB writers and forced interleavings:
+                # if canonical state changed during the atomic write, repair
+                # the just-written compatibility projection before returning.
+                if telemetry_bound:
+                    sync_telemetry_from_canonical(self)
+                else:
+                    sync_pending_from_canonical(self)
+                canonical = telemetry_json_fields(self)
+                if any(
+                    payload.get(key) != canonical[key]
+                    for key in telemetry_projection_keys
+                ):
+                    corrected = dict(payload)
+                    corrected.update(
+                        {
+                            key: canonical[key]
+                            for key in telemetry_projection_keys
+                        }
+                    )
+                    corrected["last_updated"] = datetime.now().isoformat()
+                    atomic_json_write(
+                        log_file,
+                        corrected,
+                        indent=2,
+                        default=str,
+                    )
+
             cleaned = []
             for msg in messages:
                 # Mirror the SQLite flush: ephemeral recovery scaffolding is
                 # internal retry state, never durable transcript content.
                 if _is_ephemeral_scaffolding(msg):
                     continue
+                if _DB_PERSISTED_MARKER in msg:
+                    msg = dict(msg)
+                    msg.pop(_DB_PERSISTED_MARKER, None)
                 if msg.get("role") == "assistant" and msg.get("content"):
                     msg = dict(msg)
                     msg["content"] = self._clean_session_content(msg["content"])
@@ -2668,11 +2813,47 @@ class AIAgent:
                 try:
                     existing = json.loads(log_file.read_text(encoding="utf-8"))
                     existing_count = existing.get("message_count", len(existing.get("messages", [])))
-                    if existing_count > len(cleaned):
+                    existing_epoch = telemetry_counter(
+                        existing.get(
+                            "compression_epoch",
+                            existing.get("compression_count", 0),
+                        )
+                    )
+                    current_epoch = telemetry["compression_epoch"]
+                    if writer_epoch < existing_epoch:
                         logging.debug(
-                            "Skipping session log overwrite: existing has %d messages, current has %d",
+                            "Preserving newer compacted session log while "
+                            "refreshing canonical telemetry: writer epoch %d, "
+                            "existing epoch %d",
+                            writer_epoch,
+                            existing_epoch,
+                        )
+                        existing.update(telemetry)
+                        existing["last_updated"] = datetime.now().isoformat()
+                        _write_telemetry_fenced_snapshot(existing)
+                        return
+                    intentional_compaction_shrink = (
+                        current_epoch > existing_epoch
+                        and (
+                            allow_compaction_shrink
+                            or (
+                                pending_compaction_epoch > 0
+                                and pending_compaction_epoch <= current_epoch
+                            )
+                        )
+                    )
+                    if (
+                        existing_count > len(cleaned)
+                        and not intentional_compaction_shrink
+                    ):
+                        logging.debug(
+                            "Preserving larger session log while refreshing telemetry: "
+                            "existing has %d messages, current has %d",
                             existing_count, len(cleaned),
                         )
+                        existing.update(telemetry)
+                        existing["last_updated"] = datetime.now().isoformat()
+                        _write_telemetry_fenced_snapshot(existing)
                         return
                 except Exception:
                     pass  # corrupted existing file — allow the overwrite
@@ -2690,12 +2871,20 @@ class AIAgent:
                 "messages": cleaned,
             }
 
-            atomic_json_write(
-                log_file,
-                entry,
-                indent=2,
-                default=str,
-            )
+            # Keep numeric session telemetry at the top level for external
+            # tooling that explicitly opted into JSON snapshots. These are
+            # counters only: no new prompt, transcript, route credential, or
+            # request payload is exposed. Presence is deliberate — zero means
+            # "known none/unknown", while an absent key identifies an older
+            # Hermes snapshot.
+            entry.update(telemetry)
+
+            _write_telemetry_fenced_snapshot(entry)
+            if (
+                pending_compaction_epoch > 0
+                and telemetry["compression_epoch"] >= pending_compaction_epoch
+            ):
+                self._session_json_pending_compaction_epoch = 0
 
         except Exception as e:
             if self.verbose_logging:
@@ -5920,7 +6109,9 @@ class AIAgent:
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.conversation_loop import run_conversation
-        return run_conversation(
+        from agent.session_telemetry import apply_telemetry_result_fields
+
+        result = run_conversation(
             self,
             user_message,
             system_message,
@@ -5931,6 +6122,7 @@ class AIAgent:
             persist_user_timestamp=persist_user_timestamp,
             moa_config=moa_config,
         )
+        return apply_telemetry_result_fields(result, self)
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

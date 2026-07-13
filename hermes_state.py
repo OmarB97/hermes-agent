@@ -17,6 +17,7 @@ Key design decisions:
 import asyncio
 import json
 import logging
+import math
 import random
 import re
 import sqlite3
@@ -30,6 +31,26 @@ from hermes_constants import get_device_name, get_hermes_home
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
+
+
+def _finite_nonnegative_cost(value: Any) -> Optional[float]:
+    """Normalize an explicit cost while preserving ``None`` as no update."""
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    if not math.isfinite(numeric) or numeric < 0:
+        return 0.0
+    return numeric
+
+
+def _nonnegative_counter(value: Any) -> int:
+    try:
+        return max(int(value or 0), 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 def _delegate_from_json(col: str = "model_config") -> str:
     return f"json_extract(COALESCE({col}, '{{}}'), '$._delegate_from')"
@@ -722,6 +743,26 @@ CREATE TABLE IF NOT EXISTS sessions (
     cache_read_tokens INTEGER DEFAULT 0,
     cache_write_tokens INTEGER DEFAULT 0,
     reasoning_tokens INTEGER DEFAULT 0,
+    -- Cumulative provider-reported total. This cannot always be reconstructed
+    -- from the normalized buckets (for example Codex can include reasoning in
+    -- totalTokens), so preserve the canonical reported value independently.
+    total_tokens INTEGER DEFAULT 0,
+    -- Latest successful API-call snapshot. These fields are SET, not
+    -- accumulated, so consumers can distinguish the current context from
+    -- the cumulative session counters above.
+    last_prompt_tokens INTEGER DEFAULT 0,
+    last_completion_tokens INTEGER DEFAULT 0,
+    -- Rough prompt size for the request currently in flight. A successful
+    -- response, interrupt, or request failure clears it through the matching
+    -- generation fence below; token-count writes never clear a newer request.
+    pending_prompt_tokens INTEGER DEFAULT 0,
+    pending_generation INTEGER DEFAULT 0,
+    pending_owner TEXT,
+    pending_started_at REAL,
+    -- Resolved model context cap and number of completed compactions for the
+    -- current session epoch. Zero explicitly means unknown / none yet.
+    context_length INTEGER DEFAULT 0,
+    compression_count INTEGER DEFAULT 0,
     cwd TEXT,
     git_branch TEXT,
     git_repo_root TEXT,
@@ -1392,6 +1433,23 @@ class SessionDB:
         # migration was skipped (e.g. due to version renumbering), the
         # column gets created here.
         self._reconcile_columns(cursor)
+
+        # Costs are public numeric telemetry. Older callers could persist
+        # negative or non-finite REAL values directly; repair those rows on
+        # every startup so resumed sessions never surface invalid JSON/metrics.
+        max_finite = 1.7976931348623157e308
+        for column in ("estimated_cost_usd", "actual_cost_usd"):
+            cursor.execute(
+                f"""UPDATE sessions SET {column} = 0.0
+                    WHERE {column} IS NOT NULL
+                      AND (
+                          typeof({column}) NOT IN ('integer', 'real')
+                          OR {column} < 0
+                          OR {column} != {column}
+                          OR ABS({column}) > ?
+                      )""",
+                (max_finite,),
+            )
 
         # Indexes that reference reconciler-added columns must be created
         # AFTER _reconcile_columns runs — declaring them in SCHEMA_SQL
@@ -2488,6 +2546,142 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    def set_pending_prompt_tokens(self, session_id: str, tokens: int) -> None:
+        """Compatibility setter for the in-flight prompt-size estimate.
+
+        Production request lifecycles use :meth:`begin_pending_request` and
+        :meth:`clear_pending_request`, which carry generation/owner fencing.
+        This legacy setter remains for older callers and explicit maintenance;
+        writing zero also clears owner/timestamp metadata.
+        """
+        self._insert_session_row(session_id, "unknown")
+        value = max(int(tokens or 0), 0)
+
+        def _do(conn):
+            conn.execute(
+                """UPDATE sessions SET
+                   pending_prompt_tokens = ?,
+                   pending_owner = CASE WHEN ? = 0 THEN NULL ELSE pending_owner END,
+                   pending_started_at = CASE WHEN ? = 0 THEN NULL ELSE pending_started_at END
+                   WHERE id = ?""",
+                (value, value, value, session_id),
+            )
+
+        self._execute_write(_do)
+
+    def begin_pending_request(
+        self,
+        session_id: str,
+        *,
+        tokens: int,
+        owner: str,
+        started_at: float,
+    ) -> int:
+        """Atomically publish a new in-flight request generation.
+
+        The monotonically increasing generation is returned to the caller and
+        must be supplied to :meth:`clear_pending_request`. This prevents an
+        older request's terminal ``finally`` from erasing a newer request.
+        """
+        self._insert_session_row(session_id, "unknown")
+        value = max(int(tokens or 0), 0)
+        owner_value = str(owner or "")
+        started_value = float(started_at)
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT pending_generation FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            current = int((row[0] if row else 0) or 0)
+            generation = current + 1
+            conn.execute(
+                """UPDATE sessions SET
+                   pending_prompt_tokens = ?,
+                   pending_generation = ?,
+                   pending_owner = ?,
+                   pending_started_at = ?
+                   WHERE id = ?""",
+                (
+                    value,
+                    generation,
+                    owner_value,
+                    started_value,
+                    session_id,
+                ),
+            )
+            return generation
+
+        return self._execute_write(_do)
+
+    def clear_pending_request(
+        self,
+        session_id: str,
+        *,
+        generation: int,
+        owner: Optional[str],
+    ) -> bool:
+        """Clear exactly one pending generation and report whether it matched."""
+        expected_generation = max(int(generation or 0), 0)
+
+        def _do(conn):
+            if owner is None:
+                cursor = conn.execute(
+                    """UPDATE sessions SET
+                       pending_prompt_tokens = 0,
+                       pending_owner = NULL,
+                       pending_started_at = NULL
+                       WHERE id = ?
+                         AND pending_generation = ?
+                         AND pending_owner IS NULL""",
+                    (session_id, expected_generation),
+                )
+            else:
+                cursor = conn.execute(
+                    """UPDATE sessions SET
+                       pending_prompt_tokens = 0,
+                       pending_owner = NULL,
+                       pending_started_at = NULL
+                       WHERE id = ?
+                         AND pending_generation = ?
+                         AND pending_owner = ?""",
+                    (session_id, expected_generation, str(owner)),
+                )
+            return cursor.rowcount == 1
+
+        return bool(self._execute_write(_do))
+
+    def set_context_length(self, session_id: str, length: int) -> None:
+        """Set the resolved context-window cap for *session_id*.
+
+        Zero is preserved as an explicit "unknown" value. The live compressor
+        is authoritative; callers refresh this snapshot after session creation
+        and on successful calls so model switches cannot leave a stale cap.
+        """
+        self._insert_session_row(session_id, "unknown")
+        value = max(int(length or 0), 0)
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET context_length = ? WHERE id = ?",
+                (value, session_id),
+            )
+
+        self._execute_write(_do)
+
+    def set_compression_count(self, session_id: str, count: int) -> None:
+        """Set the completed context-compaction count for *session_id*."""
+        self._insert_session_row(session_id, "unknown")
+        value = max(int(count or 0), 0)
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET compression_count = ? WHERE id = ?",
+                (value, session_id),
+            )
+
+        self._execute_write(_do)
+
     def update_token_counts(
         self,
         session_id: str,
@@ -2507,31 +2701,75 @@ class SessionDB:
         billing_mode: Optional[str] = None,
         api_call_count: int = 0,
         absolute: bool = False,
+        *,
+        last_prompt_tokens: Optional[int] = None,
+        last_completion_tokens: Optional[int] = None,
+        context_length: Optional[int] = None,
+        compression_count: Optional[int] = None,
+        total_tokens: Optional[int] = None,
     ) -> None:
         """Update token counters and backfill model if not already set.
 
-        When *absolute* is False (default), values are **incremented** — use
-        this for per-API-call deltas (CLI path).
+        When *absolute* is False (default), cumulative values are
+        **incremented** — use this for per-API-call deltas (CLI path).
 
-        When *absolute* is True, values are **set directly** — use this when
-        the caller already holds cumulative totals (gateway path, where the
-        cached agent accumulates across messages).
+        When *absolute* is True, cumulative values are **set directly** — use
+        this when the caller already holds cumulative totals (gateway path,
+        where the cached agent accumulates across messages).
+
+        The optional context fields are latest-value snapshots in both modes.
+        ``None`` preserves a prior value; explicit zero is written. Pending
+        request state is deliberately untouched here: only the matching
+        generation/owner may clear it via :meth:`clear_pending_request`.
         """
         # Ensure the session row exists so the UPDATE doesn't silently affect
         # 0 rows.  Under concurrent load (cron + kanban + delegate_task) the
         # initial create_session() may have failed due to SQLite locking.
         # INSERT OR IGNORE is cheap and idempotent.
         self._insert_session_row(session_id, "unknown", model=model)
+        resolved_total_tokens = (
+            max(int(total_tokens), 0)
+            if total_tokens is not None
+            else max(
+                int(input_tokens or 0)
+                + int(output_tokens or 0)
+                + int(cache_read_tokens or 0)
+                + int(cache_write_tokens or 0),
+                0,
+            )
+        )
+        estimated_cost_usd = _finite_nonnegative_cost(estimated_cost_usd)
+        actual_cost_usd = _finite_nonnegative_cost(actual_cost_usd)
+        api_call_count = _nonnegative_counter(api_call_count)
+        max_finite = 1.7976931348623157e308
+        valid_estimated_cost = (
+            "estimated_cost_usd IS NULL OR "
+            "(typeof(estimated_cost_usd) IN ('integer', 'real') "
+            "AND estimated_cost_usd >= 0 "
+            "AND estimated_cost_usd = estimated_cost_usd "
+            "AND ABS(estimated_cost_usd) <= ?)"
+        )
+        valid_actual_cost = (
+            "actual_cost_usd IS NULL OR "
+            "(typeof(actual_cost_usd) IN ('integer', 'real') "
+            "AND actual_cost_usd >= 0 "
+            "AND actual_cost_usd = actual_cost_usd "
+            "AND ABS(actual_cost_usd) <= ?)"
+        )
         if absolute:
-            sql = """UPDATE sessions SET
+            sql = f"""UPDATE sessions SET
                    input_tokens = ?,
                    output_tokens = ?,
                    cache_read_tokens = ?,
                    cache_write_tokens = ?,
                    reasoning_tokens = ?,
-                   estimated_cost_usd = COALESCE(?, 0),
+                   total_tokens = ?,
+                   estimated_cost_usd = COALESCE(?, 0.0),
                    actual_cost_usd = CASE
-                       WHEN ? IS NULL THEN actual_cost_usd
+                       WHEN ? IS NULL THEN CASE
+                           WHEN {valid_actual_cost} THEN actual_cost_usd
+                           ELSE 0.0
+                       END
                        ELSE ?
                    END,
                    cost_status = COALESCE(?, cost_status),
@@ -2541,19 +2779,48 @@ class SessionDB:
                    billing_base_url = COALESCE(billing_base_url, ?),
                    billing_mode = COALESCE(billing_mode, ?),
                    model = COALESCE(model, ?),
-                   api_call_count = ?
+                   api_call_count = ?,
+                   last_prompt_tokens = COALESCE(?, last_prompt_tokens),
+                   last_completion_tokens = COALESCE(?, last_completion_tokens),
+                   context_length = COALESCE(?, context_length),
+                   compression_count = COALESCE(?, compression_count)
                    WHERE id = ?"""
         else:
-            sql = """UPDATE sessions SET
+            sql = f"""UPDATE sessions SET
                    input_tokens = input_tokens + ?,
                    output_tokens = output_tokens + ?,
                    cache_read_tokens = cache_read_tokens + ?,
                    cache_write_tokens = cache_write_tokens + ?,
                    reasoning_tokens = reasoning_tokens + ?,
-                   estimated_cost_usd = COALESCE(estimated_cost_usd, 0) + COALESCE(?, 0),
+                   total_tokens = CASE
+                       WHEN COALESCE(total_tokens, 0) <= 0 THEN MAX(
+                           COALESCE(input_tokens, 0)
+                           + COALESCE(output_tokens, 0)
+                           + COALESCE(cache_read_tokens, 0)
+                           + COALESCE(cache_write_tokens, 0),
+                           0
+                       )
+                       ELSE total_tokens
+                   END + ?,
+                   estimated_cost_usd = MIN(
+                       CASE
+                           WHEN {valid_estimated_cost} THEN COALESCE(estimated_cost_usd, 0.0)
+                           ELSE 0.0
+                       END + COALESCE(?, 0.0),
+                       ?
+                   ),
                    actual_cost_usd = CASE
-                       WHEN ? IS NULL THEN actual_cost_usd
-                       ELSE COALESCE(actual_cost_usd, 0) + ?
+                       WHEN ? IS NULL THEN CASE
+                           WHEN {valid_actual_cost} THEN actual_cost_usd
+                           ELSE 0.0
+                       END
+                       ELSE MIN(
+                           CASE
+                               WHEN {valid_actual_cost} THEN COALESCE(actual_cost_usd, 0.0)
+                               ELSE 0.0
+                           END + ?,
+                           ?
+                       )
                    END,
                    cost_status = COALESCE(?, cost_status),
                    cost_source = COALESCE(?, cost_source),
@@ -2562,17 +2829,39 @@ class SessionDB:
                    billing_base_url = COALESCE(billing_base_url, ?),
                    billing_mode = COALESCE(billing_mode, ?),
                    model = COALESCE(model, ?),
-                   api_call_count = COALESCE(api_call_count, 0) + ?
+                   api_call_count = COALESCE(api_call_count, 0) + ?,
+                   last_prompt_tokens = COALESCE(?, last_prompt_tokens),
+                   last_completion_tokens = COALESCE(?, last_completion_tokens),
+                   context_length = COALESCE(?, context_length),
+                   compression_count = COALESCE(?, compression_count)
                    WHERE id = ?"""
+        cost_params = (
+            (
+                estimated_cost_usd,
+                actual_cost_usd,
+                max_finite,
+                actual_cost_usd,
+            )
+            if absolute
+            else (
+                max_finite,
+                estimated_cost_usd,
+                max_finite,
+                actual_cost_usd,
+                max_finite,
+                max_finite,
+                actual_cost_usd,
+                max_finite,
+            )
+        )
         params = (
             input_tokens,
             output_tokens,
             cache_read_tokens,
             cache_write_tokens,
             reasoning_tokens,
-            estimated_cost_usd,
-            actual_cost_usd,
-            actual_cost_usd,
+            resolved_total_tokens,
+            *cost_params,
             cost_status,
             cost_source,
             pricing_version,
@@ -2581,6 +2870,10 @@ class SessionDB:
             billing_mode,
             model,
             api_call_count,
+            last_prompt_tokens,
+            last_completion_tokens,
+            context_length,
+            compression_count,
             session_id,
         )
         def _do(conn):
@@ -5409,6 +5702,7 @@ class SessionDB:
     def surfaced_session_count(
         self,
         source: str = None,
+        cwd_prefix: str = None,
         min_message_count: int = 0,
         include_archived: bool = False,
         archived_only: bool = False,
@@ -5419,6 +5713,7 @@ class SessionDB:
         if not exclude_children:
             return self.session_count(
                 source=source,
+                cwd_prefix=cwd_prefix,
                 min_message_count=min_message_count,
                 include_archived=include_archived,
                 archived_only=archived_only,
@@ -5435,6 +5730,10 @@ class SessionDB:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")
             params.extend(exclude_sources)
+        if cwd_prefix:
+            clause, clause_params = _cwd_prefix_clause(cwd_prefix)
+            where_clauses.append(clause)
+            params.extend(clause_params)
         if min_message_count > 0:
             where_clauses.append("s.message_count >= ?")
             params.append(min_message_count)

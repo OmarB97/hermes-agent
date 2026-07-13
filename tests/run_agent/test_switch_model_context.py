@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 
 from run_agent import AIAgent
 from agent.context_compressor import ContextCompressor
+from hermes_state import SessionDB
 
 
 def _make_agent_with_compressor(config_context_length=None) -> AIAgent:
@@ -73,3 +74,50 @@ def test_switch_model_without_config_context_length():
         mock_ctx_len.assert_called_once()
         call_kwargs = mock_ctx_len.call_args.kwargs
         assert call_kwargs.get("config_context_length") is None
+
+
+def test_switch_persists_model_and_resolved_context_before_return(tmp_path):
+    db_path = tmp_path / "state.db"
+    database = SessionDB(db_path)
+    try:
+        database.create_session(
+            "switch-cap",
+            "cli",
+            model="primary-model",
+        )
+        database.set_context_length("switch-cap", 32_768)
+
+        agent = _make_agent_with_compressor(
+            config_context_length=32_768
+        )
+        agent._session_db = database
+        agent.session_id = "switch-cap"
+        agent._create_openai_client = MagicMock(
+            return_value=MagicMock()
+        )
+
+        with patch(
+            "agent.model_metadata.get_model_context_length",
+            return_value=131_072,
+        ):
+            agent.switch_model(
+                "new-model",
+                "openrouter",
+                api_key="sk-new",
+                base_url="https://openrouter.ai/api/v1",
+            )
+
+        session = database.get_session("switch-cap")
+        assert session["model"] == "new-model"
+        assert session["context_length"] == 131_072
+        assert session["billing_provider"] == "openrouter"
+    finally:
+        database.close()
+
+    restarted = SessionDB(db_path)
+    try:
+        session = restarted.get_session("switch-cap")
+        assert session["model"] == "new-model"
+        assert session["context_length"] == 131_072
+    finally:
+        restarted.close()

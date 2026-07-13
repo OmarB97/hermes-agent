@@ -183,6 +183,12 @@ _DFLASH_MODEL_FAMILY_RE = re.compile(
 # Keep the default comfortably above that observation while still bounding an
 # opaque local queue wait such as the observed 494.5s no-first-chunk stall.
 _DFLASH_LOCAL_TIMEOUT_DEFAULT_S = 180.0
+# Taro's production W2 lane can spend longer than the generic DFlash deadline
+# in gate admission plus cold prefill even when the request is healthy. Keep
+# this route/model exception bounded and narrower than the CLI's 420s outer
+# acceptance window; explicit provider/model config and legacy overrides still
+# win below.
+_TARO_W2_FIRST_CHUNK_TIMEOUT_DEFAULT_S = 360.0
 
 
 def _is_dflash_like_model(model: Any) -> bool:
@@ -194,6 +200,13 @@ def _is_dflash_like_model(model: Any) -> bool:
     this family.
     """
     return bool(_DFLASH_MODEL_FAMILY_RE.search(str(model or "").strip()))
+
+
+def _is_taro_w2_route(agent: Any, model: Any) -> bool:
+    """Return whether this is the exact production Taro W2 route."""
+    provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    model_id = str(model or "").strip().lower().rsplit("/", 1)[-1]
+    return provider == "taro" and model_id == "deepseek-v4-flash-w2"
 
 
 def _dflash_context_timeout_default(api_payload: Any) -> float:
@@ -346,7 +359,9 @@ def resolve_dflash_local_first_chunk_timeout(
     phases. Legacy first-chunk environment overrides remain compatible only
     when config.yaml does not specify a value. Without either, the first-chunk
     guard reuses the already-resolved stream timeout, including the 240s/300s
-    long-context floors.
+    long-context floors. The exact production Taro W2 route has a bounded 360s
+    floor because its healthy gate-admission plus cold-prefill path can exceed
+    the generic DFlash family's 180s deadline.
     """
     effective_model = api_kwargs.get("model") or agent.model
     if not (
@@ -379,6 +394,11 @@ def resolve_dflash_local_first_chunk_timeout(
         resolved_stream_stale_timeout = resolve_stream_stale_timeout(
             agent,
             api_kwargs,
+        )
+    if _is_taro_w2_route(agent, effective_model):
+        return max(
+            resolved_stream_stale_timeout,
+            _TARO_W2_FIRST_CHUNK_TIMEOUT_DEFAULT_S,
         )
     return resolved_stream_stale_timeout
 
@@ -3286,7 +3306,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # but delivering no real chunks.  Kill the client so the
         # inner retry loop can start a fresh connection.
         _stale_elapsed = time.time() - last_chunk_time["t"]
-        if _stale_elapsed > _stream_stale_timeout:
+        if (
+            (_dflash_first_chunk_timeout is None or first_chunk_seen["yes"])
+            and _stale_elapsed > _stream_stale_timeout
+        ):
             _est_ctx = estimate_request_context_tokens(api_kwargs)
             logger.warning(
                 "Stream stale for %.0fs (threshold %.0fs) — no chunks received. "
