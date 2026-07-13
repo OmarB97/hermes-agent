@@ -29,7 +29,11 @@ from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
 from agent.gemini_native_adapter import is_native_gemini_base_url
-from agent.model_metadata import is_local_endpoint
+from agent.model_metadata import (
+    estimate_messages_tokens_rough,
+    is_local_endpoint,
+    output_tokens_that_fit,
+)
 from agent.message_sanitization import (
     _sanitize_surrogates,
     _repair_tool_call_arguments,
@@ -871,8 +875,43 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 
+def _preflight_clamp_output_tokens(agent, api_messages: list) -> None:
+    """Shrink an oversized output cap so prompt + max_tokens fits the window.
+
+    Providers return HTTP 400 for any request where prompt_tokens + max_tokens
+    exceeds the context window.  Sizing the output cap to fit BEFORE sending
+    avoids the error entirely — critical for servers (vLLM fronting the local
+    deepseek-v4-flash-w2 lane) whose overflow error reports a
+    ``max_tokens``-dependent lower bound that makes reactive shrink-and-retry
+    non-convergent.  Only ever *shrinks* an explicit cap; never sets one where
+    the caller intended the provider default, and no-ops when the window is
+    unknown.  Applies to every api_mode via ``_ephemeral_max_output_tokens``,
+    which each builder below consumes ahead of ``agent.max_tokens``.
+    """
+    requested = getattr(agent, "_ephemeral_max_output_tokens", None)
+    if requested is None:
+        requested = getattr(agent, "max_tokens", None)
+    if not isinstance(requested, int) or requested <= 0:
+        return  # provider default in effect — nothing to clamp
+    compressor = getattr(agent, "context_compressor", None)
+    ctx = getattr(compressor, "context_length", None)
+    fit = output_tokens_that_fit(ctx, api_messages)
+    if fit is None or requested <= fit:
+        return
+    agent._ephemeral_max_output_tokens = fit
+    try:
+        agent._buffer_vprint(
+            f"📐 Output cap {requested:,} would overflow the {ctx:,}-token window "
+            f"(est. input ~{estimate_messages_tokens_rough(api_messages):,}); "
+            f"clamped max_tokens to {fit:,} for this call."
+        )
+    except Exception:
+        pass
+
+
 def build_api_kwargs(agent, api_messages: list) -> dict:
     """Build the keyword arguments dict for the active API mode."""
+    _preflight_clamp_output_tokens(agent, api_messages)
     tools_for_api = agent.tools
 
     if agent.api_mode == "anthropic_messages":
