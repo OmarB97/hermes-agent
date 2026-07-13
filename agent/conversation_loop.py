@@ -57,6 +57,7 @@ from agent.model_metadata import (
     estimate_request_tokens_rough,
     get_context_length_from_provider_error,
     is_output_cap_error,
+    output_tokens_that_fit,
     parse_available_output_tokens_from_error,
     save_context_length,
 )
@@ -3635,9 +3636,9 @@ def run_conversation(
                     #
                     # Note: max_tokens = output token cap (one response).
                     #       context_length = total window (input + output combined).
-                    available_out = parse_available_output_tokens_from_error(error_msg)
-                    if available_out is not None:
-                        # This is an output-cap error, not input overflow.
+                     available_out = parse_available_output_tokens_from_error(error_msg)
+                     if available_out is not None:
+                         # This is an output-cap error, not input overflow.
                         # The provider's available_tokens is the authoritative
                         # cap for the failed request, so keep it as an upper
                         # bound.  Also estimate the current API request shape
@@ -3651,12 +3652,22 @@ def run_conversation(
                         local_available_out = old_ctx - request_input_estimate
                         if local_available_out > 0:
                             safe_out = max(1, min(available_out, local_available_out) - 64)
-                        else:
+                         else:
                             # The rough local estimate can overshoot the real
                             # request size.  Fall back to the provider-reported
                             # budget, which is authoritative for the failed
                             # request.
-                            safe_out = max(1, available_out - 64)
+                             safe_out = max(1, available_out - 64)
+                         # Some servers (vLLM fronting deepseek-v4-flash-w2) report
+                        # the offending input as a max_tokens-dependent LOWER BOUND,
+                        # so ``available_out`` tracks whatever cap we just sent and
+                        # ``safe_out`` barely shrinks — the retry never converges and
+                        # dies at "max compression attempts reached". Anchor to our
+                        # own conservative estimate of what actually fits so the cap
+                        # converges to a working value in one step.
+                         _local_fit = output_tokens_that_fit(old_ctx, api_messages)
+                         if _local_fit is not None:
+                             safe_out = max(1, min(safe_out, _local_fit))
                         agent._ephemeral_max_output_tokens = safe_out
                         agent._buffer_vprint(
                             f"⚠️  Output cap too large for current prompt — "

@@ -2626,6 +2626,51 @@ def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
     return ((total_chars + 3) // 4) + image_tokens
 
 
+# Over-reservation factor applied to the rough input estimate before sizing the
+# output cap.  ``estimate_messages_tokens_rough`` assumes ~4 chars/token, but
+# dense tool-call / JSON / log transcripts (typical of agentic sessions)
+# tokenize closer to ~3.4 chars/token, so the server counts materially more
+# input than we estimate.  Over-reserving the input keeps the request strictly
+# inside the window even when the estimate under-counts.  Observed gap on
+# deepseek-v4-flash-w2: est 58,039 vs server >=65,797 (~1.13x); 1.2x + a fixed
+# pad gives comfortable headroom without wasting much of the window.
+_OUTPUT_FIT_INPUT_FACTOR = 1.2
+_OUTPUT_FIT_INPUT_PAD = 1024
+_OUTPUT_FIT_WINDOW_MARGIN = 512
+
+
+def output_tokens_that_fit(
+    context_length: Optional[int],
+    api_messages: List[Dict[str, Any]],
+    *,
+    min_output: int = 1,
+) -> Optional[int]:
+    """Largest output cap that keeps prompt + output inside the model window.
+
+    Uses a conservative (over-reserved) local estimate of the prompt size so the
+    result is a value the provider will accept.  Returns ``None`` when the
+    window is unknown/invalid (caller should leave ``max_tokens`` untouched).
+
+    This is the single source of truth for "how many output tokens fit", used
+    both proactively (before the request, to clamp an oversized cap) and
+    reactively (after a provider context-overflow 400).  It matters most for
+    servers — notably vLLM, which fronts the local deepseek-v4-flash-w2 lane —
+    that report the offending input size as a ``max_tokens``-dependent LOWER
+    BOUND rather than the true token count.  Against such a server a naive
+    "shrink max_tokens by the reported delta and retry" loop never converges
+    (each shrink raises the reported floor in lockstep); anchoring the retry to
+    this local estimate makes it converge to a fitting value in one step.
+    """
+    if not isinstance(context_length, int) or context_length <= 0:
+        return None
+    est = estimate_messages_tokens_rough(api_messages)
+    if not isinstance(est, int) or est < 0:
+        return None
+    reserved_input = int(est * _OUTPUT_FIT_INPUT_FACTOR) + _OUTPUT_FIT_INPUT_PAD
+    fit = context_length - reserved_input - _OUTPUT_FIT_WINDOW_MARGIN
+    return fit if fit >= min_output else min_output
+
+
 def _count_image_tokens(msg: Dict[str, Any], cost_per_image: int) -> int:
     """Count image-like content parts in a message; return their token cost."""
     count = 0
