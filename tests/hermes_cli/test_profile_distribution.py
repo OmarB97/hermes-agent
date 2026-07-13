@@ -10,6 +10,8 @@ mocking git would just test the mock.
 
 from __future__ import annotations
 
+import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -20,12 +22,17 @@ from hermes_cli.profile_distribution import (
     DistributionManifest,
     EnvRequirement,
     MANIFEST_FILENAME,
+    RECEIPT_FILENAME,
+    ROLLBACK_RECEIPT_FILENAME,
+    SUPPORTED_DISTRIBUTION_CAPABILITIES,
     USER_OWNED_EXCLUDE,
     _env_template_from_manifest,
     _looks_like_git_url,
     _parse_semver,
+    check_hermes_capabilities,
     check_hermes_requires,
     describe_distribution,
+    doctor_distribution,
     install_distribution,
     plan_install,
     read_manifest,
@@ -101,6 +108,8 @@ class TestManifestParsing:
             "version: 1.2.3\n"
             "description: Telem monitor\n"
             "hermes_requires: '>=0.12.0'\n"
+            "hermes_capabilities:\n"
+            "  - explicit-fallback-policy-v1\n"
             "author: Kyle\n"
             "license: MIT\n"
             "env_requires:\n"
@@ -123,6 +132,7 @@ class TestManifestParsing:
         assert m.env_requires[0].required is True
         assert m.env_requires[1].required is False
         assert m.env_requires[1].default == "http://127.0.0.1:8000"
+        assert m.hermes_capabilities == ["explicit-fallback-policy-v1"]
         assert m.distribution_owned == ["SOUL.md", "skills"]
 
     def test_missing_name_rejected(self, tmp_path):
@@ -153,12 +163,49 @@ class TestManifestParsing:
             name="rt",
             version="1.0.0",
             description="roundtrip",
+            hermes_capabilities=[
+                "explicit-fallback-policy-v1",
+                "transactional-profile-distribution-v1",
+            ],
             env_requires=[EnvRequirement(name="FOO", description="foo")],
         )
         write_manifest(tmp_path, original)
         parsed = read_manifest(tmp_path)
         assert parsed.name == "rt"
         assert parsed.env_requires[0].name == "FOO"
+        assert parsed.hermes_capabilities == original.hermes_capabilities
+
+    @pytest.mark.parametrize(
+        "value",
+        ["explicit-fallback-policy-v1", "''", "false", "{}", "0"],
+    )
+    def test_capabilities_must_be_list(self, tmp_path, value):
+        (tmp_path / MANIFEST_FILENAME).write_text(
+            f"name: bad\nhermes_capabilities: {value}\n"
+        )
+        with pytest.raises(
+            DistributionError, match="hermes_capabilities must be a list"
+        ):
+            read_manifest(tmp_path)
+
+    @pytest.mark.parametrize("value", ["''", "42", "null"])
+    def test_capability_entries_must_be_non_empty_strings(self, tmp_path, value):
+        (tmp_path / MANIFEST_FILENAME).write_text(
+            f"name: bad\nhermes_capabilities:\n  - {value}\n"
+        )
+        with pytest.raises(
+            DistributionError, match="entries must be non-empty strings"
+        ):
+            read_manifest(tmp_path)
+
+    def test_duplicate_capability_rejected(self, tmp_path):
+        capability = "explicit-fallback-policy-v1"
+        (tmp_path / MANIFEST_FILENAME).write_text(
+            "name: bad\nhermes_capabilities:\n"
+            f"  - {capability}\n  - {capability}\n"
+        )
+        with pytest.raises(DistributionError, match="duplicate entry"):
+            read_manifest(tmp_path)
 
 
 # ===========================================================================
@@ -201,6 +248,39 @@ class TestVersionRequires:
     def test_parse_semver_rejects_garbage(self):
         with pytest.raises(DistributionError, match="Unparseable"):
             _parse_semver("not-a-version")
+
+
+class TestCapabilityRequires:
+
+    def test_supported_capabilities_pass(self):
+        check_hermes_capabilities(sorted(SUPPORTED_DISTRIBUTION_CAPABILITIES))
+
+    def test_unknown_capability_fails_loud(self):
+        with pytest.raises(
+            DistributionError,
+            match="requires unsupported Hermes capabilities: future-contract-v9",
+        ):
+            check_hermes_capabilities(["future-contract-v9"])
+
+    def test_plan_rejects_unknown_capability_before_target_write(
+        self, profile_env, tmp_path
+    ):
+        staged = _make_staging_dir(
+            tmp_path,
+            manifest=DistributionManifest(
+                name="unsupported-capability",
+                hermes_capabilities=["future-contract-v9"],
+            ),
+        )
+        workdir = tmp_path / "work"
+        workdir.mkdir()
+
+        with pytest.raises(DistributionError, match="future-contract-v9"):
+            plan_install(str(staged), workdir)
+
+        assert not (
+            profile_env / ".hermes" / "profiles" / "unsupported-capability"
+        ).exists()
 
 
 # ===========================================================================
@@ -348,6 +428,150 @@ class TestInstall:
         with pytest.raises(DistributionError, match="requires Hermes"):
             install_distribution(str(staged), name="future")
 
+    def test_install_writes_verifiable_receipt_without_changing_active_pointer(
+        self, profile_env
+    ):
+        active_profile = profile_env / ".hermes" / "active_profile"
+        active_profile.write_bytes(b"operator-choice\n")
+        before = active_profile.read_bytes()
+        staged = _make_staging_dir(profile_env, "receipt")
+
+        plan = install_distribution(str(staged), name="receipt")
+
+        assert active_profile.read_bytes() == before
+        assert plan.receipt_path == plan.target_dir / RECEIPT_FILENAME
+        receipt = json.loads(plan.receipt_path.read_text())
+        assert receipt["status"] == "committed"
+        assert receipt["operation"] == "install"
+        assert receipt["active_profile"]["unchanged"] is True
+        result = doctor_distribution("receipt")
+        assert result["ok"] is True
+        assert result["installed_sha256"] == result["actual_sha256"]
+
+    def test_explicit_owned_paths_ignore_unlisted_source_files(self, profile_env):
+        mf = DistributionManifest(
+            name="bounded",
+            distribution_owned=["SOUL.md", "meshboard-preset.json"],
+        )
+        staged = _make_staging_dir(profile_env, "bounded", manifest=mf)
+        (staged / "meshboard-preset.json").write_text('{"role": "worker"}\n')
+        (staged / "surprise-cloud.json").write_text('{"provider": "cloud"}\n')
+        (staged / "config.yaml").unlink()
+        (staged / "mcp.json").unlink()
+        shutil.rmtree(staged / "skills")
+        shutil.rmtree(staged / "cron")
+
+        plan = install_distribution(str(staged))
+
+        assert (plan.target_dir / "SOUL.md").is_file()
+        assert (plan.target_dir / "meshboard-preset.json").is_file()
+        assert not (plan.target_dir / "config.yaml").exists()
+        assert not (plan.target_dir / "mcp.json").exists()
+        assert not (plan.target_dir / "skills" / "demo").exists()
+        assert not (plan.target_dir / "surprise-cloud.json").exists()
+        assert doctor_distribution("bounded")["ok"] is True
+
+    def test_doctor_detects_unowned_source_collision(self, profile_env):
+        mf = DistributionManifest(
+            name="collision",
+            distribution_owned=["SOUL.md"],
+        )
+        staged = _make_staging_dir(profile_env, "collision", manifest=mf)
+
+        plan = install_distribution(str(staged))
+        result = doctor_distribution("collision")
+
+        assert "skills" in plan.receipt["unowned_collisions"]
+        assert "cron" in plan.receipt["unowned_collisions"]
+        assert result["ok"] is False
+        assert any("Unowned source paths collided" in issue for issue in result["issues"])
+
+    @pytest.mark.parametrize(
+        "owned",
+        [
+            "/etc/passwd",
+            "../outside",
+            "memories/MEMORY.md",
+            "Memories/MEMORY.md",
+            ".ENV",
+            "local.",
+            "C:\\secrets",
+            "C:secrets",
+            "con/payload",
+        ],
+    )
+    def test_manifest_rejects_unsafe_owned_paths(self, tmp_path, owned):
+        (tmp_path / MANIFEST_FILENAME).write_text(
+            f"name: unsafe\ndistribution_owned:\n  - '{owned}'\n"
+        )
+        with pytest.raises(DistributionError, match="distribution_owned"):
+            read_manifest(tmp_path)
+
+    def test_fresh_receipt_failure_removes_partial_profile(
+        self, profile_env, monkeypatch
+    ):
+        staged = _make_staging_dir(profile_env, "receipt-fail")
+
+        def fail_receipt(*args, **kwargs):
+            raise OSError("injected receipt failure")
+
+        monkeypatch.setattr(
+            "hermes_cli.profile_distribution._atomic_write_json", fail_receipt
+        )
+        with pytest.raises(DistributionError, match="rollback restored"):
+            install_distribution(str(staged), name="receipt-fail")
+
+        from hermes_cli.profiles import get_profile_dir
+
+        assert not get_profile_dir("receipt-fail").exists()
+        receipts = list(
+            (profile_env / ".hermes" / "profiles" / ".distribution-backups")
+            .glob(f"receipt-fail/*/{ROLLBACK_RECEIPT_FILENAME}")
+        )
+        assert len(receipts) == 1
+        rollback = json.loads(receipts[0].read_text())
+        assert rollback["status"] == "rolled_back"
+        assert rollback["restored"] is True
+
+    def test_fresh_incomplete_rollback_fails_loud_and_receipts_residue(
+        self, profile_env, monkeypatch
+    ):
+        import hermes_cli.profile_distribution as distribution
+        from hermes_cli.profiles import get_profile_dir
+
+        staged = _make_staging_dir(profile_env, "fresh-incomplete")
+        target = get_profile_dir("fresh-incomplete")
+        real_remove = distribution._remove_path
+
+        def fail_receipt(*args, **kwargs):
+            raise OSError("injected receipt failure")
+
+        def fail_target_removal(path):
+            if Path(path) == target:
+                raise OSError("injected target removal failure")
+            return real_remove(path)
+
+        monkeypatch.setattr(distribution, "_atomic_write_json", fail_receipt)
+        monkeypatch.setattr(distribution, "_remove_path", fail_target_removal)
+
+        with pytest.raises(DistributionError, match="rollback INCOMPLETE"):
+            install_distribution(str(staged), name="fresh-incomplete")
+
+        assert target.is_dir()
+        assert not (target / RECEIPT_FILENAME).exists()
+        receipts = list(
+            target.parent.glob(
+                f".distribution-backups/fresh-incomplete/*/{ROLLBACK_RECEIPT_FILENAME}"
+            )
+        )
+        assert len(receipts) == 1
+        rollback = json.loads(receipts[0].read_text())
+        assert rollback["restored"] is False
+        assert any(
+            "injected target removal failure" in item
+            for item in rollback["recovery_errors"]
+        )
+
 
 # ===========================================================================
 # Update — preserves user data, preserves config by default
@@ -417,6 +641,259 @@ class TestUpdate:
         create_profile(name="plain", no_alias=True)
         with pytest.raises(DistributionError, match="not a distribution"):
             update_distribution("plain")
+
+    def test_update_receipt_preserves_config_and_has_rollback_backup(
+        self, profile_env
+    ):
+        staged = _make_staging_dir(profile_env, "receipt-update")
+        plan = install_distribution(str(staged), name="receipt-update")
+        (plan.target_dir / "config.yaml").write_text("model: user-choice\n")
+        (staged / "SOUL.md").write_text("updated soul\n")
+
+        updated = update_distribution("receipt-update")
+
+        assert (plan.target_dir / "config.yaml").read_text() == "model: user-choice\n"
+        assert (plan.target_dir / "SOUL.md").read_text() == "updated soul\n"
+        assert updated.receipt["preserved_paths"] == ["config.yaml"]
+        assert Path(updated.receipt["backup_path"]).is_dir()
+        assert doctor_distribution("receipt-update")["ok"] is True
+
+    def test_update_receipt_failure_rolls_back_owned_payload(
+        self, profile_env, monkeypatch
+    ):
+        staged = _make_staging_dir(profile_env, "rollback")
+        plan = install_distribution(str(staged), name="rollback")
+        old_receipt = plan.receipt_path.read_bytes()
+        (staged / "SOUL.md").write_text("new, uncommitted soul\n")
+
+        def fail_receipt(*args, **kwargs):
+            raise OSError("injected receipt failure")
+
+        monkeypatch.setattr(
+            "hermes_cli.profile_distribution._atomic_write_json", fail_receipt
+        )
+        with pytest.raises(DistributionError, match="rollback restored"):
+            update_distribution("rollback")
+
+        assert (plan.target_dir / "SOUL.md").read_text() == "I am Source.\n"
+        assert plan.receipt_path.read_bytes() == old_receipt
+        receipts = list(
+            plan.target_dir.parent.glob(
+                f".distribution-backups/rollback/*/{ROLLBACK_RECEIPT_FILENAME}"
+            )
+        )
+        assert len(receipts) == 1
+        assert json.loads(receipts[0].read_text())["restored"] is True
+        result = doctor_distribution("rollback")
+        assert result["installed_sha256"] == result["actual_sha256"]
+        assert any("Source payload digest mismatch" in issue for issue in result["issues"])
+
+    def test_update_rejects_symlinked_owned_ancestor(self, profile_env, tmp_path):
+        mf = DistributionManifest(
+            name="symlink-ancestor",
+            distribution_owned=["meshboard/role.json"],
+        )
+        staged = _make_staging_dir(profile_env, "symlink-ancestor", manifest=mf)
+        (staged / "meshboard").mkdir()
+        (staged / "meshboard" / "role.json").write_text('{"role": "old"}\n')
+        plan = install_distribution(str(staged))
+
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "role.json").write_text("operator-owned\n")
+        shutil.rmtree(plan.target_dir / "meshboard")
+        _symlink_file_or_skip(plan.target_dir / "meshboard", outside)
+        (staged / "meshboard" / "role.json").write_text('{"role": "new"}\n')
+
+        with pytest.raises(DistributionError, match="symlink"):
+            update_distribution("symlink-ancestor")
+
+        assert (outside / "role.json").read_text() == "operator-owned\n"
+
+    def test_keyboard_interrupt_rolls_back_and_preserves_exception(
+        self, profile_env, monkeypatch
+    ):
+        staged = _make_staging_dir(profile_env, "interrupt")
+        plan = install_distribution(str(staged), name="interrupt")
+        old_receipt = plan.receipt_path.read_bytes()
+        (staged / "SOUL.md").write_text("interrupted update\n")
+
+        def interrupt_receipt(*args, **kwargs):
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(
+            "hermes_cli.profile_distribution._atomic_write_json", interrupt_receipt
+        )
+        with pytest.raises(KeyboardInterrupt):
+            update_distribution("interrupt")
+
+        assert (plan.target_dir / "SOUL.md").read_text() == "I am Source.\n"
+        assert plan.receipt_path.read_bytes() == old_receipt
+        rollback_paths = list(
+            plan.target_dir.parent.glob(
+                f".distribution-backups/interrupt/*/{ROLLBACK_RECEIPT_FILENAME}"
+            )
+        )
+        rollback = json.loads(rollback_paths[0].read_text())
+        assert rollback["restored"] is True
+        assert rollback["recovery_errors"] == []
+
+    def test_incomplete_rollback_is_receipted_false(
+        self, profile_env, monkeypatch
+    ):
+        import hermes_cli.profile_distribution as distribution
+
+        staged = _make_staging_dir(profile_env, "incomplete")
+        plan = install_distribution(str(staged), name="incomplete")
+        (staged / "SOUL.md").write_text("new payload\n")
+        real_replace = distribution.os.replace
+
+        def selective_replace(source, destination):
+            source_path = Path(source)
+            destination_path = Path(destination)
+            if (
+                ".distribution-backups" in source_path.parts
+                and destination_path == plan.target_dir / "SOUL.md"
+            ):
+                raise OSError("injected restore failure")
+            return real_replace(source, destination)
+
+        def fail_receipt(*args, **kwargs):
+            raise OSError("injected commit failure")
+
+        monkeypatch.setattr(distribution.os, "replace", selective_replace)
+        monkeypatch.setattr(distribution, "_atomic_write_json", fail_receipt)
+        with pytest.raises(DistributionError, match="rollback INCOMPLETE"):
+            update_distribution("incomplete")
+
+        rollback_paths = list(
+            plan.target_dir.parent.glob(
+                f".distribution-backups/incomplete/*/{ROLLBACK_RECEIPT_FILENAME}"
+            )
+        )
+        rollback = json.loads(rollback_paths[0].read_text())
+        assert rollback["restored"] is False
+        assert any("injected restore failure" in item for item in rollback["recovery_errors"])
+
+
+class TestDistributionDoctor:
+
+    def test_doctor_reports_owned_payload_drift(self, profile_env):
+        staged = _make_staging_dir(profile_env, "drift")
+        plan = install_distribution(str(staged), name="drift")
+        (plan.target_dir / "SOUL.md").write_text("locally changed\n")
+
+        result = doctor_distribution("drift")
+
+        assert result["ok"] is False
+        assert any("digest mismatch" in issue for issue in result["issues"])
+
+    def test_doctor_reports_transaction_lock(self, profile_env):
+        staged = _make_staging_dir(profile_env, "locked")
+        plan = install_distribution(str(staged), name="locked")
+        lock = plan.target_dir.parent / ".distribution-locks" / "locked.lock"
+        lock.write_text("stale\n")
+
+        result = doctor_distribution("locked")
+
+        assert result["ok"] is False
+        assert any("transaction lock" in issue for issue in result["issues"])
+
+    def test_doctor_reports_local_source_digest_drift(self, profile_env):
+        staged = _make_staging_dir(profile_env, "source-drift")
+        install_distribution(str(staged), name="source-drift")
+        (staged / "SOUL.md").write_text("source changed after install\n")
+
+        result = doctor_distribution("source-drift")
+
+        assert result["source_available"] is True
+        assert result["ok"] is False
+        assert any("Source payload digest mismatch" in issue for issue in result["issues"])
+
+    def test_doctor_detects_executable_mode_drift(self, profile_env):
+        mf = DistributionManifest(
+            name="mode-drift",
+            distribution_owned=["run.sh"],
+        )
+        staged = _make_staging_dir(profile_env, "mode-drift", manifest=mf)
+        script = staged / "run.sh"
+        script.write_text("#!/bin/sh\nexit 0\n")
+        script.chmod(0o755)
+        plan = install_distribution(str(staged))
+        (plan.target_dir / "run.sh").chmod(0o644)
+
+        result = doctor_distribution("mode-drift")
+
+        assert result["ok"] is False
+        assert any("digest mismatch" in issue for issue in result["issues"])
+
+
+class TestFreshActivationRace:
+
+    def test_receipt_failure_cannot_race_activation_into_dangling_pointer(
+        self, profile_env, monkeypatch
+    ):
+        staged = _make_staging_dir(profile_env, "late-activation-race")
+        activation_errors = []
+
+        def activate_during_receipt(*args, **kwargs):
+            from hermes_cli.profiles import set_active_profile
+
+            try:
+                set_active_profile("late-activation-race")
+            except ValueError as exc:
+                activation_errors.append(str(exc))
+            raise OSError("injected receipt failure after activation attempt")
+
+        monkeypatch.setattr(
+            "hermes_cli.profile_distribution._atomic_write_json",
+            activate_during_receipt,
+        )
+
+        with pytest.raises(DistributionError, match="rollback restored"):
+            install_distribution(str(staged), name="late-activation-race")
+
+        from hermes_cli.profiles import get_active_profile, get_profile_dir
+
+        assert activation_errors
+        assert "distribution transaction" in activation_errors[0]
+        assert get_active_profile() == "default"
+        assert not get_profile_dir("late-activation-race").exists()
+
+    def test_concurrent_activation_retains_committed_profile(
+        self, profile_env, monkeypatch
+    ):
+        staged = _make_staging_dir(profile_env, "activate-race")
+        default_snapshot = {
+            "path": str(profile_env / ".hermes" / "active_profile"),
+            "exists": False,
+            "sha256": None,
+            "size": 0,
+            "profile": "default",
+        }
+        active_snapshot = {
+            "path": str(profile_env / ".hermes" / "active_profile"),
+            "exists": True,
+            "sha256": "changed",
+            "size": len("activate-race\n"),
+            "profile": "activate-race",
+        }
+        snapshots = iter([default_snapshot, active_snapshot])
+        monkeypatch.setattr(
+            "hermes_cli.profile_distribution._active_profile_snapshot",
+            lambda: next(snapshots),
+        )
+
+        with pytest.raises(DistributionError, match="retained"):
+            install_distribution(str(staged), name="activate-race")
+
+        from hermes_cli.profiles import get_profile_dir
+
+        target = get_profile_dir("activate-race")
+        assert target.is_dir()
+        receipt = json.loads((target / RECEIPT_FILENAME).read_text())
+        assert receipt["status"] == "committed_with_concurrent_activation"
+        assert receipt["active_profile"]["unchanged"] is False
 
 
 # ===========================================================================
@@ -507,7 +984,13 @@ class TestNestedUserOwnedExcludeNotFiltered:
     def test_nested_bin_dir_is_preserved(self, profile_env):
         """"A distribution shipping tools/bin/ must not have tools/bin/ dropped
         during install even though 'bin' is in USER_OWNED_EXCLUDE."""
-        staged = _make_staging_dir(profile_env, "src")
+        staged = _make_staging_dir(
+            profile_env,
+            "src",
+            manifest=DistributionManifest(
+                name="src", distribution_owned=["tools"]
+            ),
+        )
         (staged / "tools" / "bin").mkdir(parents=True)
         (staged / "tools" / "bin" / "tool.py").write_text("# tool\n")
 
@@ -516,7 +999,13 @@ class TestNestedUserOwnedExcludeNotFiltered:
         assert (plan.target_dir / "tools" / "bin" / "tool.py").exists()
 
     def test_nested_logs_dir_is_preserved(self, profile_env):
-        staged = _make_staging_dir(profile_env, "src")
+        staged = _make_staging_dir(
+            profile_env,
+            "src",
+            manifest=DistributionManifest(
+                name="src", distribution_owned=["scripts"]
+            ),
+        )
         (staged / "scripts" / "logs").mkdir(parents=True)
         (staged / "scripts" / "logs" / "run.log").write_text("ok\n")
 
@@ -525,7 +1014,13 @@ class TestNestedUserOwnedExcludeNotFiltered:
         assert (plan.target_dir / "scripts" / "logs" / "run.log").read_text() == "ok\n"
 
     def test_nested_cache_dir_is_preserved(self, profile_env):
-        staged = _make_staging_dir(profile_env, "src")
+        staged = _make_staging_dir(
+            profile_env,
+            "src",
+            manifest=DistributionManifest(
+                name="src", distribution_owned=["control-plane"]
+            ),
+        )
         (staged / "control-plane" / "cache").mkdir(parents=True)
         (staged / "control-plane" / "cache" / "data.json").write_text("{}\n")
 
@@ -557,7 +1052,13 @@ class TestNestedUserOwnedExcludeNotFiltered:
 
     def test_both_nested_and_top_level_coexist(self, profile_env):
         """Top-level bin/ filtered, but tools/bin/ kept."""
-        staged = _make_staging_dir(profile_env, "src")
+        staged = _make_staging_dir(
+            profile_env,
+            "src",
+            manifest=DistributionManifest(
+                name="src", distribution_owned=["tools"]
+            ),
+        )
         (staged / "bin").mkdir(exist_ok=True)
         (staged / "bin" / "top.sh").write_text("# top\n")
         (staged / "tools" / "bin").mkdir(parents=True)

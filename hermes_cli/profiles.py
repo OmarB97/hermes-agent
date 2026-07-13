@@ -1811,22 +1811,42 @@ def set_active_profile(name: str) -> None:
     """
     canon = normalize_profile_name(name)
     validate_profile_name(canon)
-    if canon != "default" and not profile_exists(canon):
-        raise FileNotFoundError(
-            f"Profile '{canon}' does not exist. "
-            f"Create it with: hermes profile create {canon}"
-        )
-
     path = _get_active_profile_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     if canon == "default":
         # Remove the file to indicate default
         path.unlink(missing_ok=True)
     else:
-        # Atomic write
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(canon + "\n")
-        tmp.replace(path)
+        # Activation and distribution install/update share the same per-profile
+        # lock.  Without this, a fresh install rollback can recheck the active
+        # pointer, then race with activation and delete the newly-active target.
+        # Import locally to avoid a module import cycle: profile_distribution
+        # imports profile helpers only inside its command paths.
+        from hermes_cli.profile_distribution import (
+            DistributionError,
+            _distribution_lock,
+        )
+
+        target = get_profile_dir(canon)
+        try:
+            with _distribution_lock(target):
+                # Revalidate after acquiring the lock; the profile may have
+                # disappeared while an activation request was waiting.
+                if not profile_exists(canon):
+                    raise FileNotFoundError(
+                        f"Profile '{canon}' does not exist. "
+                        f"Create it with: hermes profile create {canon}"
+                    )
+                # Atomic write while the target cannot be committed or rolled
+                # back by a distribution transaction.
+                tmp = path.with_suffix(".tmp")
+                tmp.write_text(canon + "\n")
+                tmp.replace(path)
+        except DistributionError as exc:
+            raise ValueError(
+                f"Cannot activate profile '{canon}' during a distribution "
+                f"transaction: {exc}"
+            ) from exc
 
 
 def get_active_profile_name() -> str:

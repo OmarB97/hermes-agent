@@ -11708,6 +11708,27 @@ def cmd_profile(args):
         print()
         return
 
+    if action == "capabilities":
+        from hermes_cli import __version__ as hermes_version
+        from hermes_cli.profile_distribution import (
+            SUPPORTED_DISTRIBUTION_CAPABILITIES,
+        )
+
+        result = {
+            "hermes_version": hermes_version,
+            "profile_distribution_capabilities": sorted(
+                SUPPORTED_DISTRIBUTION_CAPABILITIES
+            ),
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(result, sort_keys=True))
+        else:
+            print(f"Hermes {hermes_version}")
+            print("Profile distribution capabilities:")
+            for capability in result["profile_distribution_capabilities"]:
+                print(f"  - {capability}")
+        return
+
     if action == "list":
         profiles = list_profiles()
         active = get_active_profile_name()
@@ -12144,6 +12165,12 @@ def cmd_profile(args):
             )
             print(f"\n✓ Installed '{plan.manifest.name}' v{plan.manifest.version}")
             print(f"  Profile path: {plan.target_dir}")
+            if plan.receipt_path:
+                print(f"  Receipt:      {plan.receipt_path}")
+                print(
+                    "  Verify with:  "
+                    f"hermes profile doctor {plan.manifest.name}"
+                )
             if plan.manifest.env_requires:
                 print(
                     f"  Next: copy .env.EXAMPLE to .env and fill in required keys:\n"
@@ -12197,6 +12224,8 @@ def cmd_profile(args):
 
             plan = update_distribution(canon, force_config=force_config)
             print(f"\n✓ Updated '{plan.manifest.name}' → v{plan.manifest.version}")
+            if plan.receipt_path:
+                print(f"  Receipt: {plan.receipt_path}")
             if plan.has_cron:
                 print(
                     "  Cron files were refreshed.  Review with:  "
@@ -12204,6 +12233,31 @@ def cmd_profile(args):
                 )
         except (DistributionError, ValueError) as e:
             print(f"Error: {e}")
+            sys.exit(1)
+
+    elif action == "doctor":
+        from hermes_cli.profile_distribution import (
+            DistributionError,
+            doctor_distribution,
+        )
+
+        try:
+            result = doctor_distribution(args.profile_name)
+        except (DistributionError, ValueError) as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+        if getattr(args, "json", False):
+            print(json.dumps(result, indent=2, sort_keys=True))
+        elif result["ok"]:
+            print(f"✓ Distribution '{result['profile']}' is healthy")
+            print(f"  Receipt: {result['receipt_path']}")
+            print(f"  Digest:  {result['actual_sha256']}")
+            print("  Active profile pointer: unchanged during install/update")
+        else:
+            print(f"✗ Distribution '{result['profile']}' failed verification")
+            for issue in result["issues"]:
+                print(f"  - {issue}")
+        if not result["ok"]:
             sys.exit(1)
 
     elif action == "info":

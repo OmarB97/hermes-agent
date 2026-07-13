@@ -63,6 +63,7 @@ def test_profile_has_expected_actions():
     # Map each subaction to a minimal valid argv suffix.
     cases = {
         "list": [],
+        "capabilities": [],
         "use": ["work"],
         "create": ["work"],
         "delete": ["work"],
@@ -70,10 +71,29 @@ def test_profile_has_expected_actions():
         "rename": ["old", "new"],
         "export": ["work"],
         "import": ["/tmp/x.zip"],
+        "install": ["/tmp/distribution"],
+        "update": ["work"],
+        "info": ["work"],
+        "doctor": ["work"],
     }
     for action, extra in cases.items():
         ns = p.parse_args(["profile", action, *extra])
         assert ns.profile_action == action
+
+
+def test_profile_distribution_doctor_accepts_json():
+    p = _profile_parser()
+    ns = p.parse_args(["profile", "doctor", "meshboard-worker", "--json"])
+    assert ns.profile_action == "doctor"
+    assert ns.profile_name == "meshboard-worker"
+    assert ns.json is True
+
+
+def test_profile_distribution_capabilities_accepts_json():
+    p = _profile_parser()
+    ns = p.parse_args(["profile", "capabilities", "--json"])
+    assert ns.profile_action == "capabilities"
+    assert ns.json is True
 
 
 def test_gateway_and_proxy_dispatch():
