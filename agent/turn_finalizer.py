@@ -512,7 +512,9 @@ def finalize_turn(
             last_reasoning = msg["reasoning"]
             break
 
-    # Build result with interrupt info if applicable
+    # Build result with interrupt info if applicable. ``api_calls`` remains the
+    # per-turn attempt/iteration count for compatibility; ``api_call_count`` is
+    # the distinct cumulative count of successful provider calls.
     result = {
         "final_response": final_response,
         "last_reasoning": last_reasoning,
@@ -528,16 +530,6 @@ def finalize_turn(
         "model": agent.model,
         "provider": agent.provider,
         "base_url": agent.base_url,
-        "input_tokens": agent.session_input_tokens,
-        "output_tokens": agent.session_output_tokens,
-        "cache_read_tokens": agent.session_cache_read_tokens,
-        "cache_write_tokens": agent.session_cache_write_tokens,
-        "reasoning_tokens": agent.session_reasoning_tokens,
-        "prompt_tokens": agent.session_prompt_tokens,
-        "completion_tokens": agent.session_completion_tokens,
-        "total_tokens": agent.session_total_tokens,
-        "last_prompt_tokens": getattr(agent.context_compressor, "last_prompt_tokens", 0) or 0,
-        "estimated_cost_usd": agent.session_estimated_cost_usd,
         "cost_status": agent.session_cost_status,
         "cost_source": agent.session_cost_source,
         # Requested service tier (from request_overrides.extra_body), for
@@ -547,6 +539,9 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    from agent.session_telemetry import apply_telemetry_result_fields
+
+    apply_telemetry_result_fields(result, agent)
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Surface any post-loop cleanup failures so the caller can distinguish a

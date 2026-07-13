@@ -88,14 +88,20 @@ class TestLocalDflashStaleTimeout:
     def _payload_for_estimated_tokens(tokens: int) -> dict[str, list[str]]:
         return {"messages": ["x" * (tokens * 4)]}
 
-    def _make_agent(self, *, model="dflash", base_url="http://10.10.20.211:8080/v1"):
+    def _make_agent(
+        self,
+        *,
+        model="dflash",
+        base_url="http://10.10.20.211:8080/v1",
+        provider="taro",
+    ):
         from run_agent import AIAgent
 
         with patch("agent.context_compressor.get_model_context_length", return_value=256_000):
             return AIAgent(
                 api_key="sk-dummy",
                 base_url=base_url,
-                provider="taro",
+                provider=provider,
                 model=model,
                 quiet_mode=True,
                 skip_context_files=True,
@@ -203,6 +209,35 @@ class TestLocalDflashStaleTimeout:
         assert timeout == 180.0
         assert timeout > 116.0
 
+    def test_taro_w2_first_chunk_floor_is_route_and_model_specific(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / ".env").write_text("", encoding="utf-8")
+        monkeypatch.delenv("HERMES_STREAM_STALE_TIMEOUT", raising=False)
+        monkeypatch.delenv("HERMES_DFLASH_FIRST_CHUNK_TIMEOUT", raising=False)
+        monkeypatch.delenv("HERMES_DFLASH_TTFB_TIMEOUT", raising=False)
+
+        payload = {
+            "model": "deepseek-v4-flash-w2",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+        taro_w2 = self._make_agent(model="deepseek-v4-flash-w2")
+        other_route = self._make_agent(
+            model="deepseek-v4-flash-w2",
+            provider="other-lan",
+        )
+        taro_iq3 = self._make_agent(model="deepseek-v4-flash-iq3xxs")
+
+        assert resolve_dflash_local_first_chunk_timeout(taro_w2, payload) == 360.0
+        assert resolve_dflash_local_first_chunk_timeout(other_route, payload) == 180.0
+        assert resolve_dflash_local_first_chunk_timeout(
+            taro_iq3,
+            {**payload, "model": "deepseek-v4-flash-iq3xxs"},
+        ) == 180.0
+
     def test_production_w2_no_first_chunk_wait_exits_at_family_deadline(
         self,
         monkeypatch,
@@ -222,6 +257,8 @@ class TestLocalDflashStaleTimeout:
                 return cls.now
 
         class NoResponseThread:
+            joins = 0
+
             def __init__(self, *, target, daemon):
                 self.target = target
                 self.daemon = daemon
@@ -234,7 +271,8 @@ class TestLocalDflashStaleTimeout:
 
             def join(self, timeout=None):
                 if timeout == 0.3:
-                    Clock.now = 181.0
+                    type(self).joins += 1
+                    Clock.now = 181.0 if self.joins == 1 else 361.0
 
         statuses = []
         replacements = []
@@ -267,7 +305,7 @@ class TestLocalDflashStaleTimeout:
 
         with pytest.raises(
             TimeoutError,
-            match=r"Local dflash stream produced no first chunk after 181s .*180s",
+            match=r"Local dflash stream produced no first chunk after 361s .*360s",
         ):
             interruptible_streaming_api_call(
                 Agent(),
@@ -278,7 +316,7 @@ class TestLocalDflashStaleTimeout:
             )
 
         assert len(statuses) == 1
-        assert "No first stream chunk from local dflash for 181s" in statuses[0]
+        assert "No first stream chunk from local dflash for 361s" in statuses[0]
         assert statuses[0].endswith("Reconnecting...")
         assert replacements == ["dflash_first_chunk_pool_cleanup"]
 

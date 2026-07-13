@@ -2355,15 +2355,35 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         old_model, old_provider, new_model, new_provider,
     )
 
-    # ── Persist billing route to session DB ──
+    # ── Persist selected runtime to session DB ──
     # The agent's _session_db / session_id may not be set in all contexts
-    # (tests, bare agents without a session DB, etc.).  This ensures the
-    # dashboard Model cards show the actual provider after a mid-session
-    # /model switch instead of the stale session-creation provider.
+    # (tests, bare agents without a session DB, etc.). Persist the newly
+    # resolved cap as well as the model and billing route before returning;
+    # otherwise a restart can hydrate the previous model's incompatible cap.
+    # This also ensures the dashboard Model cards show the actual provider
+    # after a mid-session /model switch instead of the stale creation route.
     # See #48248 for the full bug description.
     _session_db = getattr(agent, "_session_db", None)
     _session_id = getattr(agent, "session_id", None)
     if _session_db is not None and _session_id:
+        if _cc is not None:
+            try:
+                _session_db.set_context_length(
+                    _session_id,
+                    max(int(getattr(_cc, "context_length", 0) or 0), 0),
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to persist context cap after model switch",
+                    exc_info=True,
+                )
+        try:
+            _session_db.update_session_model(_session_id, agent.model)
+        except Exception:
+            logger.warning(
+                "Failed to persist model after model switch",
+                exc_info=True,
+            )
         try:
             _session_db.update_session_billing_route(
                 _session_id,

@@ -105,7 +105,10 @@ def test_codex_app_server_manual_compression_routes_to_codex_thread():
     # This minimal fake compressor does not implement update_from_response(),
     # so the runtime preserves its existing pending-usage bookkeeping here.
     assert agent.context_compressor.last_prompt_tokens == -1
-    assert agent.context_compressor.last_completion_tokens == 0
+    # Compaction starts a new context epoch but does not fabricate a new
+    # successful provider snapshot. Preserve the last real completion count
+    # until the next response supplies a replacement.
+    assert agent.context_compressor.last_completion_tokens == 45
     assert agent.context_compressor.awaiting_real_usage_after_compression is True
     assert agent.events == [
         (

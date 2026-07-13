@@ -1416,6 +1416,29 @@ def compress_context(
         # storing it on _compression_warning lets replay_compression_warning
         # re-deliver it once a late-bound gateway status_callback is wired (#36908).
         _cc = agent.context_compressor.compression_count
+        # Persist the completed compaction immediately rather than waiting for
+        # another model response. A compression may itself be the last event a
+        # dashboard observes, and cumulative token counters otherwise span
+        # epochs without exposing that boundary. Best-effort telemetry must not
+        # block the compression path.
+        if getattr(agent, "_session_db", None) and getattr(agent, "session_id", None):
+            if _old_sid:
+                from agent.session_telemetry import (
+                    persist_current_telemetry_snapshot,
+                )
+
+                persist_current_telemetry_snapshot(agent)
+            else:
+                try:
+                    agent._session_db.set_compression_count(
+                        agent.session_id, _cc
+                    )
+                except Exception:
+                    logger.debug(
+                        "could not persist compression telemetry (session=%s)",
+                        agent.session_id,
+                        exc_info=True,
+                    )
         if _cc >= 2:
             _cc_msg = (
                 f"{agent.log_prefix}⚠️  Session compressed {_cc} times — "
@@ -1456,7 +1479,6 @@ def compress_context(
         )
         agent.context_compressor.last_compression_rough_tokens = _compressed_est
         agent.context_compressor.last_prompt_tokens = -1
-        agent.context_compressor.last_completion_tokens = 0
         agent.context_compressor.awaiting_real_usage_after_compression = True
         # Arm the effectiveness verdict only after a completed rewrite crosses
         # the full compaction boundary. Exceptions, aborts, and no-op attempts
@@ -1475,6 +1497,30 @@ def compress_context(
                 )
             else:
                 agent.context_compressor._verify_compaction_cleared_threshold = True
+        # Keep shrink authority until a JSON write actually succeeds. If this
+        # boundary write is transiently lost, the next terminal projection can
+        # still replace the pre-compression transcript and expose its terminal
+        # assistant message instead of being rejected by the larger-log guard.
+        agent._session_json_pending_compaction_epoch = max(
+            int(
+                getattr(agent, "_session_json_pending_compaction_epoch", 0)
+                or 0
+            ),
+            int(agent.context_compressor.compression_count or 0),
+        )
+        agent._session_messages = compressed
+        if getattr(agent, "_session_json_enabled", False):
+            try:
+                agent._save_session_log(
+                    compressed,
+                    allow_compaction_shrink=True,
+                )
+            except Exception:
+                logger.debug(
+                    "could not persist compression JSON telemetry (session=%s)",
+                    agent.session_id,
+                    exc_info=True,
+                )
 
         # Clear the file-read dedup cache.  After compression the original
         # read content is summarised away — if the model re-reads the same

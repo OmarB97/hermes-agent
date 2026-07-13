@@ -2354,6 +2354,14 @@ class TestCounts:
 
         assert db.session_count(cwd_prefix="/repo") == 2
 
+    def test_surfaced_session_count_by_cwd_prefix(self, db):
+        db.create_session("s1", "cli", cwd="/repo")
+        db.create_session("s2", "cli", cwd="/repo-wt-feature")
+        db.create_session("s3", "cli", cwd="/repo/subdir")
+
+        assert db.surfaced_session_count(cwd_prefix="/repo") == 2
+        assert db.surfaced_session_count(cwd_prefix="/repo", exclude_children=False) == 2
+
     def test_message_count_total(self, db):
         assert db.message_count() == 0
         db.create_session(session_id="s1", source="cli")

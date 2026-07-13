@@ -69,8 +69,15 @@ from agent.retry_utils import (
     jittered_backoff,
     zai_coding_overload_retry_ceiling,
 )
+from agent.session_telemetry import (
+    begin_pending_request,
+    clear_pending_request_during_unwind,
+    clear_pending_request_on_success,
+    record_call_without_usage,
+    record_canonical_usage,
+)
 from agent.trajectory import has_incomplete_scratchpad
-from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.usage_pricing import normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
@@ -481,6 +488,45 @@ def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List
         )
 
 
+def _emit_preflight_token_usage(
+    agent: Any, request_tokens: int, messages_len: int | None = None
+) -> None:
+    """Send the current request-size estimate through the live usage channel."""
+    if request_tokens <= 0:
+        return
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is None:
+        return
+
+    try:
+        previous = getattr(compressor, "last_prompt_tokens", 0) or 0
+        if request_tokens > previous:
+            compressor.last_prompt_tokens = request_tokens
+            if messages_len is not None:
+                compressor.last_prompt_messages_len = messages_len
+    except Exception:
+        logger.debug("could not update preflight context estimate", exc_info=True)
+
+    emit = getattr(agent, "_emit_token_usage", None)
+    if not callable(emit):
+        return
+
+    try:
+        emit(
+            input_tokens=getattr(agent, "session_input_tokens", 0)
+            or getattr(agent, "session_prompt_tokens", 0)
+            or 0,
+            output_tokens=getattr(agent, "session_output_tokens", 0)
+            or getattr(agent, "session_completion_tokens", 0)
+            or 0,
+            total_tokens=getattr(agent, "session_total_tokens", 0) or 0,
+            context_tokens=request_tokens,
+            context_length=getattr(compressor, "context_length", 0) or 0,
+        )
+    except Exception:
+        logger.debug("could not emit preflight token usage", exc_info=True)
+
+
 # Continuation nudge for Codex/Responses turns that came back with only
 # internal reasoning (no visible content, no tool calls).  When the interim
 # assistant message also carries no encrypted reasoning items and no
@@ -584,6 +630,138 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
             effective = (effective + "\n\n" + agent.ephemeral_system_prompt).strip()
         api_messages[0]["content"] = effective
     return sp
+
+
+def _record_accepted_provider_response(
+    agent: Any,
+    response: Any,
+    messages: List[Dict[str, Any]],
+    *,
+    api_duration: float,
+) -> Any:
+    """Record one valid provider response before terminal branch handling.
+
+    Refusals and real output-length responses are accepted provider calls and
+    can carry billable usage even though the turn later falls back or ends
+    partial.  A ``PARTIAL_STREAM_STUB_ID`` response is synthetic network
+    recovery state, not an accepted provider response, and is excluded.
+    """
+    if getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID:
+        return None
+
+    response_usage = getattr(response, "usage", None)
+    if not response_usage:
+        record_call_without_usage(agent, accepted=True)
+        return None
+
+    canonical_usage = normalize_usage(
+        response_usage,
+        provider=agent.provider,
+        api_mode=agent.api_mode,
+    )
+    aggregator_usage = canonical_usage
+    moa_ref_cost = None
+    moa_client = getattr(agent, "client", None)
+    if moa_client is not None and hasattr(moa_client, "consume_reference_usage"):
+        try:
+            ref_usage, moa_ref_cost = moa_client.consume_reference_usage()
+            if ref_usage is not None:
+                canonical_usage = canonical_usage + ref_usage
+        except Exception:
+            logger.debug("MoA reference usage accounting failed", exc_info=True)
+
+    if moa_client is not None and hasattr(moa_client, "consume_and_save_trace"):
+        try:
+            streamed_text = (
+                getattr(agent, "_current_streamed_assistant_text", "") or ""
+            )
+            moa_client.consume_and_save_trace(
+                agent.session_id,
+                aggregator_output_fallback=streamed_text or None,
+            )
+        except Exception:
+            logger.debug("MoA trace flush failed", exc_info=True)
+
+    pricing_model = agent.model
+    pricing_provider = agent.provider
+    pricing_base_url = agent.base_url
+    aggregator_slot = (
+        getattr(moa_client, "last_aggregator_slot", None)
+        if moa_client is not None
+        else None
+    )
+    if aggregator_slot and aggregator_slot.get("model"):
+        pricing_model = aggregator_slot["model"]
+        pricing_provider = aggregator_slot.get("provider") or agent.provider
+        pricing_base_url = aggregator_slot.get("base_url") or agent.base_url
+
+    usage_result = record_canonical_usage(
+        agent,
+        canonical_usage,
+        accepted=True,
+        priced_usage=aggregator_usage,
+        pricing_model=pricing_model,
+        pricing_provider=pricing_provider,
+        pricing_base_url=pricing_base_url,
+        extra_cost_usd=moa_ref_cost,
+        messages_len=len(messages),
+    )
+
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is not None and getattr(compressor, "_context_probed", False):
+        context_length = compressor.context_length
+        if getattr(compressor, "_context_probe_persistable", False):
+            save_context_length(agent.model, agent.base_url, context_length)
+            agent._safe_print(
+                f"{agent.log_prefix}💾 Cached context length: "
+                f"{context_length:,} tokens for {agent.model}"
+            )
+        compressor._context_probed = False
+        compressor._context_probe_persistable = False
+
+    prompt_tokens = usage_result["prompt_tokens"]
+    completion_tokens = usage_result["completion_tokens"]
+    total_tokens = usage_result["total_tokens"]
+    cache_read_tokens = usage_result["cache_read_tokens"]
+    cache_pct = ""
+    if cache_read_tokens and prompt_tokens:
+        cache_pct = (
+            f" cache={cache_read_tokens}/{prompt_tokens} "
+            f"({100 * cache_read_tokens / prompt_tokens:.0f}%)"
+        )
+    logger.info(
+        "API call #%d: model=%s provider=%s in=%d out=%d total=%d "
+        "latency=%.1fs%s",
+        agent.session_api_calls,
+        agent.model,
+        agent.provider or "unknown",
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        api_duration,
+        cache_pct,
+    )
+
+    if agent.verbose_logging:
+        logging.debug(
+            "Token usage: prompt=%s, completion=%s, total=%s",
+            f"{prompt_tokens:,}",
+            f"{completion_tokens:,}",
+            f"{total_tokens:,}",
+        )
+
+    cache_write_tokens = usage_result["cache_write_tokens"]
+    if (cache_read_tokens or cache_write_tokens) and not agent.quiet_mode:
+        hit_pct = (
+            cache_read_tokens / prompt_tokens * 100 if prompt_tokens > 0 else 0
+        )
+        agent._vprint(
+            f"{agent.log_prefix}   💾 Cache: "
+            f"{cache_read_tokens:,}/{prompt_tokens:,} tokens "
+            f"({hit_pct:.0f}% hit, {cache_write_tokens:,} written)"
+        )
+
+    return canonical_usage
 
 
 def run_conversation(
@@ -1460,22 +1638,46 @@ def run_conversation(
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
-                response = run_llm_execution_middleware(
-                    api_kwargs,
-                    _perform_api_call,
-                    original_request=_original_api_kwargs,
-                    task_id=effective_task_id,
-                    turn_id=turn_id,
-                    api_request_id=api_request_id,
-                    session_id=agent.session_id or "",
-                    platform=agent.platform or "",
-                    model=agent.model,
-                    provider=agent.provider,
-                    base_url=agent.base_url,
-                    api_mode=agent.api_mode,
-                    api_call_count=api_call_count,
-                    middleware_trace=list(_llm_middleware_trace),
+                # Publish pending state immediately adjacent to execution.
+                # Earlier estimates may loop back through compression without
+                # sending a request; the generation fence ensures an older
+                # request's finally cannot clear a newer overlapping request.
+                agent._session_messages = messages
+                _pending_generation = begin_pending_request(
+                    agent,
+                    request_pressure_tokens,
+                    started_at=api_start_time,
                 )
+                try:
+                    response = run_llm_execution_middleware(
+                        api_kwargs,
+                        _perform_api_call,
+                        original_request=_original_api_kwargs,
+                        task_id=effective_task_id,
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
+                        session_id=agent.session_id or "",
+                        platform=agent.platform or "",
+                        model=agent.model,
+                        provider=agent.provider,
+                        base_url=agent.base_url,
+                        api_mode=agent.api_mode,
+                        api_call_count=api_call_count,
+                        middleware_trace=list(_llm_middleware_trace),
+                    )
+                except BaseException:
+                    # Terminal guarantee: no response, retry exception,
+                    # interrupt, or unexpected BaseException can leave a ghost
+                    # in-flight marker behind once execution unwinds. Cleanup
+                    # must never replace the provider's original exception.
+                    clear_pending_request_during_unwind(
+                        agent, _pending_generation
+                    )
+                    raise
+                else:
+                    clear_pending_request_on_success(
+                        agent, _pending_generation
+                    )
                 
                 api_duration = time.time() - api_start_time
                 
@@ -1785,6 +1987,16 @@ def run_conversation(
                             force=True,
                         )
                         finish_reason = "length"
+
+                # Account for every accepted provider response before refusal,
+                # length, fallback, or other early terminal branches. Synthetic
+                # partial-stream stubs are excluded inside the helper.
+                _record_accepted_provider_response(
+                    agent,
+                    response,
+                    messages,
+                    api_duration=api_duration,
+                )
 
                 # ── Content-policy refusal (HTTP 200) ──────────────────
                 # The model — or the provider's safety system — returned a
@@ -2186,229 +2398,6 @@ def run_conversation(
                             "failed": True,
                             "error": "First response truncated due to output length limit"
                         }
-                
-                # Track actual token usage from response for context management
-                if hasattr(response, 'usage') and response.usage:
-                    canonical_usage = normalize_usage(
-                        response.usage,
-                        provider=agent.provider,
-                        api_mode=agent.api_mode,
-                    )
-                    # Aggregator-only usage is retained for cost pricing: MoA
-                    # advisor tokens must be priced at each advisor's OWN model
-                    # rate, not the aggregator's, so they are added as dollars
-                    # (below) rather than folded into the priced usage.
-                    aggregator_usage = canonical_usage
-                    # MoA: fold the reference (advisor) fan-out's token usage
-                    # into this turn's REPORTED token counts. MoA runs advisors
-                    # before the aggregator and returns only the aggregator's
-                    # usage, so without this the entire advisor spend — usually
-                    # the bulk of a MoA turn — is invisible in token counts.
-                    _moa_ref_cost = None
-                    _moa_client = getattr(agent, "client", None)
-                    if _moa_client is not None and hasattr(_moa_client, "consume_reference_usage"):
-                        try:
-                            _ref_usage, _moa_ref_cost = _moa_client.consume_reference_usage()
-                            if _ref_usage is not None:
-                                canonical_usage = canonical_usage + _ref_usage
-                        except Exception as _moa_acct_exc:  # pragma: no cover - defensive
-                            logger.debug("MoA reference usage accounting failed: %s", _moa_acct_exc)
-                    # Flush the full-turn MoA trace (references + aggregator I/O)
-                    # to disk when moa.save_traces is on. No-op otherwise and
-                    # for non-MoA clients. Uses the live session_id so traces
-                    # land in the right per-session file. On the streaming path
-                    # the aggregator's output wasn't captured inline (its raw
-                    # token stream went to the live consumer), so pass the
-                    # resolved streamed acting text as a fallback — makes the
-                    # trace self-contained instead of only pointing at state.db.
-                    if _moa_client is not None and hasattr(_moa_client, "consume_and_save_trace"):
-                        try:
-                            _agg_streamed_text = (
-                                getattr(agent, "_current_streamed_assistant_text", "") or ""
-                            )
-                            _moa_client.consume_and_save_trace(
-                                agent.session_id,
-                                aggregator_output_fallback=_agg_streamed_text or None,
-                            )
-                        except Exception as _moa_trace_exc:  # pragma: no cover - defensive
-                            logger.debug("MoA trace flush failed: %s", _moa_trace_exc)
-                    prompt_tokens = canonical_usage.prompt_tokens
-                    completion_tokens = canonical_usage.output_tokens
-                    total_tokens = canonical_usage.total_tokens
-                    # Forward canonical token + cache buckets so context engines
-                    # can make decisions on cache hit ratios / reasoning costs,
-                    # not just legacy aggregate tokens. Legacy keys stay for
-                    # back-compat with engines that only read prompt/completion/total.
-                    usage_dict = {
-                        "prompt_tokens": prompt_tokens,
-                        "completion_tokens": completion_tokens,
-                        "total_tokens": total_tokens,
-                        "input_tokens": canonical_usage.input_tokens,
-                        "output_tokens": canonical_usage.output_tokens,
-                        "cache_read_tokens": canonical_usage.cache_read_tokens,
-                        "cache_write_tokens": canonical_usage.cache_write_tokens,
-                        "reasoning_tokens": canonical_usage.reasoning_tokens,
-                    }
-                    agent.context_compressor.update_from_response(usage_dict)
-                elif getattr(
-                    agent.context_compressor,
-                    "awaiting_real_usage_after_compression",
-                    False,
-                ):
-                    # A response with no usage cannot adjudicate whether the
-                    # prior compaction cleared the threshold. Consume the pending
-                    # verdict now so a much later, unrelated reading is not
-                    # charged to that old compaction, and so preflight deferral
-                    # does not remain latched indefinitely.
-                    agent.context_compressor.update_from_response({})
-
-                if hasattr(response, 'usage') and response.usage:
-                    # Cache discovered context length after successful call.
-                    # Only persist limits confirmed by the provider (parsed
-                    # from the error message), not guessed probe tiers.
-                    if getattr(agent.context_compressor, "_context_probed", False):
-                        ctx = agent.context_compressor.context_length
-                        if getattr(agent.context_compressor, "_context_probe_persistable", False):
-                            save_context_length(agent.model, agent.base_url, ctx)
-                            agent._safe_print(f"{agent.log_prefix}💾 Cached context length: {ctx:,} tokens for {agent.model}")
-                        agent.context_compressor._context_probed = False
-                        agent.context_compressor._context_probe_persistable = False
-
-                    agent.session_prompt_tokens += prompt_tokens
-                    agent.session_completion_tokens += completion_tokens
-                    agent.session_total_tokens += total_tokens
-                    agent.session_api_calls += 1
-                    agent.session_input_tokens += canonical_usage.input_tokens
-                    agent.session_output_tokens += canonical_usage.output_tokens
-                    agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
-                    agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
-                    agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
-
-                    # Log API call details for debugging/observability
-                    _cache_pct = ""
-                    if canonical_usage.cache_read_tokens and prompt_tokens:
-                        _cache_pct = f" cache={canonical_usage.cache_read_tokens}/{prompt_tokens} ({100*canonical_usage.cache_read_tokens/prompt_tokens:.0f}%)"
-                    logger.info(
-                        "API call #%d: model=%s provider=%s in=%d out=%d total=%d latency=%.1fs%s",
-                        agent.session_api_calls, agent.model, agent.provider or "unknown",
-                        prompt_tokens, completion_tokens, total_tokens,
-                        api_duration, _cache_pct,
-                    )
-
-                    # On the MoA path, agent.model/provider are the virtual
-                    # preset name ("closed") and "moa", which have no pricing
-                    # entry — estimating against them returns None and silently
-                    # drops the aggregator's own spend, leaving the session cost
-                    # as advisor-fan-out only (a ~50% undercount when the
-                    # aggregator does the full acting loop). Price the aggregator
-                    # turn at its REAL model/provider, read from the MoA client's
-                    # resolved aggregator slot.
-                    _agg_cost_model = agent.model
-                    _agg_cost_provider = agent.provider
-                    _agg_cost_base_url = agent.base_url
-                    _agg_slot = getattr(_moa_client, "last_aggregator_slot", None) if _moa_client is not None else None
-                    if _agg_slot and _agg_slot.get("model"):
-                        _agg_cost_model = _agg_slot["model"]
-                        _agg_cost_provider = _agg_slot.get("provider") or agent.provider
-                        _agg_cost_base_url = _agg_slot.get("base_url") or agent.base_url
-                    cost_result = estimate_usage_cost(
-                        _agg_cost_model,
-                        aggregator_usage,
-                        provider=_agg_cost_provider,
-                        base_url=_agg_cost_base_url,
-                        api_key=getattr(agent, "api_key", ""),
-                    )
-                    if cost_result.amount_usd is not None:
-                        agent.session_estimated_cost_usd += float(cost_result.amount_usd)
-                    # Add MoA advisor cost (already priced per-advisor at each
-                    # advisor's own model rate) on top of the aggregator cost.
-                    if _moa_ref_cost is not None:
-                        try:
-                            agent.session_estimated_cost_usd += float(_moa_ref_cost)
-                        except (TypeError, ValueError):  # pragma: no cover - defensive
-                            pass
-                    agent.session_cost_status = cost_result.status
-                    agent.session_cost_source = cost_result.source
-
-                    # Persist token counts to session DB for /insights.
-                    # Do this for every platform with a session_id so non-CLI
-                    # sessions (gateway, cron, delegated runs) cannot lose
-                    # token/accounting data if a higher-level persistence path
-                    # is skipped or fails. Gateway/session-store writes use
-                    # absolute totals, so they safely overwrite these per-call
-                    # deltas instead of double-counting them.
-                    if agent._session_db and agent.session_id:
-                        try:
-                            # Ensure the session row exists before attempting UPDATE.
-                            # Under concurrent load (cron/kanban), the initial
-                            # _ensure_db_session() may have failed due to SQLite
-                            # locking.  Retry here so per-call token deltas are
-                            # not silently lost (UPDATE on a non-existent row
-                            # affects 0 rows without error).
-                            if not agent._session_db_created:
-                                agent._ensure_db_session()
-                            # Per-call cost delta = aggregator cost + MoA
-                            # advisor cost (each priced at its own rate). Folded
-                            # here so state.db's estimated_cost_usd includes the
-                            # full MoA spend, matching the folded token counts.
-                            _cost_delta = None
-                            if cost_result.amount_usd is not None:
-                                _cost_delta = float(cost_result.amount_usd)
-                            if _moa_ref_cost is not None:
-                                try:
-                                    _cost_delta = (_cost_delta or 0.0) + float(_moa_ref_cost)
-                                except (TypeError, ValueError):  # pragma: no cover
-                                    pass
-                            agent._session_db.update_token_counts(
-                                agent.session_id,
-                                input_tokens=canonical_usage.input_tokens,
-                                output_tokens=canonical_usage.output_tokens,
-                                cache_read_tokens=canonical_usage.cache_read_tokens,
-                                cache_write_tokens=canonical_usage.cache_write_tokens,
-                                reasoning_tokens=canonical_usage.reasoning_tokens,
-                                estimated_cost_usd=_cost_delta,
-                                cost_status=cost_result.status,
-                                cost_source=cost_result.source,
-                                billing_provider=agent.provider,
-                                billing_base_url=agent.base_url,
-                                billing_mode="subscription_included"
-                                if cost_result.status == "included" else None,
-                                model=agent.model,
-                                api_call_count=1,
-                            )
-                        except Exception as e:
-                            # Log token persistence failures so they're
-                            # visible in agent.log — silent loss here is
-                            # the root cause of undercounted analytics.
-                            logger.debug(
-                                "Token persistence failed (session=%s, tokens=%d): %s",
-                                agent.session_id, total_tokens, e,
-                            )
-                    
-                    if agent.verbose_logging:
-                        logging.debug(f"Token usage: prompt={usage_dict['prompt_tokens']:,}, completion={usage_dict['completion_tokens']:,}, total={usage_dict['total_tokens']:,}")
-                    
-                    # Surface cache hit stats for any provider that reports
-                    # them — not just those where we inject cache_control
-                    # markers.  OpenAI/Kimi/DeepSeek/Qwen all do automatic
-                    # server-side prefix caching and return
-                    # ``prompt_tokens_details.cached_tokens``; users
-                    # previously could not see their cache % because this
-                    # line was gated on ``_use_prompt_caching``, which is
-                    # only True for Anthropic-style marker injection.
-                    # ``canonical_usage`` is already normalised from all
-                    # three API shapes (Anthropic / Codex / OpenAI-chat)
-                    # so we can rely on its values directly.
-                    cached = canonical_usage.cache_read_tokens
-                    written = canonical_usage.cache_write_tokens
-                    prompt = usage_dict["prompt_tokens"]
-                    if (cached or written) and not agent.quiet_mode:
-                        hit_pct = (cached / prompt * 100) if prompt > 0 else 0
-                        agent._vprint(
-                            f"{agent.log_prefix}   💾 Cache: "
-                            f"{cached:,}/{prompt:,} tokens "
-                            f"({hit_pct:.0f}% hit, {written:,} written)"
-                        )
                 
                 _retry.has_retried_429 = False  # Reset on success
                 # Note: don't clear the retry buffer here — an "API call
