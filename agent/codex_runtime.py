@@ -95,138 +95,49 @@ def _coerce_usage_int(value: Any) -> int:
     return 0
 
 
-def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
-    """Translate Codex app-server token usage into Hermes accounting.
+def _record_codex_app_server_usage(
+    agent,
+    turn,
+    *,
+    accepted: bool,
+) -> dict[str, Any]:
+    """Translate Codex app-server usage through the shared accounting path.
 
-    Codex app-server reports usage via thread/tokenUsage/updated as:
-    inputTokens, cachedInputTokens, outputTokens, reasoningOutputTokens,
-    totalTokens.
-
-    Hermes' canonical prompt bucket includes uncached input + cached input.
-    The Codex app-server protocol does not currently expose cache-write tokens,
-    so that bucket remains zero on this runtime.
-
-    Even when Codex omits usage for a turn, Hermes should still count that turn
-    as one API call for session/status accounting.
+    Error/interrupted turns may still carry billable token usage. Their tokens
+    remain durable, while accepted=False keeps them out of the successful
+    provider-call counter.
     """
-    agent.session_api_calls += 1
+    from agent.session_telemetry import (
+        record_call_without_usage,
+        record_canonical_usage,
+    )
 
     usage = getattr(turn, "token_usage_last", None)
     if not isinstance(usage, dict) or not usage:
-        if agent._session_db and agent.session_id:
-            try:
-                if not agent._session_db_created:
-                    agent._ensure_db_session()
-                agent._session_db.update_token_counts(
-                    agent.session_id,
-                    model=agent.model,
-                    api_call_count=1,
-                )
-            except Exception as exc:
-                logger.debug(
-                    "Codex app-server api-call persistence failed (session=%s): %s",
-                    agent.session_id, exc,
-                )
+        record_call_without_usage(agent, accepted=accepted)
         return {}
 
-    from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
-
-    input_tokens = _coerce_usage_int(usage.get("inputTokens"))
-    cache_read_tokens = _coerce_usage_int(usage.get("cachedInputTokens"))
-    output_tokens = _coerce_usage_int(usage.get("outputTokens"))
-    reasoning_tokens = _coerce_usage_int(usage.get("reasoningOutputTokens"))
-    reported_total = _coerce_usage_int(usage.get("totalTokens"))
+    from agent.usage_pricing import CanonicalUsage
 
     canonical_usage = CanonicalUsage(
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        cache_read_tokens=cache_read_tokens,
+        input_tokens=_coerce_usage_int(usage.get("inputTokens")),
+        output_tokens=_coerce_usage_int(usage.get("outputTokens")),
+        cache_read_tokens=_coerce_usage_int(usage.get("cachedInputTokens")),
         cache_write_tokens=0,
-        reasoning_tokens=reasoning_tokens,
+        reasoning_tokens=_coerce_usage_int(usage.get("reasoningOutputTokens")),
         raw_usage=usage,
     )
-    prompt_tokens = canonical_usage.prompt_tokens
-    completion_tokens = canonical_usage.output_tokens
-    total_tokens = reported_total or canonical_usage.total_tokens
-    usage_dict = {
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": total_tokens,
-        "input_tokens": canonical_usage.input_tokens,
-        "output_tokens": canonical_usage.output_tokens,
-        "cache_read_tokens": canonical_usage.cache_read_tokens,
-        "cache_write_tokens": canonical_usage.cache_write_tokens,
-        "reasoning_tokens": canonical_usage.reasoning_tokens,
-    }
-
-    compressor = getattr(agent, "context_compressor", None)
-    if compressor is not None:
-        try:
-            compressor.update_from_response(usage_dict)
-            context_window = getattr(turn, "model_context_window", None)
-            if isinstance(context_window, int) and context_window > 0:
-                compressor.context_length = context_window
-        except Exception:
-            logger.debug("codex app-server usage update failed", exc_info=True)
-
-    agent.session_prompt_tokens += prompt_tokens
-    agent.session_completion_tokens += completion_tokens
-    agent.session_total_tokens += total_tokens
-    agent.session_input_tokens += canonical_usage.input_tokens
-    agent.session_output_tokens += canonical_usage.output_tokens
-    agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
-    agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
-    agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
-
-    cost_result = estimate_usage_cost(
-        agent.model,
+    reported_total = _coerce_usage_int(usage.get("totalTokens"))
+    context_window = getattr(turn, "model_context_window", None)
+    return record_canonical_usage(
+        agent,
         canonical_usage,
-        provider=agent.provider,
-        base_url=agent.base_url,
-        api_key=getattr(agent, "api_key", ""),
+        accepted=accepted,
+        total_tokens_override=reported_total or None,
+        context_length=context_window
+        if isinstance(context_window, int) and context_window > 0
+        else None,
     )
-    if cost_result.amount_usd is not None:
-        agent.session_estimated_cost_usd += float(cost_result.amount_usd)
-    agent.session_cost_status = cost_result.status
-    agent.session_cost_source = cost_result.source
-
-    if agent._session_db and agent.session_id:
-        try:
-            if not agent._session_db_created:
-                agent._ensure_db_session()
-            agent._session_db.update_token_counts(
-                agent.session_id,
-                input_tokens=canonical_usage.input_tokens,
-                output_tokens=canonical_usage.output_tokens,
-                cache_read_tokens=canonical_usage.cache_read_tokens,
-                cache_write_tokens=canonical_usage.cache_write_tokens,
-                reasoning_tokens=canonical_usage.reasoning_tokens,
-                estimated_cost_usd=float(cost_result.amount_usd)
-                if cost_result.amount_usd is not None else None,
-                cost_status=cost_result.status,
-                cost_source=cost_result.source,
-                billing_provider=agent.provider,
-                billing_base_url=agent.base_url,
-                billing_mode="subscription_included"
-                if cost_result.status == "included" else None,
-                model=agent.model,
-                api_call_count=1,
-            )
-        except Exception as exc:
-            logger.debug(
-                "Codex app-server token persistence failed (session=%s, tokens=%d): %s",
-                agent.session_id, total_tokens, exc,
-            )
-
-    return {
-        **usage_dict,
-        "last_prompt_tokens": prompt_tokens,
-        "estimated_cost_usd": float(cost_result.amount_usd)
-        if cost_result.amount_usd is not None else None,
-        "cost_status": cost_result.status,
-        "cost_source": cost_result.source,
-    }
-
 
 def _record_codex_app_server_compaction(
     agent,
@@ -269,8 +180,24 @@ def _record_codex_app_server_compaction(
         compressor.last_compression_rough_tokens = approx_tokens or 0
         if not getattr(turn, "token_usage_last", None):
             compressor.last_prompt_tokens = -1
-            compressor.last_completion_tokens = 0
             compressor.awaiting_real_usage_after_compression = True
+
+    session_db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    if session_db and session_id:
+        try:
+            session_db.set_compression_count(
+                session_id,
+                getattr(compressor, "compression_count", 0)
+                if compressor is not None
+                else 0,
+            )
+        except Exception:
+            logger.debug(
+                "Codex app-server compaction persistence failed (session=%s)",
+                session_id,
+                exc_info=True,
+            )
 
     agent._last_compaction_in_place = False
     try:
@@ -317,6 +244,12 @@ def run_codex_app_server_turn(
     from agent.transports.codex_app_server_session import (
         CodexAppServerSession,
         _ServerRequestRouting,
+    )
+    from agent.session_telemetry import (
+        apply_telemetry_result_fields,
+        begin_pending_request,
+        clear_pending_request_during_unwind,
+        clear_pending_request_on_success,
     )
 
     # Lazy session: one CodexAppServerSession per AIAgent instance.
@@ -386,6 +319,24 @@ def run_codex_app_server_turn(
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
+    # Codex bypasses the default provider loop, so it owns the same pending
+    # lifecycle explicitly. Estimate the actual projected request prefix and
+    # publish it immediately adjacent to run_turn().
+    try:
+        from agent.model_metadata import estimate_request_tokens_rough
+
+        pending_tokens = estimate_request_tokens_rough(
+            messages,
+            system_prompt=getattr(agent, "_cached_system_prompt", "") or "",
+            tools=getattr(agent, "tools", None) or None,
+        )
+    except Exception:
+        pending_tokens = getattr(
+            getattr(agent, "context_compressor", None),
+            "last_prompt_tokens",
+            0,
+        )
+    pending_generation = begin_pending_request(agent, pending_tokens)
     try:
         turn = agent._codex_session.run_turn(user_input=user_message)
     except Exception as exc:
@@ -397,7 +348,10 @@ def run_codex_app_server_turn(
         except Exception:
             pass
         agent._codex_session = None
-        return {
+        # Clear before returning the direct runtime error result so its
+        # compatibility projection is terminal too.
+        clear_pending_request_on_success(agent, pending_generation)
+        result = {
             "final_response": (
                 f"Codex app-server turn failed: {exc}. "
                 f"Fall back to default runtime with `/codex-runtime auto`."
@@ -408,6 +362,12 @@ def run_codex_app_server_turn(
             "partial": True,
             "error": str(exc),
         }
+        return apply_telemetry_result_fields(result, agent)
+    except BaseException:
+        clear_pending_request_during_unwind(agent, pending_generation)
+        raise
+    else:
+        clear_pending_request_on_success(agent, pending_generation)
 
     # If the turn signalled the underlying client is wedged (deadline
     # blown, post-tool watchdog tripped, OAuth refresh died, subprocess
@@ -464,7 +424,12 @@ def run_codex_app_server_turn(
         getattr(agent, "_iters_since_skill", 0) + turn.tool_iterations
     )
     _record_codex_app_server_compaction(agent, turn)
-    usage_result = _record_codex_app_server_usage(agent, turn)
+    accepted = not turn.interrupted and turn.error is None
+    usage_result = _record_codex_app_server_usage(
+        agent,
+        turn,
+        accepted=accepted,
+    )
     api_calls = 1
 
     # Now check the skill nudge AFTER iters were incremented — same
@@ -508,7 +473,19 @@ def run_codex_app_server_turn(
         except Exception:
             logger.debug("background review spawn raised", exc_info=True)
 
-    return {
+    # The DB is canonical; JSON is a compatibility projection. Refresh it only
+    # after projected messages, usage, compaction, and terminal classification
+    # have all settled so its terminal assistant and counters agree.
+    if getattr(agent, "_session_json_enabled", False):
+        try:
+            agent._save_session_log(messages)
+        except Exception:
+            logger.debug(
+                "codex app-server final JSON projection failed",
+                exc_info=True,
+            )
+
+    result = {
         "final_response": turn.final_text,
         "messages": messages,
         "api_calls": api_calls,
@@ -531,6 +508,7 @@ def run_codex_app_server_turn(
         "codex_turn_id": turn.turn_id,
         **usage_result,
     }
+    return apply_telemetry_result_fields(result, agent)
 
 
 # ---------------------------------------------------------------------------

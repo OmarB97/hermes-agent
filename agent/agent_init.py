@@ -40,6 +40,7 @@ from agent.model_metadata import (
     query_ollama_num_ctx,
 )
 from agent.process_bootstrap import _install_safe_stdio
+from agent.session_telemetry import new_pending_owner
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.think_scrubber import StreamingThinkScrubber
 from agent.tool_guardrails import (
@@ -2085,6 +2086,18 @@ def init_agent(
     agent.session_completion_tokens = 0
     agent.session_total_tokens = 0
     agent.session_api_calls = 0
+    # Rough request-size estimate while an LLM call is in flight. Mirrored to
+    # state.db and opt-in session JSON; zero means no request is pending.
+    agent.pending_prompt_tokens = 0
+    # Pending requests are fenced by a process-instance owner and monotonic
+    # SQLite generation.  The hydration marker is reset on /new, /resume, and
+    # /branch so an existing row restores its counters before early JSON writes.
+    agent._session_telemetry_owner = new_pending_owner()
+    agent._session_telemetry_hydrated_session_id = None
+    agent._pending_generation = 0
+    agent._pending_owner = None
+    agent._pending_started_at = 0.0
+    agent._session_json_pending_compaction_epoch = 0
     agent.session_input_tokens = 0
     agent.session_output_tokens = 0
     agent.session_cache_read_tokens = 0
