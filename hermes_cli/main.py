@@ -338,7 +338,16 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # Falls back to ~/.hermes/active_profile for sticky default.
 # ---------------------------------------------------------------------------
 def _apply_profile_override() -> None:
-    """Pre-parse --profile/-p and set HERMES_HOME before imports."""
+    """Pre-parse --profile/-p and set HERMES_HOME before module imports."""
+
+    # MeshBoard and other launchers can supply an isolated HERMES_HOME whose
+    # dotenv redirects model traffic through a per-dispatch telemetry proxy.
+    # Honour that sandbox verbatim when the launcher explicitly owns profile
+    # selection; otherwise a sticky active_profile silently replaces it before
+    # dotenv loading and bypasses the proxy.
+    if os.environ.get("HERMES_SKIP_PROFILE_OVERRIDE", "").strip() == "1":
+        return
+
     argv = sys.argv[1:]
     profile_name = None
     consume = 0

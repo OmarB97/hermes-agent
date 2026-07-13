@@ -241,6 +241,30 @@ class TestApplyProfileOverrideHermesHomeGuard:
         assert result.endswith("coder")
         assert sys.argv == ["hermes", "--continue"]
 
+    def test_skip_profile_override_preserves_launcher_sandbox(
+        self, tmp_path, monkeypatch
+    ):
+        """An explicit launcher sandbox must win over sticky active_profile."""
+        hermes_root = tmp_path / ".hermes"
+        profile_dir = hermes_root / "profiles" / "glm"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        (hermes_root / "active_profile").write_text("glm")
+
+        sandbox = tmp_path / "meshboard-dispatch-sandbox"
+        sandbox.mkdir()
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(sandbox))
+        monkeypatch.setenv("HERMES_SKIP_PROFILE_OVERRIDE", "1")
+        monkeypatch.setattr(sys, "argv", ["hermes", "-z", "review task"])
+
+        from hermes_cli.main import _apply_profile_override
+
+        _apply_profile_override()
+
+        assert os.environ.get("HERMES_HOME") == str(sandbox)
+        assert sys.argv == ["hermes", "-z", "review task"]
+
 
 class TestSupervisedChildIgnoresStickyProfile:
     """The reserved default gateway s6 slot must not follow active_profile.
@@ -322,4 +346,3 @@ class TestSupervisedChildIgnoresStickyProfile:
         result = os.environ.get("HERMES_HOME")
         assert result is not None
         assert result.endswith("coder")
-
