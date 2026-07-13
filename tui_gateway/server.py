@@ -10553,7 +10553,6 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         except Exception:
             pass
     turn = session.get("inflight_turn") or {}
-    _emit("message.start", sid, {"turn_id": turn.get("id")})
 
     def run():
         approval_token = None
@@ -10593,6 +10592,19 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             # the NEXT turn, after the finally-restore below.
             if not one_turn_restore:
                 _sync_agent_model_with_config(sid, session)
+            # Cached desktop/TUI agents survive config edits. Refresh the
+            # exact fallback boundary while the session's profile override is
+            # active, then publish it before the UI marks the request as
+            # started. A refresh still runs inside run_conversation as the
+            # enforcement backstop; this preflight keeps operator telemetry
+            # aligned with that boundary before any model request can leave.
+            refresh_fallback_policy = getattr(
+                agent, "_refresh_fallback_policy", None
+            )
+            if callable(refresh_fallback_policy):
+                refresh_fallback_policy()
+            _emit("session.info", sid, _session_info(agent, session))
+            _emit("message.start", sid, {"turn_id": turn.get("id")})
             cwd = _session_cwd(session)
             _register_session_cwd(session)
             cols = session.get("cols", 80)
