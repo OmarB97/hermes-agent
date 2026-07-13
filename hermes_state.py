@@ -5702,6 +5702,7 @@ class SessionDB:
     def surfaced_session_count(
         self,
         source: str = None,
+        cwd_prefix: str = None,
         min_message_count: int = 0,
         include_archived: bool = False,
         archived_only: bool = False,
@@ -5712,6 +5713,7 @@ class SessionDB:
         if not exclude_children:
             return self.session_count(
                 source=source,
+                cwd_prefix=cwd_prefix,
                 min_message_count=min_message_count,
                 include_archived=include_archived,
                 archived_only=archived_only,
@@ -5728,6 +5730,10 @@ class SessionDB:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")
             params.extend(exclude_sources)
+        if cwd_prefix:
+            clause, clause_params = _cwd_prefix_clause(cwd_prefix)
+            where_clauses.append(clause)
+            params.extend(clause_params)
         if min_message_count > 0:
             where_clauses.append("s.message_count >= ?")
             params.append(min_message_count)
