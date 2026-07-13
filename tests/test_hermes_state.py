@@ -860,6 +860,111 @@ class TestSessionLifecycle:
 
 
 # =========================================================================
+# Prompt-safe terminal turn outcomes
+# =========================================================================
+
+
+class TestTurnOutcomes:
+    def test_idempotent_prompt_safe_round_trip_and_cascade(self, db):
+        db.create_session(session_id="s1", source="tui", model="target-model")
+        db.append_message("s1", role="user", content="keep prompt history clean")
+
+        inserted = db.record_turn_outcome(
+            "s1",
+            "turn-1",
+            user_ordinal=0,
+            status="failed",
+            reason="HTTP 502 after retries",
+            model="target-model",
+            provider="local",
+            text="turn:failed · local/target-model · HTTP 502 after retries",
+            started_at=10.0,
+            completed_at=12.0,
+        )
+        duplicate = db.record_turn_outcome(
+            "s1",
+            "turn-1",
+            user_ordinal=0,
+            status="completed",
+            reason="late duplicate",
+            model="other",
+            provider="other",
+            text="must not replace the first outcome",
+            started_at=10.0,
+            completed_at=13.0,
+        )
+
+        assert inserted is True
+        assert duplicate is False
+        conversation = db.get_messages_as_conversation("s1")
+        assert [(row["role"], row["content"]) for row in conversation] == [
+            ("user", "keep prompt history clean")
+        ]
+        assert db.get_turn_outcomes("s1") == [
+            {
+                "active": 1,
+                "completed_at": 12.0,
+                "model": "target-model",
+                "provider": "local",
+                "reason": "HTTP 502 after retries",
+                "session_id": "s1",
+                "started_at": 10.0,
+                "status": "failed",
+                "text": "turn:failed · local/target-model · HTTP 502 after retries",
+                "turn_id": "turn-1",
+                "user_ordinal": 0,
+            }
+        ]
+
+        assert db.delete_session("s1") is True
+        assert db.get_turn_outcomes("s1") == []
+
+    def test_rewind_deactivates_outcomes_at_and_after_ordinal(self, db):
+        db.create_session(session_id="s1", source="tui")
+        for ordinal in range(3):
+            db.record_turn_outcome(
+                "s1",
+                f"turn-{ordinal}",
+                user_ordinal=ordinal,
+                status="completed",
+                reason="response delivered",
+                model="model",
+                provider="provider",
+                text=f"turn:completed · provider/model · response {ordinal}",
+                started_at=float(ordinal),
+                completed_at=float(ordinal + 1),
+            )
+
+        assert db.deactivate_turn_outcomes_from_ordinal("s1", 1) == 2
+        assert [row["turn_id"] for row in db.get_turn_outcomes("s1")] == ["turn-0"]
+        assert [
+            (row["turn_id"], row["active"])
+            for row in db.get_turn_outcomes("s1", include_inactive=True)
+        ] == [("turn-0", 1), ("turn-1", 0), ("turn-2", 0)]
+
+    def test_outcome_only_session_is_not_empty_cleanup_candidate(self, db):
+        db.create_session(session_id="s1", source="tui")
+        db.record_turn_outcome(
+            "s1",
+            "turn-init-failed",
+            user_ordinal=0,
+            status="failed",
+            reason="agent initialization failed",
+            model="unknown model",
+            provider="unknown provider",
+            text="turn:failed · unknown provider/unknown model · agent initialization failed",
+            started_at=1.0,
+            completed_at=2.0,
+        )
+        db.end_session("s1", "tui_close")
+
+        assert db.count_empty_sessions() == 0
+        assert db.delete_empty_sessions() == 0
+        assert db.delete_session_if_empty("s1") is False
+        assert db.get_session("s1") is not None
+
+
+# =========================================================================
 # Message storage
 # =========================================================================
 

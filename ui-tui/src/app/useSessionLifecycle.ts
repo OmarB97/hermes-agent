@@ -58,7 +58,11 @@ export const liveSessionInflightMessages = (inflight?: null | SessionInflightTur
   return user ? [{ role: 'user', text: user }] : []
 }
 
-export const hydrateLiveSessionInflight = (inflight?: null | SessionInflightTurn) => {
+export const hydrateLiveSessionInflight = (
+  inflight?: null | SessionInflightTurn,
+  messages: SessionActivateResponse['messages'] = []
+) => {
+  turnController.hydrateTurnOutcomes(inflight, messages)
   const assistant = String(inflight?.assistant ?? '')
 
   if (!assistant && !inflight?.streaming) {
@@ -339,7 +343,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             status: statusFromLiveSession(r.status, running),
             usage: usageFrom(info)
           })
-          hydrateLiveSessionInflight(r.inflight)
+          hydrateLiveSessionInflight(r.inflight, r.messages)
           cancelResumeScrollRef.current?.()
           cancelResumeScrollRef.current = scheduleResumeScrollToBottom(scrollRef)
         })
@@ -393,7 +397,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
               status: statusFromLiveSession(r.status, running),
               usage: usageFrom(info)
             })
-            hydrateLiveSessionInflight(r.inflight)
+            hydrateLiveSessionInflight(r.inflight, r.messages)
             cancelResumeScrollRef.current?.()
             cancelResumeScrollRef.current = scheduleResumeScrollToBottom(scrollRef)
 

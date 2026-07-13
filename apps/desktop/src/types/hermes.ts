@@ -428,19 +428,38 @@ export interface SessionMessage {
   tool_call_id?: null | string
   tool_calls?: unknown
   tool_name?: string
+  /** UI-only terminal metadata; never part of the model conversation. */
+  turn_outcome?: SessionTurnOutcome
+}
+
+export interface SessionTurnOutcome {
+  completed_at: number
+  id?: string
+  model: string
+  provider: string
+  reason: string
+  started_at: number
+  status: 'cancelled' | 'completed' | 'failed' | 'fallback' | 'timed_out'
+  text: string
+  turn_id?: string
+  user_ordinal: number
 }
 
 export interface SessionMessagesResponse {
   messages: SessionMessage[]
   session_id: string
+  turn_outcomes?: SessionTurnOutcome[]
+}
+
+export interface SessionInflightTurn {
+  assistant?: string
+  streaming?: boolean
+  turn_id?: string
+  user?: string
 }
 
 export interface SessionResumeResponse {
-  inflight?: null | {
-    assistant?: string
-    streaming?: boolean
-    user?: string
-  }
+  inflight?: null | SessionInflightTurn
   queued?: null | {
     user?: string
   }

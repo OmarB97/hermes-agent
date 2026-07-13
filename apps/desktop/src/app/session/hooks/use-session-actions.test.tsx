@@ -4,6 +4,7 @@ import { useEffect } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { getSessionMessages, type SessionInfo } from '@/hermes'
+import type { ChatMessage } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile } from '@/store/profile'
 import { $projectScope, $projectTree, ALL_PROJECTS } from '@/store/projects'
@@ -32,6 +33,7 @@ import {
   setSelectedStoredSessionId,
   setSessions
 } from '@/store/session'
+import type { SessionResumeResponse } from '@/types/hermes'
 
 import { sessionRoute } from '../../routes'
 import type { ClientSessionState } from '../../types'
@@ -69,6 +71,12 @@ type HarnessHandle = Pick<
   'createBackendSessionForSend' | 'startFreshSessionDraft'
 >
 
+type HydrateTurnOutcomeState = (
+  sessionId: string,
+  inflight?: SessionResumeResponse['inflight'],
+  messages?: ChatMessage[]
+) => void
+
 function storedSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
   return {
     ended_at: null,
@@ -105,6 +113,7 @@ function Harness({
     ensureSessionState: () => ({}) as ClientSessionState,
     getRouteToken: () => 'token',
     getRoutedStoredSessionId: () => null,
+    hydrateTurnOutcomeState: vi.fn(),
     navigate: vi.fn() as never,
     requestGateway,
     resetViewSync: vi.fn(),
@@ -458,6 +467,7 @@ describe('createBackendSessionForSend profile routing', () => {
 // succeeds must NOT leave the flag armed.
 function ResumeHarness({
   onStateUpdate,
+  hydrateTurnOutcomeState = vi.fn<HydrateTurnOutcomeState>(),
   onReady,
   requestGateway,
   runtimeIdByStoredSessionIdRef,
@@ -465,6 +475,7 @@ function ResumeHarness({
   sessionStateByRuntimeIdRef
 }: {
   onStateUpdate?: (sessionId: string, state: ClientSessionState) => void
+  hydrateTurnOutcomeState?: HydrateTurnOutcomeState
   onReady: (resume: (storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) => void
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
   runtimeIdByStoredSessionIdRef?: MutableRefObject<Map<string, string>>
@@ -481,6 +492,7 @@ function ResumeHarness({
     ensureSessionState: () => ({}) as ClientSessionState,
     getRouteToken: () => 'token',
     getRoutedStoredSessionId: () => null,
+    hydrateTurnOutcomeState,
     navigate: vi.fn() as never,
     requestGateway,
     resetViewSync: vi.fn(),
@@ -517,6 +529,7 @@ describe('resumeSession failure recovery', () => {
   async function runResume(
     requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>,
     options: {
+      hydrateTurnOutcomeState?: HydrateTurnOutcomeState
       runtimeIdByStoredSessionIdRef?: MutableRefObject<Map<string, string>>
       sessionStateByRuntimeIdRef?: MutableRefObject<Map<string, ClientSessionState>>
     } = {}
@@ -526,6 +539,39 @@ describe('resumeSession failure recovery', () => {
     await waitFor(() => expect(resume).not.toBeNull())
     await resume!('stored-1', true)
   }
+
+  it('hydrates the resumed in-flight turn identity and persisted outcomes', async () => {
+    const hydrateTurnOutcomeState = vi.fn<HydrateTurnOutcomeState>()
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.resume') {
+        return {
+          inflight: { assistant: 'partial', streaming: true, turn_id: 'live-turn', user: 'hello' },
+          info: {},
+          messages: [
+            {
+              role: 'system',
+              text: 'turn:failed · provider/model · stored failure',
+              turn_outcome: { id: 'stored-turn' }
+            }
+          ],
+          running: true,
+          session_id: 'runtime-1'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    await runResume(requestGateway, { hydrateTurnOutcomeState })
+
+    expect(hydrateTurnOutcomeState).toHaveBeenCalledTimes(1)
+    expect(hydrateTurnOutcomeState).toHaveBeenCalledWith(
+      'runtime-1',
+      expect.objectContaining({ turn_id: 'live-turn' }),
+      expect.arrayContaining([expect.objectContaining({ id: 'turn-outcome:stored-turn' })])
+    )
+  })
 
   it('arms $resumeFailedSessionId when resume RPC and REST fallback both fail', async () => {
     // session.resume rejects (e.g. timeout against a wedged backend)...
@@ -887,6 +933,7 @@ function BranchHarness({
     ensureSessionState: () => ({}) as ClientSessionState,
     getRouteToken: () => 'token',
     getRoutedStoredSessionId: () => null,
+    hydrateTurnOutcomeState: vi.fn(),
     navigate: vi.fn() as never,
     requestGateway,
     resetViewSync: vi.fn(),

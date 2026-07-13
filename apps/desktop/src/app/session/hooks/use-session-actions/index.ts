@@ -60,7 +60,13 @@ import {
 } from '@/store/session-states'
 import { broadcastSessionsChanged } from '@/store/session-sync'
 import { isWatchWindow } from '@/store/windows'
-import type { SessionCreateResponse, SessionInfo, SessionResumeResponse, UsageStats } from '@/types/hermes'
+import type {
+  SessionCreateResponse,
+  SessionInfo,
+  SessionResumeResponse,
+  SessionTurnOutcome,
+  UsageStats
+} from '@/types/hermes'
 
 import { NEW_CHAT_ROUTE, sessionRoute, SETTINGS_ROUTE } from '../../../routes'
 import type { ClientSessionState, SidebarNavItem } from '../../../types'
@@ -102,6 +108,11 @@ interface SessionActionsOptions {
   ensureSessionState: (sessionId: string, storedSessionId?: string | null) => ClientSessionState
   getRouteToken: () => string
   getRoutedStoredSessionId: () => null | string
+  hydrateTurnOutcomeState: (
+    sessionId: string,
+    inflight?: SessionResumeResponse['inflight'],
+    messages?: ChatMessage[]
+  ) => void
   navigate: NavigateFunction
   onFreshDraftRouteIntent?: () => void
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
@@ -140,9 +151,10 @@ function reconcileAuthoritativeMessages(
   authoritativeMessages: SessionResumeResponse['messages'],
   previousMessages: ChatMessage[],
   storedSessionId: string,
-  liveProjection?: Pick<SessionResumeResponse, 'inflight' | 'queued' | 'session_id'>
+  liveProjection?: Pick<SessionResumeResponse, 'inflight' | 'queued' | 'session_id'>,
+  turnOutcomes?: SessionTurnOutcome[]
 ): ChatMessage[] {
-  const authoritative = restoreFallbackNotices(storedSessionId, toChatMessages(authoritativeMessages))
+  const authoritative = restoreFallbackNotices(storedSessionId, toChatMessages(authoritativeMessages, turnOutcomes))
   const withLiveProjection = liveProjection ? appendLiveSessionProjection(authoritative, liveProjection) : authoritative
   const reconciled = reconcileResumeMessages(withLiveProjection, previousMessages)
   const withPendingTurn = preserveLocalPendingTurnMessages(reconciled, previousMessages)
@@ -206,6 +218,7 @@ export function useSessionActions({
   ensureSessionState,
   getRouteToken,
   getRoutedStoredSessionId,
+  hydrateTurnOutcomeState,
   navigate,
   onFreshDraftRouteIntent,
   requestGateway,
@@ -810,19 +823,21 @@ export function useSessionActions({
           if (prefetchPromise) {
             const storedMessages = await prefetchPromise
 
-              if (isCurrentResume()) {
-                const previousMessages = resumedSameSelectedSession
-                  ? preserveLocalPendingTurnMessages($messages.get(), resumeStartMessages)
-                  : $messages.get()
+            if (isCurrentResume()) {
+              const previousMessages = resumedSameSelectedSession
+                ? preserveLocalPendingTurnMessages($messages.get(), resumeStartMessages)
+                : $messages.get()
 
-                localSnapshot = reconcileAuthoritativeMessages(
-                  storedMessages.messages,
-                  previousMessages,
-                  storedSessionId
-                )
-                prefetchApplied = true
-                prefetchedMessageCount = storedMessages.messages.length
-                prefetchedStoredSessionId = storedMessages.session_id || storedSessionId
+              localSnapshot = reconcileAuthoritativeMessages(
+                storedMessages.messages,
+                previousMessages,
+                storedSessionId,
+                undefined,
+                storedMessages.turn_outcomes
+              )
+              prefetchApplied = true
+              prefetchedMessageCount = storedMessages.messages.length
+              prefetchedStoredSessionId = storedMessages.session_id || storedSessionId
 
               if (!chatMessageArraysEquivalent($messages.get(), localSnapshot)) {
                 setMessages(localSnapshot)
@@ -897,7 +912,8 @@ export function useSessionActions({
 
         patchSessionWorkspace(storedSessionId, runtimeInfo?.cwd)
 
-        resumedRunning = Boolean((resumed as { running?: boolean }).running)
+        resumedRunning = Boolean(resumed.running)
+        hydrateTurnOutcomeState(resumed.session_id, resumed.inflight, messagesForView)
 
         updateSessionState(
           resumed.session_id,
@@ -936,7 +952,15 @@ export function useSessionActions({
             ? preserveLocalPendingTurnMessages($messages.get(), resumeStartMessages)
             : $messages.get()
 
-          setMessages(reconcileAuthoritativeMessages(fallback.messages, previousMessages, storedSessionId))
+          setMessages(
+            reconcileAuthoritativeMessages(
+              fallback.messages,
+              previousMessages,
+              storedSessionId,
+              undefined,
+              fallback.turn_outcomes
+            )
+          )
         } catch (e) {
           // Fallback also failed: nothing to paint. Leave whatever messages are
           // already shown and fall through to arm the resume-failure latch so
@@ -996,6 +1020,7 @@ export function useSessionActions({
       activeSessionIdRef,
       busyRef,
       copy,
+      hydrateTurnOutcomeState,
       requestGateway,
       resetViewSync,
       runtimeIdByStoredSessionIdRef,

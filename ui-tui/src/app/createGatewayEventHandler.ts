@@ -90,7 +90,6 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
   let pendingThinkingStatus = ''
   let thinkingStatusTimer: null | ReturnType<typeof setTimeout> = null
   let startupPromptSubmitted = false
-
   // Request IDs of clarify prompts we've already flushed to the transcript as
   // an abandoned-prompt record, so the tool.complete and message.complete
   // paths can't both persist the same prompt twice.
@@ -457,6 +456,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       case 'message.start':
         resetAgentsNudgeTurnState()
         turnController.startMessage()
+        turnController.startTurnOutcome(ev.payload?.turn_id)
 
         return
       case 'status.update': {
@@ -976,6 +976,35 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         if (ev.payload?.usage) {
           patchUiState(state => ({ ...state, usage: { ...state.usage, ...ev.payload!.usage } }))
         }
+
+        return
+      }
+
+      case 'turn.outcome': {
+        const turnId = String(ev.payload?.turn_id ?? ev.payload?.id ?? '').trim()
+        const text = String(ev.payload?.text ?? '').trim()
+
+        if (!turnId || !text) {
+          return
+        }
+
+        const { duplicate, settlesCurrentTurn } = turnController.acceptTurnOutcome(turnId)
+
+        if (duplicate) {
+          return
+        }
+
+        if (settlesCurrentTurn) {
+          const { finalMessages, wasInterrupted } = turnController.recordMessageComplete({})
+
+          if (!wasInterrupted) {
+            finalMessages.forEach(appendMessage)
+          }
+
+          setStatus('ready')
+        }
+
+        appendMessage({ role: 'system', text })
 
         return
       }

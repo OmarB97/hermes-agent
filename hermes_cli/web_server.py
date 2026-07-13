@@ -10975,17 +10975,25 @@ async def get_session_messages(
             sid = db.resolve_resume_session_id(sid)
             # Clamp limit to prevent abuse (max 500 per page)
             _limit = min(limit, 500) if limit is not None else None
-            return sid, _limit, db.get_messages(sid, limit=_limit, offset=offset)
+            return (
+                sid,
+                _limit,
+                db.get_messages(sid, limit=_limit, offset=offset),
+                db.get_turn_outcomes(sid),
+            )
         finally:
             db.close()
 
     result = await asyncio.to_thread(_read)
     if result is None:
         raise HTTPException(status_code=404, detail="Session not found")
-    sid, _limit, messages = result
+    sid, _limit, messages, turn_outcomes = result
     return {
         "session_id": sid,
         "messages": messages,
+        # UI-only terminal metadata. This is intentionally separate from
+        # messages so REST hydration cannot feed it back into model context.
+        "turn_outcomes": turn_outcomes,
         "pagination": {
             "limit": _limit,
             "offset": offset,

@@ -5,7 +5,12 @@ import {
   STREAM_SCROLL_BATCH_MS,
   STREAM_TYPING_BATCH_MS
 } from '../config/timing.js'
-import type { SessionInterruptResponse, SubagentEventPayload } from '../gatewayTypes.js'
+import type {
+  GatewayTranscriptMessage,
+  SessionInflightTurn,
+  SessionInterruptResponse,
+  SubagentEventPayload
+} from '../gatewayTypes.js'
 import { appendToolShelfMessage, isToolShelfMessage } from '../lib/liveProgress.js'
 import { hasReasoningTag, splitReasoning } from '../lib/reasoning.js'
 import {
@@ -128,10 +133,12 @@ class TurnController {
   private reasoningSegmentIndex: null | number = null
   private interimBoundaryIndex: null | number = null
   private activityId = 0
+  private activeTurnId = ''
   private reasoningStreamingTimer: Timer = null
   private reasoningTimer: Timer = null
   private streamTimer: Timer = null
   private streamDelay = STREAM_IDLE_BATCH_MS
+  private seenTurnOutcomeIds = new Set<string>()
   private toolProgressTimer: Timer = null
 
   // ── Credits notice machinery (Strategy B) ───────────────────────────
@@ -144,6 +151,61 @@ class TurnController {
   private pendingNotice: Notice | null = null
   private noticeTimer: Timer = null
   private noticeIdSeq = 0
+
+  startTurnOutcome(turnId: unknown) {
+    this.activeTurnId = String(turnId ?? '').trim()
+  }
+
+  hydrateTurnOutcomes(
+    inflight?: null | SessionInflightTurn,
+    messages: GatewayTranscriptMessage[] = []
+  ) {
+    const activeTurnId = String(inflight?.turn_id ?? '').trim()
+
+    this.activeTurnId = activeTurnId
+
+    for (const message of messages) {
+      const outcomeId = String(message.turn_outcome?.turn_id ?? message.turn_outcome?.id ?? '').trim()
+
+      if (outcomeId) {
+        this.seenTurnOutcomeIds.add(outcomeId)
+      }
+    }
+
+    while (this.seenTurnOutcomeIds.size > 256) {
+      const oldest = this.seenTurnOutcomeIds.values().next().value
+
+      if (!oldest) {
+        break
+      }
+
+      this.seenTurnOutcomeIds.delete(oldest)
+    }
+  }
+
+  acceptTurnOutcome(turnId: string): { duplicate: boolean; settlesCurrentTurn: boolean } {
+    if (this.seenTurnOutcomeIds.has(turnId)) {
+      return { duplicate: true, settlesCurrentTurn: false }
+    }
+
+    this.seenTurnOutcomeIds.add(turnId)
+
+    if (this.seenTurnOutcomeIds.size > 256) {
+      const oldest = this.seenTurnOutcomeIds.values().next().value
+
+      if (oldest) {
+        this.seenTurnOutcomeIds.delete(oldest)
+      }
+    }
+
+    const settlesCurrentTurn = !this.activeTurnId || this.activeTurnId === turnId
+
+    if (settlesCurrentTurn) {
+      this.activeTurnId = ''
+    }
+
+    return { duplicate: false, settlesCurrentTurn }
+  }
 
   boostStreamingForTyping() {
     this.streamDelay = STREAM_TYPING_BATCH_MS
@@ -294,7 +356,7 @@ class TurnController {
   // while `interrupted`) instead of racing the still-unwinding turn — the race
   // duplicated the user bubble, leaked a "queued: …" note, and surfaced the
   // cancelled turn's "[interrupted]" reply.
-  interruptTurn({ appendMessage, gw, sid, sys }: InterruptDeps, opts: { keepBusy?: boolean } = {}) {
+  interruptTurn({ appendMessage, gw, sid }: InterruptDeps, opts: { keepBusy?: boolean } = {}) {
     this.interrupted = true
     gw.request<SessionInterruptResponse>('session.interrupt', { session_id: sid }).catch(() => {})
 
@@ -316,18 +378,14 @@ class TurnController {
       appendMessage(msg)
     }
 
-    // Always surface an interruption indicator — if there's an in-flight
-    // `partial` or pending tools, fold them into a single assistant message;
-    // otherwise emit a sys note so the transcript always records that the
-    // turn was cancelled, even when only prior `segments` were preserved.
+    // Preserve partial content, but do not synthesize an interruption marker.
+    // The gateway's canonical turn.outcome is the one terminal record.
     if (partial || tools.length) {
       appendMessage({
         role: 'assistant',
-        text: partial ? `${partial}\n\n*[interrupted]*` : '*[interrupted]*',
+        text: partial,
         ...(tools.length && { tools })
       })
-    } else {
-      sys('interrupted')
     }
 
     this.clearStatusTimer()
@@ -918,6 +976,7 @@ class TurnController {
     this.clearReasoning()
     this.clearStatusTimer()
     this.idle()
+    this.activeTurnId = ''
     this.bufRef = ''
     this.interrupted = false
     this.lastStatusNote = ''
@@ -927,6 +986,7 @@ class TurnController {
     this.reasoningSegmentIndex = null
     this.interimBoundaryIndex = null
     this.segmentMessages = []
+    this.seenTurnOutcomeIds.clear()
     this.turnTools = []
     this.toolTokenAcc = 0
     this.persistedToolLabels.clear()
