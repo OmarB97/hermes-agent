@@ -20,6 +20,10 @@ export interface GatewayTranscriptMessage {
   name?: string
   role: 'assistant' | 'system' | 'tool' | 'user'
   text?: string
+  turn_outcome?: {
+    id?: string
+    turn_id?: string
+  }
 }
 
 // ── Commands / completion ────────────────────────────────────────────
@@ -261,6 +265,7 @@ export interface SessionActiveListResponse {
 export interface SessionInflightTurn {
   assistant?: string
   streaming?: boolean
+  turn_id?: string
   user?: string
 }
 
@@ -618,7 +623,7 @@ export type GatewayEvent =
   | { payload?: GatewaySkin; session_id?: string; type: 'skin.changed' }
   | { payload: SessionInfo; session_id?: string; type: 'session.info' }
   | { payload?: { text?: string }; session_id?: string; type: 'thinking.delta' }
-  | { payload?: undefined; session_id?: string; type: 'message.start' }
+  | { payload?: { turn_id?: string }; session_id?: string; type: 'message.start' }
   | { payload?: { kind?: string; text?: string }; session_id?: string; type: 'status.update' }
   | {
       payload?: {
@@ -710,5 +715,21 @@ export type GatewayEvent =
       payload?: { reasoning?: string; rendered?: string; text?: string; usage?: Usage }
       session_id?: string
       type: 'message.complete'
+    }
+  | {
+      payload?: {
+        completed_at?: number
+        id?: string
+        model?: string
+        provider?: string
+        reason?: string
+        started_at?: number
+        status?: 'cancelled' | 'completed' | 'failed' | 'fallback' | 'timed_out'
+        text?: string
+        turn_id?: string
+        user_ordinal?: number
+      }
+      session_id?: string
+      type: 'turn.outcome'
     }
   | { payload?: { message?: string }; session_id?: string; type: 'error' }

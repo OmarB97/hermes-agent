@@ -167,6 +167,33 @@ describe('toChatMessages', () => {
     expect(messages[1].senderDevice).toBeUndefined()
     expect(messages[2].senderDevice).toBeUndefined()
   })
+
+  it('hydrates prompt-safe turn outcomes after their user turn with stable ids', () => {
+    const messages = toChatMessages(
+      [
+        { role: 'user', content: 'first', timestamp: 1 },
+        { role: 'assistant', content: 'answer', timestamp: 2 },
+        { role: 'user', content: 'second', timestamp: 3 }
+      ],
+      [
+        {
+          completed_at: 2.5,
+          model: 'model',
+          provider: 'provider',
+          reason: 'response delivered',
+          started_at: 1,
+          status: 'completed',
+          text: 'turn:completed · provider/model · response delivered',
+          turn_id: 'turn-1',
+          user_ordinal: 0
+        }
+      ]
+    )
+
+    expect(messages.map(message => message.role)).toEqual(['user', 'assistant', 'system', 'user'])
+    expect(messages[2].id).toBe('turn-outcome:turn-1')
+    expect(chatMessageText(messages[2])).toContain('turn:completed')
+  })
 })
 
 describe('renderMediaTags', () => {

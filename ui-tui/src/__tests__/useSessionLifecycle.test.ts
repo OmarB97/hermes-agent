@@ -43,7 +43,12 @@ describe('live session activation in-flight state', () => {
   })
 
   it('keeps the in-flight user prompt in history and hydrates partial assistant text', () => {
-    const inflight = { assistant: 'partial answer', streaming: true, user: 'write a long answer' }
+    const inflight = {
+      assistant: 'partial answer',
+      streaming: true,
+      turn_id: 'live-turn',
+      user: 'write a long answer'
+    }
 
     expect(liveSessionInflightMessages(inflight)).toEqual([{ role: 'user', text: 'write a long answer' }])
 
@@ -51,6 +56,14 @@ describe('live session activation in-flight state', () => {
 
     expect(turnController.bufRef).toBe('partial answer')
     expect(getTurnState().streaming).toBe('partial answer')
+    expect(turnController.acceptTurnOutcome('old-turn')).toEqual({
+      duplicate: false,
+      settlesCurrentTurn: false
+    })
+    expect(turnController.acceptTurnOutcome('live-turn')).toEqual({
+      duplicate: false,
+      settlesCurrentTurn: true
+    })
   })
 
   it('ignores empty in-flight payloads', () => {

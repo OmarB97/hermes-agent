@@ -122,7 +122,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -769,6 +769,20 @@ CREATE TABLE IF NOT EXISTS messages (
     compacted INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS turn_outcomes (
+    turn_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    user_ordinal INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    model TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    text TEXT NOT NULL,
+    started_at REAL NOT NULL,
+    completed_at REAL NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1
+);
+
 CREATE TABLE IF NOT EXISTS state_meta (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -804,6 +818,8 @@ CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(ex
 CREATE INDEX IF NOT EXISTS idx_messages_session_ts_max ON messages(session_id, timestamp DESC);
 -- Covering index for preview subquery (SELECT content WHERE session_id, role='user' ORDER BY timestamp, id LIMIT 1)
 CREATE INDEX IF NOT EXISTS idx_messages_session_role_ts_id ON messages(session_id, role, timestamp, id);
+CREATE INDEX IF NOT EXISTS idx_turn_outcomes_session_ordinal
+    ON turn_outcomes(session_id, active, user_ordinal, completed_at);
 """
 
 # Indexes that reference columns added in later schema versions must be
@@ -3859,6 +3875,115 @@ class SessionDB:
 
         return self._execute_write(_do)
 
+    def record_turn_outcome(
+        self,
+        session_id: str,
+        turn_id: str,
+        *,
+        user_ordinal: int,
+        status: str,
+        reason: str,
+        model: str,
+        provider: str,
+        text: str,
+        started_at: float,
+        completed_at: Optional[float] = None,
+    ) -> bool:
+        """Persist one UI-only terminal outcome for a conversation turn.
+
+        Outcomes live outside ``messages`` on purpose: they are durable display
+        metadata, not assistant/system prompt content, so replaying a session
+        never sends them to the model or invalidates the cached prefix.  The
+        ``turn_id`` primary key makes repeated/late completion paths idempotent.
+        Returns ``True`` only for the first insert.
+        """
+        allowed = {"cancelled", "completed", "failed", "fallback", "timed_out"}
+        normalized_status = str(status or "").strip().lower()
+        if normalized_status not in allowed:
+            raise ValueError(f"invalid turn outcome status: {status!r}")
+
+        normalized_turn_id = str(turn_id or "").strip()
+        normalized_session_id = str(session_id or "").strip()
+        if not normalized_turn_id or not normalized_session_id:
+            raise ValueError("session_id and turn_id are required")
+
+        try:
+            ordinal = max(0, int(user_ordinal))
+        except (TypeError, ValueError):
+            ordinal = 0
+        try:
+            started = float(started_at)
+        except (TypeError, ValueError):
+            started = time.time()
+        try:
+            completed = float(completed_at) if completed_at is not None else time.time()
+        except (TypeError, ValueError):
+            completed = time.time()
+
+        def _do(conn):
+            cursor = conn.execute(
+                """INSERT OR IGNORE INTO turn_outcomes (
+                       turn_id, session_id, user_ordinal, status, reason,
+                       model, provider, text, started_at, completed_at, active
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)""",
+                (
+                    normalized_turn_id,
+                    normalized_session_id,
+                    ordinal,
+                    normalized_status,
+                    str(reason or ""),
+                    str(model or ""),
+                    str(provider or ""),
+                    str(text or ""),
+                    started,
+                    completed,
+                ),
+            )
+            return cursor.rowcount == 1
+
+        return self._execute_write(_do)
+
+    def get_turn_outcomes(
+        self,
+        session_id: str,
+        *,
+        include_ancestors: bool = False,
+        include_inactive: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Return persisted terminal outcomes in transcript order."""
+        session_ids = [session_id]
+        if include_ancestors:
+            session_ids = self._session_lineage_root_to_tip(session_id)
+        active_clause = "" if include_inactive else " AND active = 1"
+        placeholders = ",".join("?" for _ in session_ids)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM turn_outcomes "
+                f"WHERE session_id IN ({placeholders}){active_clause} "
+                "ORDER BY user_ordinal, completed_at, turn_id",
+                tuple(session_ids),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def deactivate_turn_outcomes_from_ordinal(
+        self, session_id: str, user_ordinal: int
+    ) -> int:
+        """Hide outcomes removed by an edit/regenerate transcript rewind."""
+        try:
+            ordinal = max(0, int(user_ordinal))
+        except (TypeError, ValueError):
+            ordinal = 0
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE turn_outcomes SET active = 0 "
+                "WHERE session_id = ? AND active = 1 AND user_ordinal >= ?",
+                (session_id, ordinal),
+            )
+            return max(0, int(cursor.rowcount or 0))
+
+        return self._execute_write(_do)
+
     def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
         """Insert *messages* as fresh active rows for *session_id*.
 
@@ -5567,6 +5692,11 @@ class SessionDB:
                       SELECT 1 FROM messages WHERE messages.session_id = sessions.id
                   )
                   AND NOT EXISTS (
+                      SELECT 1 FROM turn_outcomes
+                      WHERE turn_outcomes.session_id = sessions.id
+                        AND turn_outcomes.active = 1
+                  )
+                  AND NOT EXISTS (
                       SELECT 1 FROM sessions child
                       WHERE child.parent_session_id = sessions.id
                   )
@@ -5666,9 +5796,10 @@ class SessionDB:
     def count_empty_sessions(self) -> int:
         """Return the count of empty, non-active, non-archived sessions.
 
-        "Empty" = ``message_count = 0`` AND the session has ended
-        (``ended_at IS NOT NULL``) AND is not archived. The ``ended_at``
-        guard matches the safety contract used by :meth:`prune_sessions`:
+        "Empty" = ``message_count = 0``, no active terminal outcomes, AND the
+        session has ended (``ended_at IS NOT NULL``) and is not archived. The
+        ``ended_at`` guard matches the safety contract used by
+        :meth:`prune_sessions`:
         only ended sessions are candidates for bulk deletion, so a freshly
         spawned session whose first message hasn't landed yet — or one
         held open by the live agent — is never sniped out from under
@@ -5684,7 +5815,11 @@ class SessionDB:
                 "SELECT COUNT(*) FROM sessions "
                 "WHERE message_count = 0 "
                 "AND ended_at IS NOT NULL "
-                "AND archived = 0"
+                "AND archived = 0 "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM turn_outcomes "
+                "WHERE turn_outcomes.session_id = sessions.id "
+                "AND turn_outcomes.active = 1)"
             )
             return cursor.fetchone()[0]
 
@@ -5724,7 +5859,11 @@ class SessionDB:
                 "SELECT id FROM sessions "
                 "WHERE message_count = 0 "
                 "AND ended_at IS NOT NULL "
-                "AND archived = 0"
+                "AND archived = 0 "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM turn_outcomes "
+                "WHERE turn_outcomes.session_id = sessions.id "
+                "AND turn_outcomes.active = 1)"
             )
             session_ids = {row["id"] for row in cursor.fetchall()}
 

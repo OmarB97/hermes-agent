@@ -24,6 +24,7 @@ import { dispatchNativeNotification } from '@/store/native-notifications'
 import { broadcastSessionsChanged } from '@/store/session-sync'
 import { upsertSubagent } from '@/store/subagents'
 import { setSessionTodos } from '@/store/todos'
+import type { SessionInflightTurn } from '@/types/hermes'
 
 import type { ClientSessionState } from '../../../types'
 
@@ -135,11 +136,42 @@ export function useMessageStream({
   const flushHandleRef = useRef<number | null>(null)
   const lastFlushAtRef = useRef<number>(0)
   const nativeSubagentSessionsRef = useRef<Set<string>>(new Set())
+  const activeTurnIdsRef = useRef(new Map<string, string>())
+  const seenTurnOutcomeIdsRef = useRef(new Set<string>())
   // Turns that auto-compacted: skip post-turn hydrate so live scrollback survives.
   const compactedTurnRef = useRef<Set<string>>(new Set())
   // Last session we applied a session.info cwd for — lets us tell an agent
   // relocating the SAME session (follow it) from a session switch (don't yank).
   const lastCwdInfoSessionRef = useRef<null | string>(null)
+
+  const hydrateTurnOutcomeState = useCallback(
+    (sessionId: string, inflight?: null | SessionInflightTurn, messages: ChatMessage[] = []) => {
+      const turnId = String(inflight?.turn_id ?? '').trim()
+
+      if (turnId) {
+        activeTurnIdsRef.current.set(sessionId, turnId)
+      } else {
+        activeTurnIdsRef.current.delete(sessionId)
+      }
+
+      for (const message of messages) {
+        if (message.id.startsWith('turn-outcome:')) {
+          seenTurnOutcomeIdsRef.current.add(message.id.slice('turn-outcome:'.length))
+        }
+      }
+
+      while (seenTurnOutcomeIdsRef.current.size > 256) {
+        const oldest = seenTurnOutcomeIdsRef.current.values().next().value
+
+        if (!oldest) {
+          break
+        }
+
+        seenTurnOutcomeIdsRef.current.delete(oldest)
+      }
+    },
+    []
+  )
 
   const flushQueuedDeltas = useCallback(
     (sessionId?: string) => {
@@ -517,6 +549,7 @@ export function useMessageStream({
     appendAssistantDelta,
     appendReasoningDelta,
     activeSessionIdRef,
+    activeTurnIdsRef,
     compactedTurnRef,
     lastCwdInfoSessionRef,
     nativeSubagentSessionsRef,
@@ -526,6 +559,7 @@ export function useMessageStream({
     queryClient,
     refreshHermesConfig,
     sessionInterrupted,
+    seenTurnOutcomeIdsRef,
     updateSessionState,
     upsertToolCall
   })
@@ -535,6 +569,7 @@ export function useMessageStream({
     appendReasoningDelta,
     completeAssistantMessage,
     handleGatewayEvent,
+    hydrateTurnOutcomeState,
     upsertToolCall
   }
 }

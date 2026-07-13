@@ -1243,6 +1243,111 @@ describe('createGatewayEventHandler', () => {
     ).toBe(false)
   })
 
+  it('renders one canonical cancelled outcome and no local interruption marker', () => {
+    const appended: Msg[] = []
+    const ctx = buildCtx(appended)
+    ctx.gateway.gw.request = vi.fn(async () => ({ status: 'interrupted' }))
+    const onEvent = createGatewayEventHandler(ctx)
+
+    patchUiState({ sid: 'sess-1' })
+    onEvent({ payload: { turn_id: 'turn-1' }, type: 'message.start' } as any)
+    onEvent({ payload: { text: 'partial answer' }, type: 'message.delta' } as any)
+    turnController.interruptTurn(
+      { appendMessage: (msg: Msg) => appended.push(msg), gw: ctx.gateway.gw, sid: 'sess-1', sys: ctx.system.sys },
+      { keepBusy: true }
+    )
+
+    expect(appended.some(message => message.text.includes('[interrupted]'))).toBe(false)
+    expect(getUiState().busy).toBe(true)
+
+    const outcome = {
+      payload: {
+        id: 'turn-1',
+        status: 'cancelled',
+        text: 'turn:cancelled · local-vllm/deepseek-v4-flash · user cancelled the turn'
+      },
+      type: 'turn.outcome'
+    } as any
+
+    onEvent(outcome)
+    onEvent(outcome)
+
+    expect(getUiState().busy).toBe(false)
+    expect(appended.filter(message => message.text.startsWith('turn:cancelled'))).toHaveLength(1)
+    expect(appended.some(message => message.text.includes('[interrupted]'))).toBe(false)
+  })
+
+  it('appends a delayed prior outcome without settling the newer turn', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({ payload: { turn_id: 'old-turn' }, type: 'message.start' } as any)
+    onEvent({ payload: { turn_id: 'new-turn' }, type: 'message.start' } as any)
+    expect(getUiState().busy).toBe(true)
+
+    onEvent({
+      payload: {
+        id: 'old-turn',
+        status: 'failed',
+        text: 'turn:failed · provider/model · delayed prior failure'
+      },
+      type: 'turn.outcome'
+    } as any)
+
+    expect(getUiState().busy).toBe(true)
+    expect(appended.filter(message => message.text.includes('delayed prior failure'))).toHaveLength(1)
+  })
+
+  it('hydrates the resumed turn id and dedupes persisted outcome replay', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    turnController.hydrateTurnOutcomes(
+      { streaming: true, turn_id: 'live-turn' },
+      [
+        {
+          role: 'system',
+          text: 'turn:failed · provider/model · stored failure',
+          turn_outcome: { id: 'stored-turn' }
+        }
+      ]
+    )
+    patchUiState({ busy: true })
+
+    onEvent({
+      payload: {
+        id: 'stored-turn',
+        status: 'failed',
+        text: 'turn:failed · provider/model · stored failure'
+      },
+      type: 'turn.outcome'
+    } as any)
+    onEvent({
+      payload: {
+        id: 'old-turn',
+        status: 'failed',
+        text: 'turn:failed · provider/model · delayed old failure'
+      },
+      type: 'turn.outcome'
+    } as any)
+
+    expect(getUiState().busy).toBe(true)
+    expect(appended.filter(message => message.text.includes('stored failure'))).toHaveLength(0)
+    expect(appended.filter(message => message.text.includes('delayed old failure'))).toHaveLength(1)
+
+    onEvent({
+      payload: {
+        id: 'live-turn',
+        status: 'completed',
+        text: 'turn:completed · provider/model · response delivered'
+      },
+      type: 'turn.outcome'
+    } as any)
+
+    expect(getUiState().busy).toBe(false)
+    expect(appended.filter(message => message.text.startsWith('turn:completed'))).toHaveLength(1)
+  })
+
   it('persists an abandoned (timed-out) clarify into the transcript when the clarify tool completes', () => {
     const appended: Msg[] = []
     const onEvent = createGatewayEventHandler(buildCtx(appended))

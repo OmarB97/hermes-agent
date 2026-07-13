@@ -4,6 +4,7 @@ import { useEffect } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { getSessionMessages, type SessionInfo } from '@/hermes'
+import type { ChatMessage } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { $activeGatewayProfile, $newChatProfile } from '@/store/profile'
 import {
@@ -16,6 +17,7 @@ import {
   setResumeFailedSessionId,
   setSessions
 } from '@/store/session'
+import type { SessionResumeResponse } from '@/types/hermes'
 
 import type { ClientSessionState } from '../../types'
 
@@ -31,6 +33,12 @@ vi.mock('@/hermes', async importOriginal => ({
 }))
 
 const RUNTIME_SESSION_ID = 'rt-new-001'
+
+type HydrateTurnOutcomeState = (
+  sessionId: string,
+  inflight?: SessionResumeResponse['inflight'],
+  messages?: ChatMessage[]
+) => void
 
 function storedSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
   return {
@@ -67,6 +75,7 @@ function Harness({
     creatingSessionRef: ref(false),
     ensureSessionState: () => ({}) as ClientSessionState,
     getRouteToken: () => 'token',
+    hydrateTurnOutcomeState: vi.fn(),
     navigate: vi.fn() as never,
     requestGateway,
     runtimeIdByStoredSessionIdRef: ref(new Map<string, string>()),
@@ -169,11 +178,13 @@ describe('createBackendSessionForSend profile routing', () => {
 // (b) arm $resumeFailedSessionId so use-route-resume can retry. A resume that
 // succeeds must NOT leave the flag armed.
 function ResumeHarness({
+  hydrateTurnOutcomeState = vi.fn<HydrateTurnOutcomeState>(),
   onReady,
   requestGateway,
   runtimeIdByStoredSessionIdRef,
   sessionStateByRuntimeIdRef
 }: {
+  hydrateTurnOutcomeState?: HydrateTurnOutcomeState
   onReady: (resume: (storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) => void
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
   runtimeIdByStoredSessionIdRef?: MutableRefObject<Map<string, string>>
@@ -188,6 +199,7 @@ function ResumeHarness({
     creatingSessionRef: ref(false),
     ensureSessionState: () => ({}) as ClientSessionState,
     getRouteToken: () => 'token',
+    hydrateTurnOutcomeState,
     navigate: vi.fn() as never,
     requestGateway,
     runtimeIdByStoredSessionIdRef: runtimeIdByStoredSessionIdRef ?? ref(new Map<string, string>()),
@@ -218,6 +230,7 @@ describe('resumeSession failure recovery', () => {
   async function runResume(
     requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>,
     options: {
+      hydrateTurnOutcomeState?: HydrateTurnOutcomeState
       runtimeIdByStoredSessionIdRef?: MutableRefObject<Map<string, string>>
       sessionStateByRuntimeIdRef?: MutableRefObject<Map<string, ClientSessionState>>
     } = {}
@@ -227,6 +240,39 @@ describe('resumeSession failure recovery', () => {
     await waitFor(() => expect(resume).not.toBeNull())
     await resume!('stored-1', true)
   }
+
+  it('hydrates the resumed in-flight turn identity and persisted outcomes', async () => {
+    const hydrateTurnOutcomeState = vi.fn<HydrateTurnOutcomeState>()
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.resume') {
+        return {
+          inflight: { assistant: 'partial', streaming: true, turn_id: 'live-turn', user: 'hello' },
+          info: {},
+          messages: [
+            {
+              role: 'system',
+              text: 'turn:failed · provider/model · stored failure',
+              turn_outcome: { id: 'stored-turn' }
+            }
+          ],
+          running: true,
+          session_id: 'runtime-1'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    await runResume(requestGateway, { hydrateTurnOutcomeState })
+
+    expect(hydrateTurnOutcomeState).toHaveBeenCalledTimes(1)
+    expect(hydrateTurnOutcomeState).toHaveBeenCalledWith(
+      'runtime-1',
+      expect.objectContaining({ turn_id: 'live-turn' }),
+      expect.arrayContaining([expect.objectContaining({ id: 'turn-outcome:stored-turn' })])
+    )
+  })
 
   it('arms $resumeFailedSessionId when resume RPC and REST fallback both fail', async () => {
     // session.resume rejects (e.g. timeout against a wedged backend)...
@@ -436,6 +482,7 @@ function BranchHarness({
     creatingSessionRef: ref(false),
     ensureSessionState: () => ({}) as ClientSessionState,
     getRouteToken: () => 'token',
+    hydrateTurnOutcomeState: vi.fn(),
     navigate: vi.fn() as never,
     requestGateway,
     runtimeIdByStoredSessionIdRef: ref(new Map<string, string>()),

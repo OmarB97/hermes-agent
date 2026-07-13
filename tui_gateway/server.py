@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -556,6 +557,15 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     """
     if not session or session.get("_finalized"):
         return
+    if isinstance(session.get("inflight_turn"), dict):
+        session["_turn_cancel_requested"] = True
+        session["_turn_cancel_reason"] = "session closed while the turn was running"
+        _finalize_turn_outcome(
+            str(session.get("_sid") or ""),
+            session,
+            status="cancelled",
+            reason=session["_turn_cancel_reason"],
+        )
     session["_finalized"] = True
     _release_active_session_slot(session)
     stop_event = session.get("_notif_stop")
@@ -1304,6 +1314,14 @@ def _status_update(sid: str, kind: str, text: str | None = None):
 
         if COMPACTION_STATUS_MARKER in body:
             out_kind = "compacting"
+    if out_kind == "fallback":
+        # Consume (but do not separately persist) the fallback-policy lane's
+        # latest decision.  The single terminal turn outcome folds this reason
+        # into its durable record, avoiding a second status-history system.
+        with _sessions_lock:
+            session = _sessions.get(sid)
+            if session is not None:
+                session["_turn_fallback_notice"] = body
     _emit("status.update", sid, {"kind": out_kind, "text": body})
 
 
@@ -5108,9 +5126,54 @@ def _coerce_message_text(content: Any) -> str:
     return str(content)
 
 
-def _history_to_messages(history: list[dict]) -> list[dict]:
+def _history_to_messages(
+    history: list[dict], turn_outcomes: list[dict] | None = None
+) -> list[dict]:
+    """Project prompt history plus UI-only outcomes into transcript rows.
+
+    ``turn_outcomes`` never enters ``history`` and is never returned to the
+    agent. It is merged only at this display boundary, after the user turn it
+    terminates (or at the end when an init failure left no prompt row).
+    """
     messages = []
     tool_call_args = {}
+    outcomes_by_ordinal: dict[int, list[dict]] = {}
+    for outcome in turn_outcomes or []:
+        if not isinstance(outcome, dict) or not outcome.get("text"):
+            continue
+        try:
+            ordinal = max(0, int(outcome.get("user_ordinal") or 0))
+        except (TypeError, ValueError):
+            ordinal = 0
+        outcomes_by_ordinal.setdefault(ordinal, []).append(outcome)
+    for rows in outcomes_by_ordinal.values():
+        rows.sort(
+            key=lambda row: (
+                float(row.get("completed_at") or 0),
+                str(row.get("turn_id") or row.get("id") or ""),
+            )
+        )
+
+    user_ordinal = -1
+    flushed_outcome_ordinals: set[int] = set()
+
+    def flush_outcomes(ordinal: int) -> None:
+        if ordinal < 0 or ordinal in flushed_outcome_ordinals:
+            return
+        flushed_outcome_ordinals.add(ordinal)
+        for outcome in outcomes_by_ordinal.get(ordinal, []):
+            turn_id = str(outcome.get("turn_id") or outcome.get("id") or "")
+            messages.append(
+                {
+                    "role": "system",
+                    "text": str(outcome.get("text") or ""),
+                    "timestamp": float(outcome.get("completed_at") or 0),
+                    "turn_outcome": {
+                        **outcome,
+                        "id": turn_id,
+                    },
+                }
+            )
 
     for m in history:
         if not isinstance(m, dict):
@@ -5118,6 +5181,9 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         role = m.get("role")
         if role not in {"user", "assistant", "tool", "system"}:
             continue
+        if role == "user":
+            flush_outcomes(user_ordinal)
+            user_ordinal += 1
         content_text = _coerce_message_text(m.get("content"))
         if role == "assistant" and m.get("tool_calls"):
             for tc in m["tool_calls"]:
@@ -5165,7 +5231,35 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
                     msg[key] = m.get(key)
         messages.append(msg)
 
+    flush_outcomes(user_ordinal)
+    # Agent-init failures can terminate before the prompt itself reaches the
+    # normal messages table. Keep those durable outcomes visible rather than
+    # dropping them merely because their ordinal has no prompt row to anchor to.
+    for ordinal in sorted(outcomes_by_ordinal):
+        flush_outcomes(ordinal)
+
     return messages
+
+
+def _turn_outcomes_for_display(
+    db: Any, session_id: str, *, include_ancestors: bool = False
+) -> list[dict]:
+    """Best-effort compatibility shim for display-only outcome hydration."""
+    getter = getattr(db, "get_turn_outcomes", None)
+    if not callable(getter):
+        return []
+    try:
+        rows = getter(session_id, include_ancestors=include_ancestors)
+    except TypeError:
+        # Small external/test DB adapters may expose only the legacy one-arg
+        # shape. They can still participate for non-lineage hydration.
+        if include_ancestors:
+            return []
+        rows = getter(session_id)
+    except Exception:
+        logger.debug("failed to load turn outcomes for display", exc_info=True)
+        return []
+    return rows if isinstance(rows, list) else []
 
 
 def _coerce_seed_history(value: Any) -> list[dict]:
@@ -5228,13 +5322,25 @@ def _inflight_text(value: Any) -> str:
 
 def _start_inflight_turn(session: dict, text: Any) -> None:
     now = time.time()
+    visible_history = list(session.get("display_history_prefix") or []) + list(
+        session.get("history") or []
+    )
     session["inflight_turn"] = {
         "assistant": "",
+        "id": uuid.uuid4().hex,
         "started_at": now,
         "streaming": True,
         "updated_at": now,
         "user": _inflight_text(text),
+        "user_ordinal": sum(
+            1
+            for message in visible_history
+            if isinstance(message, dict) and message.get("role") == "user"
+        ),
     }
+    session["_turn_cancel_reason"] = None
+    session["_turn_cancel_requested"] = False
+    session["_turn_fallback_notice"] = None
 
 
 def _append_inflight_delta(session: dict, delta: Any) -> None:
@@ -5254,7 +5360,235 @@ def _clear_inflight_turn(session: dict) -> None:
     session["inflight_turn"] = None
 
 
-def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
+_TURN_OUTCOME_STATUSES = {
+    "cancelled",
+    "completed",
+    "failed",
+    "fallback",
+    "timed_out",
+}
+_TURN_TIMEOUT_RE = re.compile(r"\b(?:readtimeout|timeout|timed[ -]?out)\b", re.IGNORECASE)
+
+
+def _safe_turn_outcome_text(value: Any, *, limit: int) -> str:
+    """Return bounded single-line terminal metadata with forced redaction."""
+    try:
+        from agent.redact import redact_sensitive_text
+
+        text = redact_sensitive_text(str(value or ""), force=True)
+    except Exception:
+        text = ""
+    return " ".join(text.split()).strip()[:limit]
+
+
+def _format_turn_outcome(payload: dict) -> str:
+    status = str(payload.get("status") or "failed")
+    label = {
+        "cancelled": "cancelled",
+        "completed": "completed",
+        "failed": "failed",
+        "fallback": "completed via fallback",
+        "timed_out": "timed out",
+    }.get(status, status.replace("_", " "))
+    provider = str(payload.get("provider") or "unknown provider")
+    model = str(payload.get("model") or "unknown model")
+    reason = str(payload.get("reason") or "no reason reported")
+    return f"turn:{label} · {provider}/{model} · {reason}"
+
+
+def _derive_turn_outcome(session: dict, result: Any) -> dict:
+    """Classify one agent result without adding anything to model history."""
+    row = result if isinstance(result, dict) else {"final_response": str(result or "")}
+    agent = session.get("agent")
+    raw = str(row.get("final_response") or "").strip()
+    error = str(row.get("error") or "").strip()
+    failure_reason = str(row.get("failure_reason") or "").strip().lower()
+    fallback_notice = str(session.get("_turn_fallback_notice") or "").strip()
+    cancel_reason = str(session.get("_turn_cancel_reason") or "").strip()
+    response_delivered = bool(raw) and row.get("completed") is not False and not any(
+        (row.get("error"), row.get("failed"), row.get("partial"), row.get("interrupted"))
+    )
+
+    model = row.get("model") or getattr(agent, "model", "") or "unknown model"
+    provider = row.get("provider") or getattr(agent, "provider", "") or "unknown provider"
+    model = _safe_turn_outcome_text(model, limit=160) or "unknown model"
+    provider = _safe_turn_outcome_text(provider, limit=80) or "unknown provider"
+
+    if session.get("_turn_cancel_requested"):
+        status = "cancelled"
+        reason = cancel_reason or "user cancelled the turn"
+    elif failure_reason in {"timeout", "timed_out"} or _TURN_TIMEOUT_RE.search(
+        " ".join((failure_reason, error))
+    ):
+        status = "timed_out"
+        reason = fallback_notice or error or raw or "model/provider request timed out"
+    elif row.get("interrupted"):
+        status = "cancelled"
+        reason = row.get("interrupt_message") or cancel_reason or "turn was interrupted"
+    elif (
+        response_delivered
+        and bool(getattr(agent, "_fallback_activated", False))
+    ):
+        status = "fallback"
+        reason = fallback_notice or "primary route failed; fallback response delivered"
+    elif response_delivered:
+        status = "completed"
+        reason = "response delivered"
+    else:
+        status = "failed"
+        reason = (
+            fallback_notice
+            or error
+            or raw
+            or "turn ended without a visible response"
+        )
+
+    safe_reason = _safe_turn_outcome_text(reason, limit=400) or "no reason reported"
+    return {
+        "model": model,
+        "provider": provider,
+        "reason": safe_reason,
+        "status": status,
+    }
+
+
+def _freeze_turn_outcome(
+    session: dict,
+    *,
+    result: Any = None,
+    status: str | None = None,
+    reason: str | None = None,
+    turn: dict | None = None,
+) -> dict | None:
+    """Classify one turn exactly once without performing persistence or I/O.
+
+    Callers that race with ``session.interrupt`` freeze while holding the
+    session history lock.  Whichever side owns that lock first decides the
+    terminal classification; later Stop/completion paths reuse this cached row.
+    """
+    turn = turn if isinstance(turn, dict) else session.get("inflight_turn")
+    if not isinstance(turn, dict):
+        return None
+    turn_id = str(turn.get("id") or "").strip()
+    if not turn_id:
+        return None
+
+    outcome_lock = session.setdefault("_turn_outcome_lock", threading.Lock())
+    with outcome_lock:
+        cached = session.setdefault("_turn_outcomes_by_id", {})
+        outcome = cached.get(turn_id)
+        if outcome is None:
+            outcome = _derive_turn_outcome(session, result)
+            if status is not None:
+                normalized = str(status).strip().lower()
+                outcome["status"] = (
+                    normalized if normalized in _TURN_OUTCOME_STATUSES else "failed"
+                )
+            if reason is not None:
+                outcome["reason"] = (
+                    _safe_turn_outcome_text(reason, limit=400)
+                    or "no reason reported"
+                )
+            outcome.update(
+                {
+                    "completed_at": time.time(),
+                    "id": turn_id,
+                    "started_at": float(turn.get("started_at") or time.time()),
+                    "user_ordinal": max(0, int(turn.get("user_ordinal") or 0)),
+                }
+            )
+            outcome["text"] = _format_turn_outcome(outcome)
+            cached[turn_id] = outcome
+            while len(cached) > 64:
+                cached.pop(next(iter(cached)))
+            session["_last_turn_outcome"] = outcome
+        return outcome
+
+
+def _finalize_turn_outcome(
+    sid: str,
+    session: dict,
+    *,
+    result: Any = None,
+    status: str | None = None,
+    reason: str | None = None,
+    turn: dict | None = None,
+) -> dict | None:
+    """Persist and emit the one terminal outcome owned by the active turn ID."""
+    outcome = _freeze_turn_outcome(
+        session,
+        result=result,
+        status=status,
+        reason=reason,
+        turn=turn,
+    )
+    if outcome is None:
+        return None
+    turn_id = str(outcome.get("id") or "")
+
+    outcome_lock = session.setdefault("_turn_outcome_lock", threading.Lock())
+    with outcome_lock:
+        cached = session.setdefault("_turn_outcomes_by_id", {})
+        emitted = session.setdefault("_emitted_turn_outcome_ids", [])
+        should_emit = turn_id not in emitted
+        if should_emit:
+            # Reserve the emission before I/O so concurrent close/late-result
+            # paths cannot both publish the same terminal row.
+            emitted.append(turn_id)
+            del emitted[:-64]
+
+        persisted = session.setdefault("_persisted_turn_outcome_ids", set())
+        persisted.intersection_update(cached)
+        persisting = session.setdefault("_persisting_turn_outcome_ids", set())
+        should_persist = turn_id not in persisted and turn_id not in persisting
+        if should_persist:
+            persisting.add(turn_id)
+
+    persistence_succeeded = False
+    if should_persist:
+        try:
+            with _session_db(session) as db:
+                if db is not None:
+                    db.record_turn_outcome(
+                        str(session.get("session_key") or ""),
+                        turn_id,
+                        user_ordinal=outcome["user_ordinal"],
+                        status=outcome["status"],
+                        reason=outcome["reason"],
+                        model=outcome["model"],
+                        provider=outcome["provider"],
+                        text=outcome["text"],
+                        started_at=outcome["started_at"],
+                        completed_at=outcome["completed_at"],
+                    )
+                    # False means another path/process already inserted the
+                    # same primary key, which is still durable success.
+                    persistence_succeeded = True
+        except Exception:
+            logger.warning(
+                "failed to persist turn outcome (session=%s turn=%s)",
+                session.get("session_key"),
+                turn_id,
+                exc_info=True,
+            )
+        finally:
+            with outcome_lock:
+                persisting.discard(turn_id)
+                if persistence_succeeded:
+                    persisted.add(turn_id)
+
+    # SQLite idempotency and live-delivery idempotency are separate. A row may
+    # already exist after a backend restart even though this client has never
+    # received the event; the in-memory turn-ID reservation above is the guard
+    # that makes emission exactly-once for this live owner.
+    if should_emit:
+        _emit("turn.outcome", sid, outcome)
+    return outcome
+
+
+def _enqueue_prompt(
+    session: dict, text: Any, transport: Any, *, front: bool = False
+) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
     Used when a prompt arrives mid-turn (see ``_handle_busy_submit``). A single
@@ -5270,8 +5604,72 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
         and isinstance(text, str)
     ):
         prev = existing["text"]
-        text = f"{prev}\n\n{text}" if prev and text else (prev or text)
-    session["queued_prompt"] = {"text": text, "transport": transport}
+        if front:
+            text = f"{text}\n\n{prev}" if prev and text else (text or prev)
+        else:
+            text = f"{prev}\n\n{text}" if prev and text else (prev or text)
+    target_transport = (
+        existing.get("transport") if front and existing is not None else transport
+    )
+    session["queued_prompt"] = {"text": text, "transport": target_transport}
+
+
+def _begin_prompt_dispatch_locked(
+    session: dict, text: Any, transport: Any = None
+) -> dict:
+    """Claim one idle session and create its turn identity.
+
+    The caller must hold ``history_lock``.  Keeping the running flag, transport,
+    and turn ID in one critical section prevents two post-turn producers from
+    both believing they own the next dispatch.
+    """
+    session["running"] = True
+    if transport is not None:
+        session["transport"] = transport
+    _start_inflight_turn(session, text)
+    return session["inflight_turn"]
+
+
+def _dispatch_claimed_prompt(
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    turn: dict,
+    *,
+    failure_context: str,
+    restore_on_failure=None,
+) -> bool:
+    """Start one already-claimed turn or fail it loudly and release ownership."""
+    try:
+        _run_prompt_submit(rid, sid, session, text)
+        return True
+    except Exception as exc:
+        reason = f"{failure_context} dispatch failed: {type(exc).__name__}: {exc}"
+        print(f"[tui_gateway] {reason}", file=sys.stderr)
+        _finalize_turn_outcome(
+            sid,
+            session,
+            status="failed",
+            reason=reason,
+            turn=turn,
+        )
+        with session["history_lock"]:
+            if restore_on_failure is not None:
+                try:
+                    restore_on_failure()
+                except Exception as restore_exc:
+                    print(
+                        f"[tui_gateway] {failure_context} restore failed: "
+                        f"{type(restore_exc).__name__}: {restore_exc}",
+                        file=sys.stderr,
+                    )
+            current = session.get("inflight_turn")
+            if isinstance(current, dict) and current.get("id") == turn.get("id"):
+                _clear_inflight_turn(session)
+            session["running"] = False
+            session["last_active"] = time.time()
+        return False
 
 
 def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any) -> dict:
@@ -5301,6 +5699,12 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any)
     if mode != "queue" and agent is not None and hasattr(agent, "interrupt"):
         try:
             agent.interrupt()
+            session["_turn_cancel_requested"] = True
+            session["_turn_cancel_reason"] = (
+                "steer could not attach; prompt queued for the next turn"
+                if mode == "steer"
+                else "superseded by a queued prompt"
+            )
         except Exception:
             pass
     _enqueue_prompt(session, text, transport)
@@ -5320,20 +5724,89 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if not queued or session.get("running"):
             return False
         session["queued_prompt"] = None
-        session["running"] = True
-        if queued.get("transport") is not None:
-            session["transport"] = queued["transport"]
-    try:
-        _run_prompt_submit(rid, sid, session, queued["text"])
-    except Exception as exc:
-        print(
-            f"[tui_gateway] queued prompt dispatch failed: "
-            f"{type(exc).__name__}: {exc}",
-            file=sys.stderr,
+        turn = _begin_prompt_dispatch_locked(
+            session,
+            queued["text"],
+            queued.get("transport"),
         )
-        with session["history_lock"]:
-            session["running"] = False
+
+    def _restore_queued_prompt() -> None:
+        _enqueue_prompt(
+            session,
+            queued["text"],
+            queued.get("transport"),
+            front=True,
+        )
+
+    _dispatch_claimed_prompt(
+        rid,
+        sid,
+        session,
+        queued["text"],
+        turn,
+        failure_context="queued prompt",
+        restore_on_failure=_restore_queued_prompt,
+    )
     return True
+
+
+def _dispatch_notification_batch(
+    rid,
+    sid: str,
+    session: dict,
+    notifications: list[tuple[dict, str]],
+    completion_queue,
+) -> None:
+    """Dispatch owned notifications without losing an unclaimed batch tail."""
+    for index, (event, text) in enumerate(notifications):
+        with session["history_lock"]:
+            if session.get("running"):
+                for pending_event, _pending_text in notifications[index:]:
+                    completion_queue.put(pending_event)
+                return
+            turn = _begin_prompt_dispatch_locked(session, text)
+        dispatched = _dispatch_claimed_prompt(
+            rid,
+            sid,
+            session,
+            text,
+            turn,
+            failure_context="completion notification",
+            restore_on_failure=lambda e=event: completion_queue.put(e),
+        )
+        if not dispatched:
+            for pending_event, _pending_text in notifications[index + 1 :]:
+                completion_queue.put(pending_event)
+            return
+
+
+def _dispatch_goal_continuation(
+    rid,
+    sid: str,
+    session: dict,
+    prompt: str,
+) -> bool:
+    """Claim a goal turn, preserving it behind any user work on sync failure."""
+    with session["history_lock"]:
+        if session.get("running"):
+            return False
+        turn = _begin_prompt_dispatch_locked(session, prompt)
+    return _dispatch_claimed_prompt(
+        rid,
+        sid,
+        session,
+        prompt,
+        turn,
+        failure_context="goal continuation",
+        # A user prompt can queue after this automatic turn is claimed.
+        # Restore the goal behind it so user work still wins.
+        restore_on_failure=lambda: _enqueue_prompt(
+            session,
+            prompt,
+            (session.get("queued_prompt") or {}).get("transport")
+            or session.get("transport"),
+        ),
+    )
 
 
 def _inflight_snapshot(session: dict) -> dict | None:
@@ -5348,6 +5821,7 @@ def _inflight_snapshot(session: dict) -> dict | None:
     return {
         "assistant": assistant,
         "streaming": streaming,
+        "turn_id": str(turn.get("id") or ""),
         "user": user,
     }
 
@@ -5852,6 +6326,7 @@ def _(rid, params: dict) -> dict:
             # The child's OWN conversation only — include_ancestors would prepend
             # the parent's transcript onto the subagent's branch.
             history = db.get_messages_as_conversation(target)
+            turn_outcomes = _turn_outcomes_for_display(db, target)
         except Exception as e:
             if lease is not None:
                 lease.release()
@@ -5873,7 +6348,7 @@ def _(rid, params: dict) -> dict:
         # A delegated child mid-run emits no session events of its own — report
         # its liveness from the relay registry so the window shows a busy turn.
         child_running = _child_run_active(target)
-        messages = _history_to_messages(history)
+        messages = _history_to_messages(history, turn_outcomes)
         return _ok(
             rid,
             {
@@ -5918,6 +6393,9 @@ def _(rid, params: dict) -> dict:
             db.reopen_session(target)
             raw_history = db.get_messages_as_conversation(target)
             display_history = db.get_messages_as_conversation(target, include_ancestors=True)
+            turn_outcomes = _turn_outcomes_for_display(
+                db, target, include_ancestors=True
+            )
         except Exception as e:
             if lease is not None:
                 lease.release()
@@ -5952,7 +6430,7 @@ def _(rid, params: dict) -> dict:
         _schedule_agent_build(sid)
         _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
 
-        messages = _history_to_messages(display_history)
+        messages = _history_to_messages(display_history, turn_outcomes)
         return _ok(
             rid,
             {
@@ -5994,6 +6472,9 @@ def _(rid, params: dict) -> dict:
         display_history = db.get_messages_as_conversation(
             target, include_ancestors=True
         )
+        turn_outcomes = _turn_outcomes_for_display(
+            db, target, include_ancestors=True
+        )
         # The display transcript keeps every row so the user still sees their
         # full history.  The model-fed history is sanitized: a session whose
         # last turn died mid-tool-loop persists a dangling assistant(tool_calls)
@@ -6005,7 +6486,7 @@ def _(rid, params: dict) -> dict:
             : max(0, len(display_history) - len(raw_history))
         ]
         history = sanitize_replay_history(raw_history)
-        messages = _history_to_messages(display_history)
+        messages = _history_to_messages(display_history, turn_outcomes)
         tokens = _set_session_context(target)
         try:
             # Pass the profile's db so the agent persists turns to the right
@@ -6251,10 +6732,21 @@ def _live_session_payload(
         )
         inflight = _inflight_snapshot(session)
         running = bool(session.get("running"))
+    turn_outcomes: list[dict] = []
+    try:
+        with _session_db(session) as db:
+            if db is not None:
+                turn_outcomes = _turn_outcomes_for_display(
+                    db,
+                    _session_lookup_key(session, fallback=sid),
+                    include_ancestors=bool(session.get("display_history_prefix")),
+                )
+    except Exception:
+        logger.debug("failed to load turn outcomes for live payload", exc_info=True)
     payload = {
         "info": _fallback_session_info(session),
         "message_count": len(history),
-        "messages": _history_to_messages(history),
+        "messages": _history_to_messages(history, turn_outcomes),
         "running": running,
         "session_id": sid,
         "session_key": _session_lookup_key(session, fallback=sid),
@@ -8459,19 +8951,24 @@ def _(rid, params: dict) -> dict:
     if err:
         return err
     history = list(session.get("history", []))
-    db = _get_db()
-    if db is not None and session.get("session_key"):
-        try:
-            history = db.get_messages_as_conversation(
-                session["session_key"], include_ancestors=True
-            )
-        except Exception:
-            pass
+    turn_outcomes: list[dict] = []
+    try:
+        with _session_db(session) as db:
+            if db is not None and session.get("session_key"):
+                history = db.get_messages_as_conversation(
+                    session["session_key"], include_ancestors=True
+                )
+                turn_outcomes = _turn_outcomes_for_display(
+                    db,
+                    session["session_key"], include_ancestors=True
+                )
+    except Exception:
+        pass
     return _ok(
         rid,
         {
             "count": len(history),
-            "messages": _history_to_messages(history),
+            "messages": _history_to_messages(history, turn_outcomes),
         },
     )
 
@@ -8770,12 +9267,26 @@ def _(rid, params: dict) -> dict:
         session["agent"].interrupt()
     with session["history_lock"]:
         session["_turn_cancel_requested"] = True
+        session["_turn_cancel_reason"] = "user cancelled the turn"
         session["queued_prompt"] = None
+        stranded_turn = (
+            not run_thread_alive
+            and isinstance(session.get("inflight_turn"), dict)
+        )
+    # A dead/missing run thread cannot reach the normal turn-finally funnel.
+    # Persist and emit its cancellation before clearing the in-flight identity.
+    if stranded_turn:
+        _finalize_turn_outcome(
+            str(params.get("session_id") or session.get("_sid") or ""),
+            session,
+            status="cancelled",
+            reason="user cancelled the turn",
+        )
     if not run_thread_alive:
         with session["history_lock"]:
             if session.get("running"):
                 session["running"] = False
-                _clear_inflight_turn(session)
+            _clear_inflight_turn(session)
 
     # Stop = stop the TURN (cooperative interrupt above also kills the in-flight
     # foreground subprocess). Background processes the agent started (dev servers,
@@ -9104,12 +9615,13 @@ def _(rid, params: dict) -> dict:
             if (db := _get_db()) is not None:
                 try:
                     db.replace_messages(session["session_key"], truncated)
+                    db.deactivate_turn_outcomes_from_ordinal(
+                        session["session_key"], ordinal
+                    )
                 except Exception as exc:
                     print(f"[tui_gateway] prompt.submit: replace_messages failed: {exc}", file=sys.stderr)
-        session["running"] = True
-        session["_turn_cancel_requested"] = False
+        _begin_prompt_dispatch_locked(session, text)
         session["last_active"] = time.time()
-        _start_inflight_turn(session, text)
 
     # Persist the DB row lazily, now that the user has actually sent a message.
     _ensure_session_db_row(session)
@@ -9121,14 +9633,14 @@ def _(rid, params: dict) -> dict:
     def run_after_agent_ready() -> None:
         err = _wait_agent(session, rid)
         if err:
-            _emit(
-                "error",
+            message = err.get("error", {}).get(
+                "message", "agent initialization failed"
+            )
+            _finalize_turn_outcome(
                 sid,
-                {
-                    "message": err.get("error", {}).get(
-                        "message", "agent initialization failed"
-                    )
-                },
+                session,
+                status="failed",
+                reason=message,
             )
             with session["history_lock"]:
                 session["running"] = False
@@ -9136,10 +9648,31 @@ def _(rid, params: dict) -> dict:
             return
         with session["history_lock"]:
             if session.get("_turn_cancel_requested") or not session.get("running"):
+                cancelled = True
+            else:
+                cancelled = False
+        if cancelled:
+            _finalize_turn_outcome(
+                sid,
+                session,
+                status="cancelled",
+                reason=session.get("_turn_cancel_reason") or "user cancelled the turn",
+            )
+            with session["history_lock"]:
                 session["running"] = False
                 _clear_inflight_turn(session)
-                return
-        _run_prompt_submit(rid, sid, session, text)
+            return
+        with session["history_lock"]:
+            initial_turn = session.get("inflight_turn")
+        if isinstance(initial_turn, dict):
+            _dispatch_claimed_prompt(
+                rid,
+                sid,
+                session,
+                text,
+                initial_turn,
+                failure_context="initial prompt",
+            )
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck
@@ -9391,7 +9924,7 @@ def _notification_poller_loop(
                 process_registry.completion_queue.put(evt)
                 _requeued = True
             else:
-                session["running"] = True
+                notification_turn = _begin_prompt_dispatch_locked(session, text)
         if _requeued:
             # Back off before re-polling: the re-queued event keeps the queue
             # non-empty, so without a sleep this loop spins at full speed
@@ -9400,17 +9933,16 @@ def _notification_poller_loop(
             continue
 
         rid = f"__notif__{int(time.time() * 1000)}"
-        try:
-            _emit("message.start", sid)
-            _run_prompt_submit(rid, sid, session, text)
-        except Exception as exc:
-            print(
-                f"[tui_gateway] notification poller dispatch failed: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-            with session["history_lock"]:
-                session["running"] = False
+        if not _dispatch_claimed_prompt(
+            rid,
+            sid,
+            session,
+            text,
+            notification_turn,
+            failure_context="notification poller",
+            restore_on_failure=lambda e=evt: process_registry.completion_queue.put(e),
+        ):
+            time.sleep(0.25)
 
     # Drain any remaining events after stop signal (process all pending
     # before exiting so nothing is lost on shutdown). Events owned by other
@@ -9449,20 +9981,19 @@ def _notification_poller_loop(
             if session.get("running"):
                 process_registry.completion_queue.put(evt)
                 break
-            session["running"] = True
+            notification_turn = _begin_prompt_dispatch_locked(session, text)
 
         rid = f"__notif__{int(time.time() * 1000)}"
-        try:
-            _emit("message.start", sid)
-            _run_prompt_submit(rid, sid, session, text)
-        except Exception as exc:
-            print(
-                f"[tui_gateway] notification poller dispatch failed: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-            with session["history_lock"]:
-                session["running"] = False
+        if not _dispatch_claimed_prompt(
+            rid,
+            sid,
+            session,
+            text,
+            notification_turn,
+            failure_context="notification shutdown drain",
+            restore_on_failure=lambda e=evt: deferred.append(e),
+        ):
+            break
 
     # Hand any other sessions' events back to the shared queue.
     for evt in deferred:
@@ -9541,13 +10072,16 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             agent.clear_interrupt()
         except Exception:
             pass
-    _emit("message.start", sid)
+    turn = session.get("inflight_turn") or {}
+    _emit("message.start", sid, {"turn_id": turn.get("id")})
 
     def run():
         approval_token = None
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         goal_followup = None  # set by the post-turn goal hook below
+        result = None
+        terminal_turn = None
         try:
             from tools.approval import (
                 reset_current_session_key,
@@ -9596,13 +10130,14 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     context_length=ctx_len,
                 )
                 if ctx.blocked:
-                    _emit(
-                        "error",
+                    _finalize_turn_outcome(
                         sid,
-                        {
-                            "message": "\n".join(ctx.warnings)
+                        session,
+                        status="failed",
+                        reason=(
+                            "\n".join(ctx.warnings)
                             or "Context injection refused."
-                        },
+                        ),
                     )
                     return
                 prompt = ctx.message
@@ -9682,6 +10217,19 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             except (TypeError, ValueError):
                 pass
             result = agent.run_conversation(run_message, **run_kwargs)
+            if isinstance(result, dict):
+                pending_steer = str(result.get("pending_steer") or "").strip()
+                if pending_steer:
+                    # A steer accepted after the final tool batch cannot be
+                    # injected into this turn. Preserve it as the next user
+                    # turn, ahead of prompts that arrived later.
+                    with session["history_lock"]:
+                        _enqueue_prompt(
+                            session,
+                            pending_steer,
+                            session.get("transport"),
+                            front=True,
+                        )
             if "moa_one_shot_restore" in session:
                 _restore = session.pop("moa_one_shot_restore", None)
                 # Restore the model the user was on before the /moa one-shot.
@@ -9796,9 +10344,33 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             rendered = render_message(raw, cols)
             if rendered:
                 payload["rendered"] = rendered
+            payload["turn_id"] = (session.get("inflight_turn") or {}).get("id")
             with session["history_lock"]:
+                terminal_turn = session.get("inflight_turn")
+                # Freeze completion while holding the same lock Stop uses to
+                # request cancellation.  A Stop after this boundary cannot
+                # relabel an already-produced answer as cancelled merely
+                # because message.complete delivery is still in progress.
+                frozen_outcome = _freeze_turn_outcome(
+                    session,
+                    result=result,
+                    turn=terminal_turn,
+                )
                 _clear_inflight_turn(session)
+            if frozen_outcome is not None:
+                frozen_status = str(frozen_outcome.get("status") or "")
+                payload["status"] = (
+                    "interrupted"
+                    if frozen_status == "cancelled"
+                    else "error"
+                    if frozen_status in {"failed", "timed_out"}
+                    else "complete"
+                )
+                status = payload["status"]
             _emit("message.complete", sid, payload)
+            _finalize_turn_outcome(
+                sid, session, result=result, turn=terminal_turn
+            )
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge
@@ -9938,8 +10510,23 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             print(
                 f"[gateway-turn] {type(e).__name__}: {e}", file=sys.stderr, flush=True
             )
-            _emit("error", sid, {"message": str(e)})
+            _finalize_turn_outcome(
+                sid,
+                session,
+                result={"error": f"{type(e).__name__}: {e}"},
+                turn=terminal_turn,
+            )
         finally:
+            # This is deliberately unconditional. All earlier paths converge
+            # here, while turn-ID idempotency makes normal/late/duplicate
+            # completions no-ops. No turn can disappear without a terminal
+            # record, even if an unexpected return was added above.
+            _finalize_turn_outcome(
+                sid,
+                session,
+                result=result,
+                turn=terminal_turn,
+            )
             try:
                 if approval_token is not None:
                     reset_current_session_key(approval_token)
@@ -9967,23 +10554,12 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         # prompt.submit sets running=True under the history_lock and
         # we check that guard before re-firing.
         if goal_followup:
-            with session["history_lock"]:
-                if session.get("running"):
-                    # User already sent something — their turn wins,
-                    # the judge will re-run on the next turn anyway.
-                    return
-                session["running"] = True
-            try:
-                _emit("message.start", sid)
-                _run_prompt_submit(rid, sid, session, goal_followup)
-            except Exception as _cont_exc:
-                print(
-                    f"[tui_gateway] goal continuation dispatch failed: "
-                    f"{type(_cont_exc).__name__}: {_cont_exc}",
-                    file=sys.stderr,
-                )
-                with session["history_lock"]:
-                    session["running"] = False
+            _dispatch_goal_continuation(
+                rid,
+                sid,
+                session,
+                goal_followup,
+            )
 
         # Drain completion notifications that arrived during this turn.
         # The background poller handles between-turn delivery; this is
@@ -9996,26 +10572,17 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             # adopt another session's (or an orphan's) delegation payload,
             # while a post-compression session still claims its own
             # pre-compression dispatches (#55578).
-            for _evt, synth in process_registry.drain_notifications(
+            drained_notifications = process_registry.drain_notifications(
                 session_key=session.get("session_key", ""),
                 owns_event=lambda e: _session_owns_notification_event(sid, session, e),
-            ):
-                with session["history_lock"]:
-                    if session.get("running"):
-                        process_registry.completion_queue.put(_evt)
-                        break
-                    session["running"] = True
-                try:
-                    _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, synth)
-                except Exception as _n_exc:
-                    print(
-                        f"[tui_gateway] completion notification dispatch failed: "
-                        f"{type(_n_exc).__name__}: {_n_exc}",
-                        file=sys.stderr,
-                    )
-                    with session["history_lock"]:
-                        session["running"] = False
+            )
+            _dispatch_notification_batch(
+                rid,
+                sid,
+                session,
+                drained_notifications,
+                process_registry.completion_queue,
+            )
         except Exception as _drain_exc:
             print(
                 f"[tui_gateway] completion queue drain failed: "

@@ -4,7 +4,7 @@ import { dedupeGeneratedImageEchoesInParts } from '@/lib/generated-images'
 import { mediaDisplayLabel, mediaMarkdownHref } from '@/lib/media'
 import { normalize } from '@/lib/text'
 import { parseTodos } from '@/lib/todos'
-import type { SessionMessage, UsageStats } from '@/types/hermes'
+import type { SessionMessage, SessionTurnOutcome, UsageStats } from '@/types/hermes'
 
 export type ChatMessagePart = Exclude<ThreadMessageLike['content'], string>[number]
 
@@ -29,6 +29,7 @@ export type GatewayEventPayload = {
   status?: string
   message?: string
   id?: string
+  turn_id?: string
   name?: string
   tool_id?: string
   tool_call_id?: string
@@ -46,6 +47,10 @@ export type GatewayEventPayload = {
   model?: string
   provider?: string
   fallback_policy?: string
+  reason?: string
+  user_ordinal?: number
+  started_at?: number
+  completed_at?: number
   reasoning_effort?: string
   service_tier?: string
   fast?: boolean
@@ -701,7 +706,76 @@ function withUniqueToolCallIds(messages: ChatMessage[]): ChatMessage[] {
   })
 }
 
-export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
+function turnOutcomeId(outcome: SessionTurnOutcome | undefined): string {
+  return String(outcome?.turn_id || outcome?.id || '').trim()
+}
+
+function withTurnOutcomeRows(messages: SessionMessage[], outcomes: SessionTurnOutcome[]): SessionMessage[] {
+  if (!outcomes.length) {
+    return messages
+  }
+
+  const existing = new Set(
+    messages.map(message => turnOutcomeId(message.turn_outcome)).filter((id): id is string => Boolean(id))
+  )
+
+  const byOrdinal = new Map<number, SessionTurnOutcome[]>()
+
+  for (const outcome of outcomes) {
+    const id = turnOutcomeId(outcome)
+
+    if (!id || existing.has(id) || !outcome.text.trim()) {
+      continue
+    }
+
+    const ordinal = Math.max(0, Number.isFinite(outcome.user_ordinal) ? Math.trunc(outcome.user_ordinal) : 0)
+    byOrdinal.set(ordinal, [...(byOrdinal.get(ordinal) ?? []), outcome])
+  }
+
+  for (const rows of byOrdinal.values()) {
+    rows.sort((a, b) => a.completed_at - b.completed_at || turnOutcomeId(a).localeCompare(turnOutcomeId(b)))
+  }
+
+  const result: SessionMessage[] = []
+  const flushed = new Set<number>()
+  let userOrdinal = -1
+
+  const flush = (ordinal: number) => {
+    if (ordinal < 0 || flushed.has(ordinal)) {
+      return
+    }
+
+    flushed.add(ordinal)
+
+    for (const outcome of byOrdinal.get(ordinal) ?? []) {
+      result.push({
+        content: outcome.text,
+        role: 'system',
+        timestamp: outcome.completed_at,
+        turn_outcome: outcome
+      })
+    }
+  }
+
+  for (const message of messages) {
+    if (message.role === 'user') {
+      flush(userOrdinal)
+      userOrdinal += 1
+    }
+
+    result.push(message)
+  }
+
+  flush(userOrdinal)
+
+  for (const ordinal of [...byOrdinal.keys()].sort((a, b) => a - b)) {
+    flush(ordinal)
+  }
+
+  return result
+}
+
+export function toChatMessages(messages: SessionMessage[], turnOutcomes: SessionTurnOutcome[] = []): ChatMessage[] {
   const result: ChatMessage[] = []
   let pendingToolParts: ChatMessagePart[] = []
   let pendingToolTimestamp: number | undefined
@@ -749,7 +823,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
     clearPendingTools()
   }
 
-  messages.forEach((message, index) => {
+  withTurnOutcomeRows(messages, turnOutcomes).forEach((message, index) => {
     if (message.role === 'tool') {
       const updatedPendingToolParts = applyStoredToolResultToParts(pendingToolParts, message)
 
@@ -841,8 +915,10 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
         ? message.sender_device.trim()
         : undefined
 
+    const outcomeId = turnOutcomeId(message.turn_outcome)
+
     result.push({
-      id: `${message.timestamp || Date.now()}-${index}-${message.role}`,
+      id: outcomeId ? `turn-outcome:${outcomeId}` : `${message.timestamp || Date.now()}-${index}-${message.role}`,
       role: message.role,
       parts,
       timestamp: message.timestamp,

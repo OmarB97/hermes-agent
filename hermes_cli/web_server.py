@@ -9707,9 +9707,13 @@ async def get_session_messages(
         # Clamp limit to prevent abuse (max 500 per page)
         _limit = min(limit, 500) if limit is not None else None
         messages = db.get_messages(sid, limit=_limit, offset=offset)
+        turn_outcomes = db.get_turn_outcomes(sid)
         return {
             "session_id": sid,
             "messages": messages,
+            # UI-only terminal metadata. This is intentionally separate from
+            # messages so REST hydration cannot feed it back into model context.
+            "turn_outcomes": turn_outcomes,
             "pagination": {
                 "limit": _limit,
                 "offset": offset,

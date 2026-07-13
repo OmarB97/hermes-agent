@@ -15,7 +15,7 @@ import { cn } from '@/lib/utils'
 import { useSkinCommand } from '@/themes/use-skin-command'
 
 import { formatRefValue } from '../components/assistant-ui/directive-text'
-import { getSessionMessages, type SessionMessage, triggerCronJob } from '../hermes'
+import { getSessionMessages, type SessionMessage, type SessionTurnOutcome, triggerCronJob } from '../hermes'
 import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '../lib/chat-messages'
 import { restoreFallbackNotices } from '../lib/fallback-notices'
 import { storedSessionIdForNotification } from '../lib/session-ids'
@@ -166,7 +166,7 @@ function hashString(hash: number, value: string): number {
   return next >>> 0
 }
 
-function sessionMessagesSignature(messages: SessionMessage[]): string {
+function sessionMessagesSignature(messages: SessionMessage[], turnOutcomes: SessionTurnOutcome[] = []): string {
   let hash = 2166136261
 
   for (const m of messages) {
@@ -175,7 +175,13 @@ function sessionMessagesSignature(messages: SessionMessage[]): string {
     hash = hashString(hash, typeof m.content === 'string' ? m.content : (JSON.stringify(m.content) ?? ''))
   }
 
-  return `${messages.length}:${hash}`
+  for (const outcome of turnOutcomes) {
+    hash = hashString(hash, outcome.turn_id || outcome.id || '')
+    hash = hashString(hash, outcome.status)
+    hash = hashString(hash, outcome.text)
+  }
+
+  return `${messages.length}:${turnOutcomes.length}:${hash}`
 }
 
 export function DesktopController() {
@@ -508,7 +514,10 @@ export function DesktopController() {
       for (let index = 0; index < Math.max(1, attempts); index += 1) {
         try {
           const latest = await getSessionMessages(storedSessionId, storedProfile)
-          const messages = restoreFallbackNotices(storedSessionId, toChatMessages(latest.messages))
+          const messages = restoreFallbackNotices(
+            storedSessionId,
+            toChatMessages(latest.messages, latest.turn_outcomes)
+          )
           updateSessionState(
             runtimeSessionId,
             state => ({
@@ -563,14 +572,14 @@ export function DesktopController() {
     try {
       const latest = await getSessionMessages(storedSessionId, stored.profile)
       const signatureKey = `${stored.profile ?? 'default'}:${storedSessionId}`
-      const sig = sessionMessagesSignature(latest.messages)
+      const sig = sessionMessagesSignature(latest.messages, latest.turn_outcomes)
 
       if (messagingTranscriptSignatureRef.current.get(signatureKey) === sig) {
         return
       }
 
       messagingTranscriptSignatureRef.current.set(signatureKey, sig)
-      const messages = restoreFallbackNotices(storedSessionId, toChatMessages(latest.messages))
+      const messages = restoreFallbackNotices(storedSessionId, toChatMessages(latest.messages, latest.turn_outcomes))
 
       updateSessionState(
         runtimeSessionId,
@@ -582,7 +591,7 @@ export function DesktopController() {
     }
   }, [activeSessionIdRef, busyRef, selectedStoredSessionIdRef, updateSessionState])
 
-  const { handleGatewayEvent } = useMessageStream({
+  const { handleGatewayEvent, hydrateTurnOutcomeState } = useMessageStream({
     activeSessionIdRef,
     hydrateFromStoredSession,
     queryClient,
@@ -619,6 +628,7 @@ export function DesktopController() {
     creatingSessionRef,
     ensureSessionState,
     getRouteToken,
+    hydrateTurnOutcomeState,
     navigate,
     requestGateway,
     runtimeIdByStoredSessionIdRef,
