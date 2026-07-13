@@ -518,7 +518,7 @@ class TestInstall:
         monkeypatch.setattr(
             "hermes_cli.profile_distribution._atomic_write_json", fail_receipt
         )
-        with pytest.raises(DistributionError, match="rolled back"):
+        with pytest.raises(DistributionError, match="rollback restored"):
             install_distribution(str(staged), name="receipt-fail")
 
         from hermes_cli.profiles import get_profile_dir
@@ -532,6 +532,45 @@ class TestInstall:
         rollback = json.loads(receipts[0].read_text())
         assert rollback["status"] == "rolled_back"
         assert rollback["restored"] is True
+
+    def test_fresh_incomplete_rollback_fails_loud_and_receipts_residue(
+        self, profile_env, monkeypatch
+    ):
+        import hermes_cli.profile_distribution as distribution
+        from hermes_cli.profiles import get_profile_dir
+
+        staged = _make_staging_dir(profile_env, "fresh-incomplete")
+        target = get_profile_dir("fresh-incomplete")
+        real_remove = distribution._remove_path
+
+        def fail_receipt(*args, **kwargs):
+            raise OSError("injected receipt failure")
+
+        def fail_target_removal(path):
+            if Path(path) == target:
+                raise OSError("injected target removal failure")
+            return real_remove(path)
+
+        monkeypatch.setattr(distribution, "_atomic_write_json", fail_receipt)
+        monkeypatch.setattr(distribution, "_remove_path", fail_target_removal)
+
+        with pytest.raises(DistributionError, match="rollback INCOMPLETE"):
+            install_distribution(str(staged), name="fresh-incomplete")
+
+        assert target.is_dir()
+        assert not (target / RECEIPT_FILENAME).exists()
+        receipts = list(
+            target.parent.glob(
+                f".distribution-backups/fresh-incomplete/*/{ROLLBACK_RECEIPT_FILENAME}"
+            )
+        )
+        assert len(receipts) == 1
+        rollback = json.loads(receipts[0].read_text())
+        assert rollback["restored"] is False
+        assert any(
+            "injected target removal failure" in item
+            for item in rollback["recovery_errors"]
+        )
 
 
 # ===========================================================================
@@ -811,7 +850,7 @@ class TestFreshActivationRace:
             activate_during_receipt,
         )
 
-        with pytest.raises(DistributionError, match="rolled back"):
+        with pytest.raises(DistributionError, match="rollback restored"):
             install_distribution(str(staged), name="late-activation-race")
 
         from hermes_cli.profiles import get_active_profile, get_profile_dir

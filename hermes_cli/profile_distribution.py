@@ -1207,13 +1207,14 @@ def _commit_fresh_candidate(
             / plan.manifest.name
             / transaction_id
         )
+        restored = not target.exists() and not recovery_errors
         rollback_receipt = _write_rollback_receipt(
             rollback_dir,
             plan,
             transaction_id=transaction_id,
             operation="install",
             error=exc,
-            restored=not target.exists() and not recovery_errors,
+            restored=restored,
             recovery_errors=recovery_errors,
         )
         receipt_note = (
@@ -1221,8 +1222,9 @@ def _commit_fresh_candidate(
             if rollback_receipt
             else " Rollback receipt could not be written."
         )
+        outcome = "restored" if restored else "INCOMPLETE"
         note = (
-            "Fresh distribution install failed and the new profile was rolled back: "
+            f"Fresh distribution install failed; rollback {outcome}: "
             f"{exc}.{receipt_note}"
         )
         if hasattr(exc, "add_note"):
