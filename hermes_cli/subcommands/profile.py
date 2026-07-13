@@ -21,6 +21,15 @@ def build_profile_parser(subparsers, *, cmd_profile: Callable) -> None:
     profile_subparsers = profile_parser.add_subparsers(dest="profile_action")
 
     profile_subparsers.add_parser("list", help="List all profiles")
+    profile_capabilities = profile_subparsers.add_parser(
+        "capabilities",
+        help="Show profile-distribution capabilities supported by this Hermes build",
+    )
+    profile_capabilities.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit a machine-readable capability result",
+    )
     profile_use = profile_subparsers.add_parser(
         "use", help="Set sticky default profile"
     )
@@ -199,5 +208,16 @@ def build_profile_parser(subparsers, *, cmd_profile: Callable) -> None:
         help="Show a profile's distribution manifest (version, requirements, source)",
     )
     profile_info.add_argument("profile_name", help="Profile to inspect")
+
+    profile_doctor = profile_subparsers.add_parser(
+        "doctor",
+        help="Verify a distribution receipt, owned payload, and transaction state",
+    )
+    profile_doctor.add_argument("profile_name", help="Profile to verify")
+    profile_doctor.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit a machine-readable verification result",
+    )
 
     profile_parser.set_defaults(func=cmd_profile)
