@@ -1806,6 +1806,10 @@ def run_doctor(args):
             try:
                 # Use resolved absolute path so Windows can execute
                 # npm.cmd (CreateProcessW can't run bare .cmd names).
+                # audit_extra scopes the audit to one workspace: without it npm
+                # resolves the full workspace glob (Electron, node-pty, ...) for
+                # what is meant to be a routine check — see the comment on
+                # npm_audit_targets above.
                 audit_result = subprocess.run(
                     [_npm_bin, "audit", "--json", *audit_extra],
                     cwd=str(npm_dir),
