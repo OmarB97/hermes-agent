@@ -3282,6 +3282,22 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     f"{int(_first_elapsed)}s "
                     f"(context: ~{_est_ctx:,} tokens). Reconnecting..."
                 )
+                # Mark THIS request cancelled BEFORE force-closing, exactly as
+                # the interrupt path below does (#6600). Without it the worker
+                # catches the transport error caused by our own close, cannot
+                # tell it apart from a transient network blip, and silently
+                # retries. We meanwhile give up after the join below and break
+                # with a TimeoutError — so the retry is orphaned: it keeps
+                # streaming, and when the slow local model finally answers it
+                # writes into a turn the main loop already finalised. The
+                # desktop then renders that late text into an idle composer
+                # with no way to interrupt it. Setting the flag first makes the
+                # worker recognise the abort and exit without retrying.
+                #
+                # This must happen before the close, not after the join: the
+                # worker can raise and re-enter its retry loop the instant the
+                # socket dies, which is well before we get to break.
+                _request_cancelled["value"] = True
                 try:
                     _close_request_client_once("dflash_first_chunk_kill")
                 except Exception:
