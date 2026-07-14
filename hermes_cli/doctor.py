@@ -1655,14 +1655,18 @@ def run_doctor(args):
             (PROJECT_ROOT, "ui-tui workspace", ["--workspace", "ui-tui"]),
             (_whatsapp_bridge_dir, "WhatsApp bridge", []),
         ]
-        for npm_dir, label in npm_dirs:
+        for npm_dir, label, audit_extra in npm_audit_targets:
             if not (npm_dir / "node_modules").exists():
                 continue
             try:
                 # Use resolved absolute path so Windows can execute
                 # npm.cmd (CreateProcessW can't run bare .cmd names).
+                # audit_extra scopes the audit to one workspace: without it npm
+                # resolves the full workspace glob (Electron, node-pty, ...) for
+                # what is meant to be a routine check — see the comment on
+                # npm_audit_targets above.
                 audit_result = subprocess.run(
-                    [_npm_bin, "audit", "--json"],
+                    [_npm_bin, "audit", "--json", *audit_extra],
                     cwd=str(npm_dir),
                     capture_output=True, text=True, timeout=30,
                 )
