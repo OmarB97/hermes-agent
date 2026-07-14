@@ -466,6 +466,118 @@ def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List
         )
 
 
+# ── Length-continuation convergence guards (#truncation livelock) ──────────
+# A ``finish_reason="length"`` response with no tool calls is answered by
+# appending the partial assistant message plus a "continue" user prompt and
+# re-issuing the call. That only works when the OUTPUT cap was the binding
+# constraint. When the CONTEXT WINDOW is the binding constraint the scaffolding
+# is self-defeating: every round adds two more messages to an already-full
+# window, the model gets even less room to write, and the loop burns all four
+# attempts before failing. Two guards below stop that:
+#
+#   * head-room guard — refuse to scaffold another round when the window has no
+#     room left for a useful completion (compact instead);
+#   * non-convergence guard — a continuation that returns ~no new content is
+#     proof the model cannot make progress; more "please continue" prompts can
+#     only make it worse.
+#
+# Minimum completion room (tokens) that must remain in the context window for a
+# continuation round to have any chance of producing useful output.
+_LENGTH_CONTINUE_MIN_HEADROOM_TOKENS = 2048
+# A continuation whose new content is shorter than this (after think-block
+# stripping) counts as "no progress".
+_LENGTH_CONTINUE_MIN_NEW_CHARS = 32
+# Consecutive no-progress continuations that prove the loop is not converging.
+_LENGTH_CONTINUE_MAX_NO_PROGRESS = 2
+
+_CONTEXT_EXHAUSTED_ERROR = (
+    "Context window exhausted — the model has no room left to continue its "
+    "response. Compact the conversation with /compress or start a new one "
+    "with /new."
+)
+_CONTEXT_EXHAUSTED_RESPONSE = (
+    "⚠️ **Context Window Exhausted**\n\n"
+    "The conversation has filled the model's context window, so there is no "
+    "room left for it to finish this response. Asking it to continue again "
+    "would only add more history and make it worse.\n\n"
+    "To fix this:\n"
+    "→ Compact the conversation: `/compress`\n"
+    "→ Or start a fresh one: `/new`"
+)
+_NO_PROGRESS_ERROR = (
+    "Response stopped converging — continuation attempts returned no new "
+    "content. Compact the conversation with /compress, start a new one with "
+    "/new, or switch models with /model."
+)
+_NO_PROGRESS_RESPONSE = (
+    "⚠️ **Response Not Converging**\n\n"
+    "The model keeps reporting a truncated response but is no longer "
+    "producing any new text, so further continuation attempts cannot finish "
+    "the answer.\n\n"
+    "To fix this:\n"
+    "→ Compact the conversation: `/compress`\n"
+    "→ Start a fresh one: `/new`\n"
+    "→ Or switch models: `/model`"
+)
+
+
+def _is_length_continuation_prompt(message: Dict) -> bool:
+    """True when ``message`` is one of the scaffolded "continue" user prompts."""
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return False
+    content = message.get("content")
+    if not isinstance(content, str):
+        return False
+    return content.startswith(
+        (
+            "[System: Your previous response was truncated by the output",
+            "[System: The previous response was cut off by a",
+            "[System: Your previous tool call ",
+        )
+    )
+
+
+def _rollback_length_continuation_scaffolding(agent: Any, messages: List[Dict]) -> List[Dict]:
+    """Strip trailing (partial assistant, "continue" prompt) scaffolding pairs.
+
+    Used before compacting on the truncation path so the compressor summarizes
+    a coherent transcript instead of a stack of half-finished assistant turns
+    interleaved with system-flavored continuation prompts.
+    """
+    rolled = list(messages)
+    while len(rolled) >= 2 and _is_length_continuation_prompt(rolled[-1]):
+        rolled.pop()  # the "continue" user prompt
+        if rolled and rolled[-1].get("role") == "assistant":
+            rolled.pop()  # the partial assistant message it was answering
+    return rolled
+
+
+def _length_continuation_headroom(agent: Any, request_pressure_tokens: int) -> Optional[int]:
+    """Remaining context tokens the NEXT continuation round could write into.
+
+    Returns ``None`` when the context window is unknown (nothing to reason
+    about — leave the legacy continuation behavior alone).
+    """
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is None:
+        return None
+    context_length = int(getattr(compressor, "context_length", 0) or 0)
+    if context_length <= 0:
+        return None
+
+    # Prefer the provider's own prompt count for the call that just truncated
+    # (recorded by _record_accepted_provider_response before this point); fall
+    # back to the rough request estimate when the provider reports no usage.
+    real_prompt = int(getattr(compressor, "last_real_prompt_tokens", 0) or 0)
+    prompt_tokens = real_prompt if real_prompt > 0 else int(request_pressure_tokens or 0)
+    if prompt_tokens <= 0:
+        return None
+
+    # The next request also carries the partial answer we are about to append.
+    completion_tokens = int(getattr(compressor, "last_completion_tokens", 0) or 0)
+    return context_length - prompt_tokens - max(completion_tokens, 0)
+
+
 def _emit_preflight_token_usage(
     agent: Any, request_tokens: int, messages_len: int | None = None
 ) -> None:
@@ -790,6 +902,10 @@ def run_conversation(
     failed = False
     codex_ack_continuations = 0
     length_continue_retries = 0
+    # Consecutive continuation rounds that produced ~no new content, and whether
+    # the truncation path has already spent its one compaction rescue this turn.
+    length_no_progress_streak = 0
+    length_continuation_compacted = False
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
     compression_attempts = 0
@@ -2104,6 +2220,162 @@ def run_conversation(
                                 force=True,
                             )
                         if assistant_message is not None and not _trunc_has_tool_calls:
+                            _is_partial_stream_stub = (
+                                getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
+                            )
+                            _dropped_tools = getattr(
+                                response, "_dropped_tool_names", None
+                            )
+
+                            # ── Convergence guards ────────────────────────
+                            # Scaffolding another continuation round only helps
+                            # when the OUTPUT cap was the binding constraint.
+                            # (a) Head-room guard: if the context window has no
+                            #     room left to write into, another round makes
+                            #     it strictly worse (two more messages, less
+                            #     room).  (b) Non-convergence guard: a
+                            #     continuation that returns ~no new content
+                            #     proves the model cannot make progress; burning
+                            #     the remaining attempts is pointless.
+                            # Either way: compact through the existing
+                            # compression machinery and retry once, or fail
+                            # fast and honestly.
+                            _new_text = agent._strip_think_blocks(
+                                assistant_message.content or ""
+                            ).strip()
+                            if not _is_partial_stream_stub and length_continue_retries >= 1:
+                                # Only a *continuation* response can prove
+                                # non-convergence.  A partial-stream stub's
+                                # empty content is a network artifact, not a
+                                # stalled model — leave its retry path alone.
+                                if len(_new_text) < _LENGTH_CONTINUE_MIN_NEW_CHARS:
+                                    length_no_progress_streak += 1
+                                else:
+                                    length_no_progress_streak = 0
+
+                            _headroom = _length_continuation_headroom(
+                                agent, request_pressure_tokens
+                            )
+                            _window_bound = (
+                                _headroom is not None
+                                and _headroom < _LENGTH_CONTINUE_MIN_HEADROOM_TOKENS
+                            )
+                            _not_converging = (
+                                length_no_progress_streak
+                                >= _LENGTH_CONTINUE_MAX_NO_PROGRESS
+                            )
+
+                            if _window_bound or _not_converging:
+                                _reason = (
+                                    f"context window exhausted "
+                                    f"(~{max(_headroom or 0, 0):,} tokens of room left)"
+                                    if _window_bound
+                                    else (
+                                        f"{length_no_progress_streak} continuation "
+                                        f"attempts produced no new content"
+                                    )
+                                )
+                                _can_compact = (
+                                    agent.compression_enabled
+                                    and agent.context_compressor is not None
+                                    and len(messages) > 1
+                                    and not length_continuation_compacted
+                                    and compression_attempts < 3
+                                )
+                                if _can_compact:
+                                    length_continuation_compacted = True
+                                    compression_attempts += 1
+                                    logger.info(
+                                        "Truncation livelock guard: %s — compacting "
+                                        "instead of scaffolding continuation "
+                                        "%s/4 (headroom=%s, context=%s)",
+                                        _reason,
+                                        length_continue_retries + 1,
+                                        _headroom,
+                                        int(
+                                            getattr(
+                                                agent.context_compressor,
+                                                "context_length",
+                                                0,
+                                            )
+                                            or 0
+                                        ),
+                                    )
+                                    agent._emit_status(
+                                        f"📦 Response truncated and {_reason} — "
+                                        f"compacting the conversation and retrying "
+                                        f"instead of asking the model to continue."
+                                    )
+                                    # Drop the half-finished continuation
+                                    # scaffolding so the compressor summarizes a
+                                    # coherent transcript, then compact via the
+                                    # same helper the overflow handler uses.
+                                    messages = _rollback_length_continuation_scaffolding(
+                                        agent, messages
+                                    )
+                                    messages, active_system_prompt = agent._compress_context(
+                                        messages,
+                                        system_message,
+                                        approx_tokens=request_pressure_tokens,
+                                        task_id=effective_task_id,
+                                    )
+                                    conversation_history = conversation_history_after_compression(
+                                        agent, messages
+                                    )
+                                    agent._session_messages = messages
+                                    # The partial text was rolled out of the
+                                    # transcript, so the model will answer afresh
+                                    # against the compacted window — do not
+                                    # prepend the stale partial to the result.
+                                    truncated_response_parts = []
+                                    length_continue_retries = 0
+                                    length_no_progress_streak = 0
+                                    agent._ephemeral_max_output_tokens = None
+                                    _retry.restart_with_compressed_messages = True
+                                    break
+
+                                # Nothing left to compact (disabled, already
+                                # spent this turn, or no history) — fail fast
+                                # with an honest, actionable message instead of
+                                # burning the remaining attempts on rounds that
+                                # cannot converge.
+                                partial_response = agent._strip_think_blocks(
+                                    "".join(
+                                        truncated_response_parts
+                                        + [assistant_message.content or ""]
+                                    )
+                                ).strip()
+                                _trunc_error = (
+                                    _CONTEXT_EXHAUSTED_ERROR
+                                    if _window_bound
+                                    else _NO_PROGRESS_ERROR
+                                )
+                                _trunc_guidance = (
+                                    _CONTEXT_EXHAUSTED_RESPONSE
+                                    if _window_bound
+                                    else _NO_PROGRESS_RESPONSE
+                                )
+                                agent._flush_status_buffer()
+                                agent._vprint(
+                                    f"{agent.log_prefix}❌ Stopping continuation "
+                                    f"retries: {_reason}.",
+                                    force=True,
+                                )
+                                agent._cleanup_task_resources(effective_task_id)
+                                agent._persist_session(messages, conversation_history)
+                                return {
+                                    "final_response": (
+                                        f"{partial_response}\n\n{_trunc_guidance}"
+                                        if partial_response
+                                        else _trunc_guidance
+                                    ),
+                                    "messages": messages,
+                                    "api_calls": api_call_count,
+                                    "completed": False,
+                                    "partial": True,
+                                    "error": _trunc_error,
+                                }
+
                             length_continue_retries += 1
                             interim_msg = agent._build_assistant_message(assistant_message, finish_reason)
                             messages.append(interim_msg)
@@ -2111,13 +2383,6 @@ def run_conversation(
                                 truncated_response_parts.append(assistant_message.content)
 
                             if length_continue_retries < 4:
-                                _is_partial_stream_stub = (
-                                    getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
-                                )
-                                _dropped_tools = getattr(
-                                    response, "_dropped_tool_names", None
-                                )
-
                                 if _is_partial_stream_stub and _dropped_tools:
                                     _tool_list = ", ".join(_dropped_tools[:3])
                                     agent._vprint(
@@ -4227,7 +4492,20 @@ def run_conversation(
             if _requested_cap is not None:
                 _boost = max(_boost, _requested_cap)
             _boost_cap = max(32768, _requested_cap or 0)
-            agent._ephemeral_max_output_tokens = min(_boost, _boost_cap)
+            _boosted = min(_boost, _boost_cap)
+            # Never ask for more output than the context window can still hold.
+            # Doubling the ask each round while the prompt grows is how the loop
+            # used to request a 65k completion into a 14k hole: the provider
+            # clamps it, returns finish_reason="length" again, and the cycle
+            # repeats. The head-room guard on the truncation path already
+            # refuses to continue below _LENGTH_CONTINUE_MIN_HEADROOM_TOKENS, so
+            # any value we reach here is at least that large.
+            _ctx_headroom = _length_continuation_headroom(
+                agent, request_pressure_tokens
+            )
+            if _ctx_headroom is not None and _ctx_headroom > 0:
+                _boosted = min(_boosted, _ctx_headroom)
+            agent._ephemeral_max_output_tokens = _boosted
             continue
 
         # Guard: if all retries exhausted without a successful response

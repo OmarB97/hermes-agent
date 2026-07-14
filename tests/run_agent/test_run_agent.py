@@ -5194,10 +5194,17 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("hello")
 
-        # Without think tags, the agent should attempt continuation retries
-        # (up to 4), not immediately fire thinking-exhaustion.
-        assert result["api_calls"] == 4
+        # Without think tags, the agent falls through to the continuation path
+        # (it must NOT fire thinking-exhaustion) — but a continuation that keeps
+        # returning no content is not converging, so the loop stops as soon as
+        # that is proven (two no-progress continuations) instead of burning all
+        # four attempts. Call 1 = initial truncation, calls 2 and 3 = the two
+        # continuation rounds that produce nothing.
+        assert result["api_calls"] == 3
         assert result["completed"] is False
+        assert result["partial"] is True
+        assert "no new content" in result["error"]
+        assert "/compress" in result["final_response"]
 
     def test_length_with_tool_calls_returns_partial_without_executing_tools(self, agent):
         self._setup_agent(agent)
