@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
+  bulkArchiveSessions,
   getCronJobs,
   getGlobalModelInfo,
   getGlobalModelOptions,
@@ -132,6 +133,19 @@ describe('Hermes REST session helpers', () => {
     expect(api).toHaveBeenCalledWith({
       path: '/api/sessions/session-1/messages?profile=xiaoxuxu',
       profile: 'xiaoxuxu'
+    })
+  })
+
+  it('routes bulk archive to the owning profile and deduplicates preserved ids', async () => {
+    api.mockResolvedValue({ archived: 3, ok: true })
+
+    await bulkArchiveSessions(['pinned', 'pinned', 'running'], 'coder')
+
+    expect(api).toHaveBeenCalledWith({
+      body: { preserve_ids: ['pinned', 'running'] },
+      method: 'POST',
+      path: '/api/sessions/bulk-archive',
+      profile: 'coder'
     })
   })
 

@@ -612,6 +612,7 @@ export function DesktopController() {
   })
 
   const {
+    archiveAllSessions,
     archiveSession,
     branchCurrentSession,
     branchStoredSession,
@@ -1026,6 +1027,7 @@ export function DesktopController() {
   const sidebar = (
     <ChatSidebar
       currentView={currentView}
+      onArchiveAllSessions={() => archiveAllSessions().then(() => refreshSessions())}
       onArchiveSession={sessionId => void archiveSession(sessionId)}
       onBranchSession={sessionId => void branchStoredSession(sessionId)}
       onDeleteSession={sessionId => void removeSession(sessionId)}

@@ -7,6 +7,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { PlatformAvatar } from '@/app/messaging/platform-icon'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { KbdGroup } from '@/components/ui/kbd'
 import { SearchField } from '@/components/ui/search-field'
@@ -207,6 +208,7 @@ interface ChatSidebarProps extends React.ComponentProps<typeof Sidebar> {
   onResumeSession: (sessionId: string) => void
   onDeleteSession: (sessionId: string) => void
   onArchiveSession: (sessionId: string) => void
+  onArchiveAllSessions: () => Promise<void> | void
   onBranchSession: (sessionId: string) => void
   onNewSessionInWorkspace: (path: null | string) => void
   onManageCronJob: (jobId: string) => void
@@ -222,6 +224,7 @@ export function ChatSidebar({
   onResumeSession,
   onDeleteSession,
   onArchiveSession,
+  onArchiveAllSessions,
   onBranchSession,
   onNewSessionInWorkspace,
   onManageCronJob,
@@ -275,6 +278,7 @@ export function ChatSidebar({
   const gatewayState = useStore($gatewayState)
   const dismissedAutoProjects = useStore($dismissedAutoProjectIds)
   const [searchQuery, setSearchQuery] = useState('')
+  const [archiveAllOpen, setArchiveAllOpen] = useState(false)
   const [serverMatches, setServerMatches] = useState<SessionSearchResult[]>([])
   const [searchPending, setSearchPending] = useState(false)
   const [newSessionKbdFlash, setNewSessionKbdFlash] = useState(false)
@@ -1266,6 +1270,22 @@ export function ChatSidebar({
                           <Codicon name="add" size="0.75rem" />
                         </Button>
                       ) : null}
+                      {!showAllProfiles && agentSessions.length > 0 ? (
+                        <Button
+                          aria-label={s.archiveAllAria}
+                          className={HEADER_ACTION_BTN}
+                          disabled={sessionsLoading}
+                          onClick={event => {
+                            event.stopPropagation()
+                            setArchiveAllOpen(true)
+                          }}
+                          size="icon-xs"
+                          title={s.archiveAllTitle}
+                          variant="ghost"
+                        >
+                          <Codicon name="archive" size="0.75rem" />
+                        </Button>
+                      ) : null}
                       <div className="grid size-6 place-items-center">
                         {!showAllProfiles && agentSessions.length > 0 ? (
                           <Button
@@ -1400,6 +1420,23 @@ export function ChatSidebar({
           </div>
         )}
       </SidebarContent>
+      <ConfirmDialog
+        busyLabel={s.archiveAllSubmitting}
+        confirmLabel={s.archiveAllConfirm}
+        description={
+          <>
+            {s.archiveAllDialogDesc}
+            <span className="mt-2 block rounded-md border border-(--ui-stroke-tertiary) bg-(--ui-control-background) px-3 py-2 text-xs text-(--ui-text-secondary)">
+              {s.archiveAllChecked(agentSessions.length)}
+            </span>
+          </>
+        }
+        destructive
+        onClose={() => setArchiveAllOpen(false)}
+        onConfirm={onArchiveAllSessions}
+        open={archiveAllOpen}
+        title={s.archiveAllDialogTitle}
+      />
       <ProjectDialog />
     </Sidebar>
   )

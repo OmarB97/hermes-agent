@@ -1231,6 +1231,15 @@ export interface Translations {
     showSessions: string
     groupTitleGrouped: string
     groupTitleUngrouped: string
+    archiveAllTitle: string
+    archiveAllAria: string
+    archiveAllDialogTitle: string
+    archiveAllDialogDesc: string
+    archiveAllConfirm: string
+    archiveAllSubmitting: string
+    archiveAllChecked: (count: number) => string
+    archiveAllSucceeded: (count: number) => string
+    archiveAllFailed: string
     allPinned: string
     shiftClickHint: string
     noWorkspace: string

@@ -1,6 +1,7 @@
 import type * as React from 'react'
 
 import type { ChatMessage } from '@/lib/chat-messages'
+import type { UsageStats } from '@/types/hermes'
 
 export interface ContextSuggestion {
   text: string
@@ -135,6 +136,9 @@ export interface SidebarNavItem {
 export interface ClientSessionState {
   storedSessionId: string | null
   messages: ChatMessage[]
+  /** Per-session usage snapshot. The global usage atom mirrors only the
+   *  focused session so background streams cannot overwrite its context bar. */
+  usage: UsageStats
   branch: string
   cwd: string
   model: string

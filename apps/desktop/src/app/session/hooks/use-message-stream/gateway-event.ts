@@ -17,6 +17,7 @@ import {
 import { gatewayEventRequiresSessionId } from '@/lib/gateway-events'
 import { triggerHaptic } from '@/lib/haptics'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
+import { mergeTokenUsagePayload, mergeUsageSnapshot, type TokenUsagePayload } from '@/lib/token-usage'
 import { clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
 import { setSessionCompacting } from '@/store/compaction'
 import { refreshBackgroundProcesses } from '@/store/composer-status'
@@ -39,7 +40,6 @@ import {
   setCurrentProvider,
   setCurrentReasoningEffort,
   setCurrentServiceTier,
-  setCurrentUsage,
   setLocalDeviceName,
   setSessions,
   setTurnStartedAt,
@@ -232,12 +232,13 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           }
         }
 
-        if (sessionId && hasStatePatch) {
+        if (sessionId && (hasStatePatch || payload?.usage)) {
           updateSessionState(sessionId, state => ({
             ...state,
             ...statePatch,
             branch: statePatch.branch ?? state.branch,
-            cwd: statePatch.cwd ?? state.cwd
+            cwd: statePatch.cwd ?? state.cwd,
+            usage: payload?.usage ? mergeUsageSnapshot(state.usage, payload.usage) : state.usage
           }))
         }
 
@@ -274,10 +275,6 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           }
         }
 
-        if (payload?.usage && (!explicitSid || isActiveEvent)) {
-          setCurrentUsage(current => ({ ...current, ...payload.usage }))
-        }
-
         if (typeof payload?.credential_warning === 'string' && payload.credential_warning) {
           requestDesktopOnboarding(payload.credential_warning)
         }
@@ -291,6 +288,14 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         if (modelChanged || providerChanged) {
           void queryClient.invalidateQueries({
             queryKey: explicitSid && sessionId ? ['model-options', sessionId] : ['model-options']
+          })
+        }
+      } else if (event.type === 'token.usage') {
+        if (sessionId) {
+          updateSessionState(sessionId, state => {
+            const usage = mergeTokenUsagePayload(state.usage, event.payload as TokenUsagePayload | undefined)
+
+            return usage === state.usage ? state : { ...state, usage }
           })
         }
       } else if (event.type === 'message.start') {
@@ -418,7 +423,10 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         }
 
         if (payload?.usage) {
-          setCurrentUsage(current => ({ ...current, ...payload.usage }))
+          updateSessionState(sessionId, state => ({
+            ...state,
+            usage: mergeUsageSnapshot(state.usage, payload.usage)
+          }))
         }
       } else if (event.type === 'turn.outcome') {
         if (!sessionId) {
@@ -516,6 +524,13 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         flushQueuedDeltas(sessionId)
         upsertToolCall(sessionId, toTodoPayload(payload) ?? payload, 'running', event.type)
 
+        if (payload?.usage) {
+          updateSessionState(sessionId, state => ({
+            ...state,
+            usage: mergeUsageSnapshot(state.usage, payload.usage)
+          }))
+        }
+
         if (isActiveEvent) {
           setPetActivity({ reasoning: false, toolRunning: true })
         }
@@ -533,6 +548,13 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           // the sidebar indicator clears as soon as it's answered, not only at
           // message.complete.
           updateSessionState(sessionId, state => (state.needsInput ? { ...state, needsInput: false } : state))
+
+          if (payload?.usage) {
+            updateSessionState(sessionId, state => ({
+              ...state,
+              usage: mergeUsageSnapshot(state.usage, payload.usage)
+            }))
+          }
 
           // terminal/process tool calls are the only things that spawn or reap
           // background processes — sync the composer status stack right after.

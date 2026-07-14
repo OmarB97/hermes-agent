@@ -444,6 +444,7 @@ export interface SessionRuntimeInfo {
 
 export interface UsageStats {
   calls: number
+  compressions?: number
   context_max?: number
   context_percent?: number
   context_used?: number

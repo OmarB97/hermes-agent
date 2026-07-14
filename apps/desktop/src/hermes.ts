@@ -270,6 +270,18 @@ export function setSessionArchived(id: string, archived: boolean, profile?: stri
   })
 }
 
+export function bulkArchiveSessions(
+  preserveIds: string[] = [],
+  profile?: string | null
+): Promise<{ ok: boolean; archived: number }> {
+  return window.hermesDesktop.api<{ ok: boolean; archived: number }>({
+    ...(profile ? { profile } : {}),
+    path: '/api/sessions/bulk-archive',
+    method: 'POST',
+    body: { preserve_ids: Array.from(new Set(preserveIds.filter(Boolean))).slice(0, 5000) }
+  })
+}
+
 export function searchSessions(query: string): Promise<SessionSearchResponse> {
   return window.hermesDesktop.api<SessionSearchResponse>({
     path: `/api/sessions/search?q=${encodeURIComponent(query)}`

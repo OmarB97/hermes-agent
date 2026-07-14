@@ -2,10 +2,12 @@ import type { MutableRefObject } from 'react'
 import { useCallback, useRef } from 'react'
 import type { NavigateFunction } from 'react-router-dom'
 
-import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
+import { bulkArchiveSessions, deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { type ChatMessage, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
 import { restoreFallbackNotices } from '@/lib/fallback-notices'
+import { sessionArchivePreserveIds } from '@/lib/session-eligibility'
+import { emptyUsageStats, mergeUsageSnapshot } from '@/lib/token-usage'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { clearQueuedPrompts } from '@/store/composer-queue'
 import { $pinnedSessionIds } from '@/store/layout'
@@ -20,6 +22,8 @@ import {
   $currentReasoningEffort,
   $messages,
   $sessions,
+  $sessionsTotal,
+  $workingSessionIds,
   $yoloActive,
   sessionAliasIds,
   setActiveSessionId,
@@ -77,6 +81,13 @@ function pinnedAliasesFor(session: SessionInfo | null | undefined, fallbackId: s
   return aliases
 }
 
+function storedSessionUsagePreview(stored: SessionInfo): UsageStats {
+  const input = stored.input_tokens || 0
+  const output = stored.output_tokens || 0
+
+  return { calls: 0, input, output, total: input + output }
+}
+
 interface SessionActionsOptions {
   activeSessionId: string | null
   activeSessionIdRef: MutableRefObject<string | null>
@@ -122,6 +133,7 @@ export function useSessionActions({
 }: SessionActionsOptions) {
   const { t } = useI18n()
   const copy = t.desktop
+  const sidebarCopy = t.sidebar
   const resumeRequestRef = useRef(0)
 
   const startFreshSessionDraft = useCallback(
@@ -137,12 +149,7 @@ export function useSessionActions({
       setSelectedStoredSessionId(null)
       selectedStoredSessionIdRef.current = null
       setMessages([])
-      setCurrentUsage({
-        calls: 0,
-        input: 0,
-        output: 0,
-        total: 0
-      })
+      setCurrentUsage(emptyUsageStats())
       setSessionStartedAt(null)
       setTurnStartedAt(null)
       // The composer's model/effort/fast is sticky UI state (persisted in
@@ -421,7 +428,10 @@ export function useSessionActions({
             }
 
             if (usage) {
-              setCurrentUsage(current => ({ ...current, ...usage }))
+              updateSessionState(cachedRuntimeId, state => ({
+                ...state,
+                usage: mergeUsageSnapshot(state.usage, usage, { allowContextDecrease: true })
+              }))
             }
 
             return
@@ -458,12 +468,7 @@ export function useSessionActions({
       applyStoredSessionPreviewRuntimeInfo(stored)
 
       if (stored) {
-        setCurrentUsage(current => ({
-          ...current,
-          input: stored.input_tokens || 0,
-          output: stored.output_tokens || 0,
-          total: (stored.input_tokens || 0) + (stored.output_tokens || 0)
-        }))
+        setCurrentUsage(storedSessionUsagePreview(stored))
       }
 
       let resumedRunning = false
@@ -881,12 +886,7 @@ export function useSessionActions({
           const stored = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
 
           if (stored) {
-            setCurrentUsage(current => ({
-              ...current,
-              input: stored.input_tokens || 0,
-              output: stored.output_tokens || 0,
-              total: (stored.input_tokens || 0) + (stored.output_tokens || 0)
-            }))
+            setCurrentUsage(storedSessionUsagePreview(stored))
           }
 
           setMessages(previousMessages)
@@ -961,7 +961,51 @@ export function useSessionActions({
     [copy, selectedStoredSessionId, startFreshSessionDraft]
   )
 
+  const archiveAllSessions = useCallback(async () => {
+    clearNotifications()
+
+    const previousSessions = $sessions.get()
+    const previousTotal = $sessionsTotal.get()
+    const preserveIds = sessionArchivePreserveIds(previousSessions, {
+      activeSessionId,
+      pinnedSessionIds: $pinnedSessionIds.get(),
+      selectedSessionId: selectedStoredSessionId,
+      workingSessionIds: $workingSessionIds.get()
+    })
+
+    const shouldPreserve = (session: SessionInfo) => sessionAliasIds(session).some(id => preserveIds.has(id))
+    const keptSessions = previousSessions.filter(shouldPreserve)
+    setSessions(keptSessions)
+    setSessionsTotal(keptSessions.length)
+
+    const profiles = Array.from(
+      new Set(previousSessions.map(session => normalizeProfileKey(session.profile)).filter(Boolean))
+    )
+
+    if (profiles.length === 0) {
+      profiles.push(normalizeProfileKey($activeGatewayProfile.get()))
+    }
+
+    try {
+      const results = await Promise.all(
+        profiles.map(profile => bulkArchiveSessions([...preserveIds], profile || undefined))
+      )
+      const archived = results.reduce((sum, result) => sum + result.archived, 0)
+
+      notify({ durationMs: 2_500, kind: 'success', message: sidebarCopy.archiveAllSucceeded(archived) })
+      broadcastSessionsChanged()
+
+      return { archived, ok: true }
+    } catch (err) {
+      setSessions(previousSessions)
+      setSessionsTotal(previousTotal)
+      notifyError(err, sidebarCopy.archiveAllFailed)
+      throw err
+    }
+  }, [activeSessionId, selectedStoredSessionId, sidebarCopy])
+
   return {
+    archiveAllSessions,
     archiveSession,
     branchCurrentSession,
     branchStoredSession,

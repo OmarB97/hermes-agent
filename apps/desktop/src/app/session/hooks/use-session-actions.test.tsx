@@ -412,28 +412,7 @@ describe('resumeSession failure recovery', () => {
       current: new Map([
         [
           'runtime-stale',
-          {
-            awaitingResponse: false,
-            branch: '',
-            busy: false,
-            cwd: '',
-            fallbackPolicy: '',
-            fast: false,
-            interrupted: false,
-            messages: [],
-            model: '',
-            needsInput: false,
-            pendingBranchGroup: null,
-            personality: '',
-            provider: '',
-            reasoningEffort: '',
-            sawAssistantPayload: false,
-            serviceTier: '',
-            storedSessionId: 'stored-1',
-            streamId: null,
-            turnStartedAt: null,
-            yolo: false
-          }
+          createClientSessionState('stored-1')
         ]
       ])
     } satisfies MutableRefObject<Map<string, ClientSessionState>>
