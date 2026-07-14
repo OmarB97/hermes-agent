@@ -62,6 +62,23 @@ import {
   toTodoPayload
 } from './utils'
 
+// Assistant activity that can only happen once auto-compaction has finished:
+// the agent is producing content again. Seeing any of these is the end-of-
+// compaction signal the backend never sends.
+//
+// Deliberately excludes turn lifecycle events (message.start / message.complete
+// / error) — those already clear compaction explicitly, and message.start also
+// SETS up the next turn, so folding it in here would be redundant at best.
+const COMPACTION_RESUME_EVENTS: ReadonlySet<string> = new Set([
+  'message.delta',
+  'thinking.delta',
+  'reasoning.delta',
+  'tool.start',
+  'tool.progress',
+  'tool.generating',
+  'tool.complete'
+])
+
 interface GatewayEventDeps {
   activeSessionIdRef: MutableRefObject<string | null>
   activeTurnIdsRef: MutableRefObject<Map<string, string>>
@@ -122,6 +139,24 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
       const sessionId = explicitSid || activeSessionIdRef.current
       const isActiveEvent = !!sessionId && sessionId === activeSessionIdRef.current
+
+      // Auto-compaction is synchronous: the agent stops, summarizes, then keeps
+      // going. The backend announces the START (a `lifecycle` status carrying
+      // COMPACTION_STATUS_MARKER, re-tagged to kind="compacting" in
+      // tui_gateway/server.py) but emits NO matching "done" notice — so the only
+      // clears we had were turn-start, turn-complete and error.
+      //
+      // On a long agentic turn that means the "Summarizing thread" label stays
+      // pinned for the entire REST of the turn. Observed: it sat there for 16+
+      // minutes, timer counting, while the agent was visibly running tools and
+      // writing text underneath it.
+      //
+      // The first content the agent emits after compacting IS the proof that
+      // compacting finished, so clear on it. setSessionCompacting is a no-op when
+      // the session is not marked, so this stays cheap on every delta.
+      if (sessionId && COMPACTION_RESUME_EVENTS.has(event.type)) {
+        setSessionCompacting(sessionId, false)
+      }
 
       if (event.type === 'gateway.ready') {
         const rawDeviceName = (payload as { device_name?: unknown } | undefined)?.device_name
