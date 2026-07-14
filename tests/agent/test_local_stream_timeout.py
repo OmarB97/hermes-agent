@@ -209,7 +209,7 @@ class TestLocalDflashStaleTimeout:
         assert timeout == 180.0
         assert timeout > 116.0
 
-    def test_taro_w2_first_chunk_floor_is_route_and_model_specific(
+    def test_managed_local_w2_timeout_floor_is_route_and_model_specific(
         self,
         monkeypatch,
         tmp_path,
@@ -225,16 +225,35 @@ class TestLocalDflashStaleTimeout:
             "messages": [{"role": "user", "content": "hello"}],
         }
         taro_w2 = self._make_agent(model="deepseek-v4-flash-w2")
+        meshboard_w2 = self._make_agent(
+            model="deepseek-v4-flash-w2",
+            base_url="http://127.0.0.1:8080/v1",
+            provider="meshboard-qualified-local",
+        )
         other_route = self._make_agent(
             model="deepseek-v4-flash-w2",
             provider="other-lan",
         )
-        taro_iq3 = self._make_agent(model="deepseek-v4-flash-iq3xxs")
+        remote_lookalike = self._make_agent(
+            model="deepseek-v4-flash-w2",
+            base_url="https://models.example.com/v1",
+            provider="meshboard-qualified-local",
+        )
+        managed_iq3 = self._make_agent(
+            model="deepseek-v4-flash-iq3xxs",
+            provider="meshboard-qualified-local",
+        )
 
+        assert resolve_stream_stale_timeout(taro_w2, payload) == 180.0
         assert resolve_dflash_local_first_chunk_timeout(taro_w2, payload) == 360.0
+        assert resolve_stream_stale_timeout(meshboard_w2, payload) == 180.0
+        assert resolve_dflash_local_first_chunk_timeout(meshboard_w2, payload) == 360.0
+        assert resolve_stream_stale_timeout(other_route, payload) == 180.0
         assert resolve_dflash_local_first_chunk_timeout(other_route, payload) == 180.0
+        assert resolve_stream_stale_timeout(remote_lookalike, payload) == 180.0
+        assert resolve_dflash_local_first_chunk_timeout(remote_lookalike, payload) is None
         assert resolve_dflash_local_first_chunk_timeout(
-            taro_iq3,
+            managed_iq3,
             {**payload, "model": "deepseek-v4-flash-iq3xxs"},
         ) == 180.0
 
