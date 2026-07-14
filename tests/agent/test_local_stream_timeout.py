@@ -20,6 +20,7 @@ from agent.chat_completion_helpers import (
     _dflash_context_timeout_default,
     _gate_status_url,
     _local_backend_generation_active,
+    _is_managed_local_w2_route,
     resolve_dflash_local_first_chunk_timeout,
     resolve_stream_stale_timeout,
 )
@@ -889,6 +890,11 @@ class TestProgressAwareWatchdog:
         ):
             monkeypatch.delenv(var, raising=False)
         monkeypatch.setenv("HERMES_DFLASH_FIRST_CHUNK_CEILING", ceiling)
+        # Pin the budget well under the ceiling. Since the runtime resolver now
+        # reaches the context-scaled budget, a 90.7k prompt would otherwise
+        # resolve to ~723s -- ABOVE this test's 600s ceiling -- so the loop would
+        # skip the liveness probe and kill, which is not what this test is about.
+        monkeypatch.setenv("HERMES_DFLASH_FIRST_CHUNK_TIMEOUT", "120")
 
         class Clock:
             now = 0.0
@@ -984,3 +990,121 @@ class TestProgressAwareWatchdog:
 
         assert isinstance(raised, TimeoutError)
         assert not [s for s in statuses if "Still prefilling" in s]
+
+
+class TestRuntimeFirstChunkBudgetIsReachable:
+    """The context-scaled budget must actually be used by the RUNTIME resolver.
+
+    `_dflash_context_timeout_default` models the real cost of a healthy request
+    (cold-start allowance + per-1k prefill). But only the legacy
+    `_dflash_local_first_chunk_timeout` helper ever called it — the runtime path,
+    `resolve_dflash_local_first_chunk_timeout`, fell straight through to the
+    stale ladder. So the cost model existed and was never reached: a 90k-token
+    turn got 240s from a step function calibrated against nothing.
+    """
+
+    class _Agent:
+        # The path the desktop actually uses: ko-nas fleet router -> taro -> W2.
+        provider = "ai-router"
+        base_url = "http://10.10.20.199:9081/v1"
+        model = "deepseek-v4-flash-w2"
+        api_mode = "chat_completions"
+
+    @staticmethod
+    def _kwargs(tokens: int) -> dict:
+        return {
+            "model": "deepseek-v4-flash-w2",
+            "messages": [{"role": "user", "content": "x" * (tokens * 4)}],
+        }
+
+    @staticmethod
+    def _clear(monkeypatch) -> None:
+        for var in (
+            "HERMES_DFLASH_FIRST_CHUNK_TIMEOUT",
+            "HERMES_DFLASH_TTFB_TIMEOUT",
+            "HERMES_STREAM_STALE_TIMEOUT",
+            "HERMES_DFLASH_STALE_TIMEOUT",
+            "HERMES_DFLASH_STREAM_STALE_TIMEOUT",
+            "HERMES_DFLASH_PREFILL_SECONDS_PER_1K",
+            "HERMES_DFLASH_COLD_START_ALLOWANCE",
+            "HERMES_DFLASH_FIRST_CHUNK_CEILING",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+    def test_ai_router_is_recognised_as_a_managed_w2_route(self):
+        """The provider allowlist missed the one the desktop actually uses."""
+        assert _is_managed_local_w2_route(self._Agent(), "deepseek-v4-flash-w2") is True
+
+    def test_an_arbitrary_lan_provider_is_NOT_a_managed_w2_route(self):
+        """The floor is route-specific on purpose.
+
+        A provider that merely happens to serve a W2-named model over the LAN is
+        not this lane and must keep the generic deadline. Widening the check to
+        "any local endpoint" would silently grant it the 360s floor.
+        """
+        class Agent(self._Agent):
+            provider = "other-lan"
+
+        assert _is_managed_local_w2_route(Agent(), "deepseek-v4-flash-w2") is False
+
+    def test_remote_endpoint_is_not_a_managed_w2_route(self):
+        """A W2-named model behind a REMOTE endpoint must not get local floors."""
+        class Agent(self._Agent):
+            provider = "openrouter"
+            base_url = "https://openrouter.ai/api/v1"
+
+        assert _is_managed_local_w2_route(Agent(), "deepseek-v4-flash-w2") is False
+
+    def test_non_w2_model_is_not_a_managed_w2_route(self):
+        assert _is_managed_local_w2_route(self._Agent(), "qwen3.6-27b") is False
+
+    def test_runtime_budget_scales_with_context_instead_of_the_ladder(
+        self, monkeypatch
+    ):
+        """The regression: 90.7k used to resolve to exactly 240s."""
+        self._clear(monkeypatch)
+
+        budget_90k = resolve_dflash_local_first_chunk_timeout(
+            self._Agent(), self._kwargs(90_700)
+        )
+        assert budget_90k > 240.0 * 2, (
+            f"runtime budget at 90.7k is {budget_90k:.0f}s — the stale ladder's "
+            "240s is still winning, so the context cost model is unreachable"
+        )
+
+        # Continuous, not a step function.
+        budgets = [
+            resolve_dflash_local_first_chunk_timeout(self._Agent(), self._kwargs(n))
+            for n in (10_000, 50_000, 79_800, 90_700, 131_072)
+        ]
+        assert budgets == sorted(budgets), f"budget is not monotonic: {budgets}"
+
+    def test_runtime_budget_never_shrinks_below_the_old_floors(self, monkeypatch):
+        self._clear(monkeypatch)
+
+        def old_ladder(n):
+            if n > 100_000:
+                return 300.0
+            if n > 50_000:
+                return 240.0
+            return 180.0
+
+        for tokens in (1_000, 50_001, 90_700, 100_001, 131_072):
+            budget = resolve_dflash_local_first_chunk_timeout(
+                self._Agent(), self._kwargs(tokens)
+            )
+            assert budget >= old_ladder(tokens), (
+                f"budget shrank at {tokens:,} tokens: {budget} < {old_ladder(tokens)}"
+            )
+
+    def test_explicit_env_override_still_wins(self, monkeypatch):
+        """An operator who pinned a number must still get exactly that number."""
+        self._clear(monkeypatch)
+        monkeypatch.setenv("HERMES_DFLASH_FIRST_CHUNK_TIMEOUT", "45")
+
+        assert (
+            resolve_dflash_local_first_chunk_timeout(
+                self._Agent(), self._kwargs(90_700)
+            )
+            == 45.0
+        )
