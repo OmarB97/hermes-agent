@@ -339,6 +339,110 @@ class TestLocalDflashStaleTimeout:
         assert statuses[0].endswith("Reconnecting...")
         assert replacements == ["dflash_first_chunk_pool_cleanup"]
 
+    def test_first_chunk_timeout_cancels_the_worker_instead_of_orphaning_it(
+        self,
+        monkeypatch,
+    ):
+        """A first-chunk timeout must CANCEL the streaming worker, not orphan it.
+
+        The poll loop force-closes the connection, then breaks with a
+        TimeoutError. The worker's exception handler retries on transport
+        errors *unless* ``_request_cancelled`` is set — it cannot otherwise
+        distinguish our deliberate close from a network blip.
+
+        So if the flag is not set before the close, the worker retries in the
+        background against a turn the main loop has already abandoned. When a
+        slow local model (deepseek-v4-flash-w2) finally answers minutes later,
+        that orphan writes into the finalised turn: the desktop streams text
+        into an idle composer that offers no way to interrupt it.
+
+        Assert the flag is set on the worker's own closure.
+        """
+        monkeypatch.delenv("HERMES_STREAM_STALE_TIMEOUT", raising=False)
+        monkeypatch.delenv("HERMES_DFLASH_STALE_TIMEOUT", raising=False)
+        monkeypatch.delenv("HERMES_DFLASH_STREAM_STALE_TIMEOUT", raising=False)
+        monkeypatch.delenv("HERMES_DFLASH_FIRST_CHUNK_TIMEOUT", raising=False)
+        monkeypatch.delenv("HERMES_DFLASH_TTFB_TIMEOUT", raising=False)
+
+        class Clock:
+            now = 0.0
+
+            @classmethod
+            def time(cls):
+                return cls.now
+
+        spawned = []
+
+        class NoResponseThread:
+            joins = 0
+
+            def __init__(self, *, target, daemon):
+                self.target = target
+                self.daemon = daemon
+                spawned.append(self)
+
+            def start(self):
+                return None
+
+            def is_alive(self):
+                return True
+
+            def join(self, timeout=None):
+                if timeout == 0.3:
+                    type(self).joins += 1
+                    Clock.now = 181.0 if self.joins == 1 else 361.0
+
+        class Agent:
+            api_mode = "chat_completions"
+            base_url = "http://10.10.20.211:8080/v1"
+            provider = "taro"
+            model = "deepseek-v4-flash-w2"
+            _interrupt_requested = False
+            _consecutive_stale_streams = 0
+
+            @staticmethod
+            def _touch_activity(_message):
+                return None
+
+            @staticmethod
+            def _buffer_status(_message):
+                return None
+
+            @staticmethod
+            def _replace_primary_openai_client(*, reason):
+                return None
+
+        monkeypatch.setattr(
+            "agent.chat_completion_helpers.threading.Thread",
+            NoResponseThread,
+        )
+        monkeypatch.setattr("agent.chat_completion_helpers.time.time", Clock.time)
+
+        with pytest.raises(TimeoutError, match=r"no first chunk after 361s"):
+            interruptible_streaming_api_call(
+                Agent(),
+                {
+                    "model": "deepseek-v4-flash-w2",
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+            )
+
+        assert len(spawned) == 1, "expected exactly one streaming worker"
+        worker = spawned[0].target
+        freevars = worker.__code__.co_freevars
+        assert "_request_cancelled" in freevars, (
+            "the streaming worker no longer closes over _request_cancelled; "
+            "this test must be updated to track the new cancellation channel"
+        )
+        cancelled = worker.__closure__[
+            freevars.index("_request_cancelled")
+        ].cell_contents
+        assert cancelled["value"] is True, (
+            "first-chunk timeout abandoned the turn without cancelling the "
+            "worker: it will retry in the background and stream a late "
+            "response into an already-finalised turn"
+        )
+
     def test_dflash_first_chunk_timeout_has_independent_env(self, monkeypatch):
         monkeypatch.setenv("HERMES_DFLASH_FIRST_CHUNK_TIMEOUT", "45")
 
