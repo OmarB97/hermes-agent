@@ -240,6 +240,7 @@ describe('useSessionStateCache — per-session turn timer', () => {
 
   it('switches the context meter immediately to the newly focused cached session', () => {
     let cache!: Cache
+
     const { rerender } = render(
       <Harness activeSessionId="session-a" onReady={c => (cache = c)} selectedStoredSessionId="stored-a" />
     )

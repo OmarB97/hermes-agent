@@ -514,10 +514,12 @@ export function DesktopController() {
       for (let index = 0; index < Math.max(1, attempts); index += 1) {
         try {
           const latest = await getSessionMessages(storedSessionId, storedProfile)
+
           const messages = restoreFallbackNotices(
             storedSessionId,
             toChatMessages(latest.messages, latest.turn_outcomes)
           )
+
           updateSessionState(
             runtimeSessionId,
             state => ({

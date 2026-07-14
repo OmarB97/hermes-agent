@@ -65,12 +65,17 @@ export function usageFromTokenUsagePayload(payload: TokenUsagePayload | null | u
   const contextMax = positiveNumber(payload.context_length)
   const contextPercent = percentFrom(payload)
 
-  if (input !== undefined) usage.input = input
-  if (output !== undefined) usage.output = output
-  if (total !== undefined) usage.total = total
-  if (contextUsed !== undefined) usage.context_used = contextUsed
-  if (contextMax !== undefined) usage.context_max = contextMax
-  if (contextPercent !== undefined) usage.context_percent = contextPercent
+  if (input !== undefined) {usage.input = input}
+
+  if (output !== undefined) {usage.output = output}
+
+  if (total !== undefined) {usage.total = total}
+
+  if (contextUsed !== undefined) {usage.context_used = contextUsed}
+
+  if (contextMax !== undefined) {usage.context_max = contextMax}
+
+  if (contextPercent !== undefined) {usage.context_percent = contextPercent}
 
   return Object.keys(usage).length ? usage : null
 }
@@ -96,12 +101,15 @@ export function mergeUsageSnapshot(
   const incomingContextPercent = finiteNumber(incoming.context_percent)
   const incomingCompressionCount = finiteNumber(incoming.compressions)
   const currentCompressionCount = finiteNumber(current.compressions) ?? 0
+
   const compressionAdvanced =
     incomingCompressionCount !== undefined && incomingCompressionCount > currentCompressionCount
+
   const contextWindowChanged =
     incoming.context_max !== undefined &&
     current.context_max !== undefined &&
     incoming.context_max !== current.context_max
+
   const contextWentBackwards =
     (currentContextUsed !== undefined &&
       incomingContextUsed !== undefined &&

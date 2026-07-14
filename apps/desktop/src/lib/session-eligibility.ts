@@ -17,7 +17,8 @@ interface SessionArchivePreserveOptions {
 
 function addPreserveId(ids: Set<string>, value: null | string | undefined) {
   const id = String(value ?? '').trim()
-  if (id) ids.add(id)
+
+  if (id) {ids.add(id)}
 }
 
 function aliases(session: SessionInfo): string[] {
@@ -37,13 +38,15 @@ export function sessionArchivePreserveIds(
 ): Set<string> {
   const preserveIds = new Set<string>()
 
-  for (const id of pinnedSessionIds) addPreserveId(preserveIds, id)
-  for (const id of workingSessionIds) addPreserveId(preserveIds, id)
+  for (const id of pinnedSessionIds) {addPreserveId(preserveIds, id)}
+
+  for (const id of workingSessionIds) {addPreserveId(preserveIds, id)}
   addPreserveId(preserveIds, selectedSessionId)
   addPreserveId(preserveIds, activeSessionId)
 
   for (const session of sessions) {
     const sessionAliases = aliases(session)
+
     if (sessionAliases.some(id => preserveIds.has(id))) {
       sessionAliases.forEach(id => addPreserveId(preserveIds, id))
     }
@@ -63,10 +66,12 @@ export function computeSessionEligibility(
 
   for (const session of sessions) {
     const sid = String(session.id).trim()
-    if (!sid) continue
+
+    if (!sid) {continue}
 
     const targetId = String(session._lineage_root_id ?? sid).trim() || sid
-    if (seenTargets.has(targetId)) continue
+
+    if (seenTargets.has(targetId)) {continue}
     seenTargets.add(targetId)
 
     const startedAt = Number(session.started_at) || 0

@@ -30,6 +30,7 @@ function Harness() {
     updateSessionState: (sessionId, updater, storedSessionId) => {
       const current =
         sessionStateByRuntimeIdRef.current.get(sessionId) ?? createClientSessionState(storedSessionId ?? null)
+
       const next = updater(current)
       sessionStateByRuntimeIdRef.current.set(sessionId, next)
 

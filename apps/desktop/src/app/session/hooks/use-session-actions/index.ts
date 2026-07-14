@@ -966,6 +966,7 @@ export function useSessionActions({
 
     const previousSessions = $sessions.get()
     const previousTotal = $sessionsTotal.get()
+
     const preserveIds = sessionArchivePreserveIds(previousSessions, {
       activeSessionId,
       pinnedSessionIds: $pinnedSessionIds.get(),
@@ -990,6 +991,7 @@ export function useSessionActions({
       const results = await Promise.all(
         profiles.map(profile => bulkArchiveSessions([...preserveIds], profile || undefined))
       )
+
       const archived = results.reduce((sum, result) => sum + result.archived, 0)
 
       notify({ durationMs: 2_500, kind: 'success', message: sidebarCopy.archiveAllSucceeded(archived) })
