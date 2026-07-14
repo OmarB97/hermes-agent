@@ -388,12 +388,35 @@ preview = true  # required for PLW1514 (unspecified-encoding) — preview rule
 # which silently corrupts any non-ASCII file content.  We had three
 # separate Windows sandbox regressions in one debug session before
 # adding the explicit encoding.  This rule keeps new code honest.
-select = ["PLW1514"]
+select = ["PLW1514", "F821"]
 
 [tool.ruff.lint.per-file-ignores]
 # Tests can intentionally exercise locale-encoding edge cases.
-"tests/**" = ["PLW1514"]
+"tests/**" = ["PLW1514", "F821"]
 # Skills and plugins are partially user-authored — their own conventions.
 "skills/**" = ["PLW1514"]
-"optional-skills/**" = ["PLW1514"]
-"plugins/**" = ["PLW1514"]
+"optional-skills/**" = ["PLW1514", "F821"]
+"plugins/**" = ["PLW1514", "F821"]
+
+# F821 (undefined-name) ratchet — added 2026-07-14.
+#
+# Turning F821 on caught a NameError that had already SHIPPED to main:
+# hermes_cli/doctor.py referenced `npm_dirs` and `audit_extra`, neither of which
+# existed. A refactor rewrote the target list and the loop BODY but not the `for`
+# statement, so `hermes doctor` crashed outright for every user — and MeshBoard
+# profile installs, which shell out to `hermes doctor`, failed with it. Ruff had
+# every rule except PLW1514 switched off, so nothing flagged it.
+#
+# F821 is enforced from here on. The pre-existing backlog is grandfathered below
+# so new and changed code is protected immediately. Burn these down and delete the
+# entry. Do NOT add to this list to silence a new finding — fix the name.
+"agent/agent_init.py" = ["F821"]
+"gateway/platforms/api_server.py" = ["F821"]
+"gateway/platforms/whatsapp_common.py" = ["F821"]
+"gateway/run.py" = ["F821"]
+"hermes_cli/model_switch.py" = ["F821"]
+"hermes_cli/runtime_provider.py" = ["F821"]
+"hermes_cli/web_server.py" = ["F821"]
+"run_agent.py" = ["F821"]
+"tools/patch_parser.py" = ["F821"]
+"tools/web_tools.py" = ["F821"]
