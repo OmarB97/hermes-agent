@@ -261,14 +261,172 @@ def _is_managed_local_w2_route(agent: Any, model: Any) -> bool:
     )
 
 
+# Prefill cost, in seconds per 1k prompt tokens, for the local DFlash family.
+#
+# Measured on taro (RTX 5090, vLLM-MoET W2, 2-bit experts in pinned host RAM)
+# through the lifecycle-managed gate. Two things make a single clean number
+# impossible, and BOTH of them argue for a generous budget rather than a precise
+# one:
+#
+#   * PREFIX CACHING. Re-running a growing prompt built from the same text gave
+#     18.8s @ 4k, 87.5s @ 32k, then a flat ~100s at 64k/96k/128k — TTFT stopped
+#     growing because vLLM was serving the shared prefix from KV cache. That is
+#     the normal agentic case (each turn appends to a conversation whose prefix
+#     is already cached) and it is why W2 feels fast turn-to-turn.
+#   * COLD/UNCACHED PREFILL is a different regime entirely. The same 4k prompt
+#     with unique content — no prefix to reuse — took 62.6s, ~3.3x the cached
+#     figure. A model eviction (llama-swap unloads W2 whenever another model is
+#     requested on the GPU) wipes the KV cache, so the next turn re-prefills the
+#     WHOLE context from scratch.
+#
+# So the cost of a healthy request spans well over an order of magnitude
+# depending on cache state, and no static constant can predict which regime a
+# given turn is in. That is precisely why the authoritative mechanism is the
+# liveness probe (_local_backend_generation_active): ask the server whether it is
+# working, rather than guessing how long it should take.
+#
+# This constant is only the FALLBACK safety net for backends with no progress
+# signal. It is deliberately generous — a watchdog that fires on healthy work is
+# worse than one that fires late, and the ceiling below bounds the worst case.
+_DFLASH_PREFILL_SECONDS_PER_1K_DEFAULT = 4.0
+# A cold start is a first-class cost here, not an outlier. llama-swap evicts the
+# resident model whenever another model is requested on the same GPU, so the very
+# next W2 turn pays a full load. Measured cold start on taro: 138.5s for a
+# 4-token prompt. The budget must absorb that or it will kill the first healthy
+# turn after any swap.
+_DFLASH_COLD_START_ALLOWANCE_DEFAULT_S = 180.0
+# Absolute ceiling. The watchdog exists so a request cannot park forever; even
+# with a live progress signal saying the backend is working, we stop eventually.
+_DFLASH_FIRST_CHUNK_CEILING_DEFAULT_S = 1800.0
+
+
 def _dflash_context_timeout_default(api_payload: Any) -> float:
-    """Return the implicit DFlash watchdog timeout for the request size."""
+    """Return the implicit DFlash watchdog budget for the request size.
+
+    This replaces a step ladder (>100k -> 300s, >50k -> 240s, else 180s) that
+    had three defects: it was discontinuous (99,999 tokens got 240s, 100,001 got
+    300s), it was capped at 300s with no headroom above 100k, and its numbers
+    corresponded to no measurement of any real backend. A 90.7k-token request on
+    the production W2 lane landed in the 240s bucket and was killed while the
+    server was still healthily prefilling it.
+
+    The budget is now continuous and grounded in the physics of the backend:
+
+        budget = cold_start_allowance + base + per_1k * (tokens / 1000)
+
+    ``cold_start_allowance`` covers a model that is not currently resident (see
+    the constant above). The result is clamped to a ceiling so a wedged backend
+    is still bounded.
+
+    Note this is only the FALLBACK budget. When the backend exposes a progress
+    signal (see :func:`_local_backend_generation_active`), the watchdog verifies
+    the server is actually working before it kills anything, and this number
+    stops being load-bearing.
+    """
     est_tokens = estimate_request_context_tokens(api_payload)
-    if est_tokens > 100_000:
-        return 300.0
-    if est_tokens > 50_000:
-        return 240.0
-    return _DFLASH_LOCAL_TIMEOUT_DEFAULT_S
+    per_1k = _env_float(
+        "HERMES_DFLASH_PREFILL_SECONDS_PER_1K",
+        _DFLASH_PREFILL_SECONDS_PER_1K_DEFAULT,
+    )
+    cold_start = _env_float(
+        "HERMES_DFLASH_COLD_START_ALLOWANCE",
+        _DFLASH_COLD_START_ALLOWANCE_DEFAULT_S,
+    )
+    ceiling = _env_float(
+        "HERMES_DFLASH_FIRST_CHUNK_CEILING",
+        _DFLASH_FIRST_CHUNK_CEILING_DEFAULT_S,
+    )
+    budget = (
+        cold_start
+        + _DFLASH_LOCAL_TIMEOUT_DEFAULT_S
+        + per_1k * (est_tokens / 1000.0)
+    )
+    # Never return less than the old ladder would have: this change may only ever
+    # widen a budget, never narrow one.
+    return min(max(budget, _DFLASH_LOCAL_TIMEOUT_DEFAULT_S), ceiling)
+
+
+def _gate_status_url(base_url: Any) -> str | None:
+    """Map a local provider base_url to its ai-gate status endpoint.
+
+    The mesh's local LLM hosts sit behind ai-gate, which proxies EVERY generation
+    request to llama-swap. That makes it the only component that knows whether a
+    request is actually being worked on, so it is the authoritative liveness
+    signal for this watchdog.
+
+    ``http://10.10.20.211:8080/v1`` -> ``http://10.10.20.211:8080/_gate/status``
+    """
+    raw = str(base_url or "").strip()
+    if not raw:
+        return None
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+
+        parts = urlsplit(raw)
+        if not parts.scheme or not parts.netloc:
+            return None
+        return urlunsplit((parts.scheme, parts.netloc, "/_gate/status", "", ""))
+    except Exception:
+        return None
+
+
+def _local_backend_generation_active(base_url: Any, model: Any) -> bool | None:
+    """Is the local backend actively working on a generation right now?
+
+    Returns True (backend is busy generating), False (backend reports nothing in
+    flight) or None (no progress signal available — caller must fall back to the
+    time budget).
+
+    This is the fix for the core defect: a stopwatch cannot distinguish "the
+    server is wedged" from "the server is healthily prefilling 90k tokens". The
+    gate can. ``/_gate/status`` reports ``active_generations`` with the model and
+    an age for each in-flight request, so we can verify the backend is genuinely
+    working before killing a request that has simply not produced its first token
+    yet.
+
+    Deliberately conservative: any error, timeout, missing endpoint or
+    unparseable body yields None rather than False, so a provider WITHOUT a gate
+    (a remote API, a bare llama.cpp server) never has its behaviour changed by
+    this. Only a positive, parsed signal can extend a deadline.
+    """
+    url = _gate_status_url(base_url)
+    if not url:
+        return None
+    try:
+        import httpx as _httpx
+
+        timeout = _env_float("HERMES_GATE_PROBE_TIMEOUT", 4.0)
+        resp = _httpx.get(url, timeout=timeout)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+    except Exception:
+        return None
+
+    if not isinstance(data, dict):
+        return None
+    gens = data.get("active_generations")
+    if not isinstance(gens, list):
+        # Endpoint exists but does not speak the shape we expect — treat as no
+        # signal rather than inventing one.
+        return None
+    if not gens:
+        return False
+
+    wanted = str(model or "").strip().lower().rsplit("/", 1)[-1]
+    if not wanted:
+        return True
+    for gen in gens:
+        if not isinstance(gen, dict):
+            continue
+        served = str(gen.get("model") or "").strip().lower().rsplit("/", 1)[-1]
+        # An entry with no model attributed still means the backend is busy.
+        if not served or served == wanted:
+            return True
+    # The backend is generating, but for a different model. On a single-GPU
+    # llama-swap host that means OUR model was evicted and is being swapped back
+    # in — which is exactly when we must be patient, not trigger-happy.
+    return True
 
 
 def _legacy_dflash_timeout_override(*names: str) -> float | None:
@@ -3916,6 +4074,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     if _reasoning_floor is not None and _dflash_first_chunk_timeout is None:
         _stream_stale_timeout = max(_stream_stale_timeout, _reasoning_floor)
 
+    # Wall clock for the absolute ceiling. The no-first-chunk budget can be
+    # extended repeatedly while the backend reports it is actively generating,
+    # so we need a separate, non-resettable clock to bound the worst case.
+    _dflash_request_started_at = time.time()
+
     t = threading.Thread(target=_call, daemon=True)
     t.start()
     _last_heartbeat = time.time()
@@ -3965,6 +4128,50 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             _first_elapsed = time.time() - last_chunk_time["t"]
             if _first_elapsed > _dflash_first_chunk_timeout:
                 _est_ctx = estimate_request_context_tokens(api_kwargs)
+
+                # Before killing anything: ASK THE BACKEND whether it is still
+                # working. The time budget is a guess; the gate knows the truth.
+                # A long prefill on a large context is not a fault, and a request
+                # the server is actively serving must never be killed just
+                # because a client-side stopwatch expired. Only a genuinely
+                # wedged backend (or the ceiling) may end this request.
+                _ceiling = _env_float(
+                    "HERMES_DFLASH_FIRST_CHUNK_CEILING",
+                    _DFLASH_FIRST_CHUNK_CEILING_DEFAULT_S,
+                )
+                _total_waited = time.time() - _dflash_request_started_at
+                if _total_waited < _ceiling:
+                    _still_working = _local_backend_generation_active(
+                        getattr(agent, "base_url", None),
+                        api_kwargs.get("model") or getattr(agent, "model", None),
+                    )
+                    if _still_working:
+                        # Extend: reset the no-chunk clock and keep waiting. The
+                        # backend is demonstrably generating for us.
+                        last_chunk_time["t"] = time.time()
+                        logger.info(
+                            "Local dflash has produced no first chunk for %.0fs "
+                            "(budget %.0fs) but the backend reports an ACTIVE "
+                            "generation — extending. model=%s context=~%s tokens "
+                            "total_waited=%.0fs ceiling=%.0fs",
+                            _first_elapsed,
+                            _dflash_first_chunk_timeout,
+                            api_kwargs.get("model", "unknown"),
+                            f"{_est_ctx:,}",
+                            _total_waited,
+                            _ceiling,
+                        )
+                        agent._buffer_status(
+                            f"⏳ Still prefilling ~{_est_ctx:,} tokens on the "
+                            f"local backend ({int(_total_waited)}s elapsed). "
+                            f"The server reports it is working — waiting."
+                        )
+                        agent._touch_activity(
+                            f"local backend actively generating "
+                            f"({int(_total_waited)}s, ~{_est_ctx:,} tokens)"
+                        )
+                        continue
+
                 logger.warning(
                     "Local dflash stream produced no first chunk for %.0fs "
                     "(threshold %.0fs). model=%s context=~%s tokens. "

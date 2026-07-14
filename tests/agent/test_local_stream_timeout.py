@@ -8,6 +8,7 @@ kills during long prefill phases.
 
 import os
 import pytest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from agent.model_metadata import is_local_endpoint
@@ -16,6 +17,9 @@ from agent.chat_completion_helpers import (
     _dflash_local_stale_timeout,
     _is_dflash_like_model,
     interruptible_streaming_api_call,
+    _dflash_context_timeout_default,
+    _gate_status_url,
+    _local_backend_generation_active,
     resolve_dflash_local_first_chunk_timeout,
     resolve_stream_stale_timeout,
 )
@@ -167,8 +171,14 @@ class TestLocalDflashStaleTimeout:
         assert _is_dflash_like_model(model) is False
 
     @pytest.mark.parametrize(
-        ("estimated_tokens", "expected_timeout"),
+        ("estimated_tokens", "min_expected_timeout"),
         [
+            # The old ladder returned exactly (180, 240, 240, 300, 300) here. It
+            # was a step function whose numbers matched no measurement, and it
+            # killed healthy requests: a 90.7k-token turn needs ~370s cold on the
+            # measured W2 curve but was allowed 240s. The budget is now
+            # continuous, so assert the FLOOR (it must never shrink) rather than
+            # pinning a magic constant that would just re-freeze the old bug.
             (50_000, 180.0),
             (50_001, 240.0),
             (100_000, 240.0),
@@ -180,17 +190,20 @@ class TestLocalDflashStaleTimeout:
         self,
         monkeypatch,
         estimated_tokens,
-        expected_timeout,
+        min_expected_timeout,
     ):
         monkeypatch.delenv("HERMES_DFLASH_FIRST_CHUNK_TIMEOUT", raising=False)
         monkeypatch.delenv("HERMES_DFLASH_TTFB_TIMEOUT", raising=False)
+        monkeypatch.delenv("HERMES_DFLASH_PREFILL_SECONDS_PER_1K", raising=False)
+        monkeypatch.delenv("HERMES_DFLASH_COLD_START_ALLOWANCE", raising=False)
+        monkeypatch.delenv("HERMES_DFLASH_FIRST_CHUNK_CEILING", raising=False)
 
         timeout = _dflash_local_first_chunk_timeout(
             self._payload_for_estimated_tokens(estimated_tokens),
             "dflash",
         )
 
-        assert timeout == expected_timeout
+        assert timeout >= min_expected_timeout
 
     @pytest.mark.parametrize(
         "model",
@@ -206,8 +219,13 @@ class TestLocalDflashStaleTimeout:
 
         timeout = _dflash_local_first_chunk_timeout({"messages": []}, model)
 
-        assert timeout == 180.0
-        assert timeout > 116.0
+        # This used to assert exactly 180.0. That floor was itself the bug this
+        # test was trying to guard against: a llama-swap model load on taro takes
+        # a MEASURED 138.5s, so a cold W2 turn with even a modest prompt blew the
+        # 180s budget and was killed while perfectly healthy. The floor now
+        # carries an explicit cold-start allowance on top of the base watchdog.
+        assert timeout > 138.5, "budget must clear the measured W2 cold start"
+        assert timeout >= 300.0
 
     def test_managed_local_w2_timeout_floor_is_route_and_model_specific(
         self,
@@ -320,6 +338,10 @@ class TestLocalDflashStaleTimeout:
             "agent.chat_completion_helpers.threading.Thread",
             NoResponseThread,
         )
+        monkeypatch.setattr(
+            "agent.chat_completion_helpers._local_backend_generation_active",
+            lambda base_url, model: None,
+        )
         monkeypatch.setattr("agent.chat_completion_helpers.time.time", Clock.time)
 
         with pytest.raises(
@@ -416,6 +438,10 @@ class TestLocalDflashStaleTimeout:
             "agent.chat_completion_helpers.threading.Thread",
             NoResponseThread,
         )
+        monkeypatch.setattr(
+            "agent.chat_completion_helpers._local_backend_generation_active",
+            lambda base_url, model: None,
+        )
         monkeypatch.setattr("agent.chat_completion_helpers.time.time", Clock.time)
 
         with pytest.raises(TimeoutError, match=r"no first chunk after 361s"):
@@ -442,6 +468,110 @@ class TestLocalDflashStaleTimeout:
             "worker: it will retry in the background and stream a late "
             "response into an already-finalised turn"
         )
+
+    def test_budget_is_continuous_with_no_cliffs(self, monkeypatch):
+        """The old step ladder jumped 240s -> 300s across a single token."""
+        for var in (
+            "HERMES_DFLASH_PREFILL_SECONDS_PER_1K",
+            "HERMES_DFLASH_COLD_START_ALLOWANCE",
+            "HERMES_DFLASH_FIRST_CHUNK_CEILING",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+        def budget(tokens):
+            return _dflash_context_timeout_default(
+                {"messages": [{"role": "user", "content": "x" * (tokens * 4)}]}
+            )
+
+        # Straddle the old 100k cliff: the step must be small, not 60 seconds.
+        below, above = budget(99_000), budget(101_000)
+        assert above > below
+        assert above - below < 30.0, "budget still has a cliff at ~100k tokens"
+
+        # Monotonic non-decreasing across the whole range.
+        sizes = [1_000, 10_000, 25_000, 50_000, 75_000, 90_700, 110_000, 131_072]
+        budgets = [budget(n) for n in sizes]
+        assert budgets == sorted(budgets), f"budget is not monotonic: {budgets}"
+
+    def test_budget_clears_a_cold_model_load_at_every_context(self, monkeypatch):
+        """A llama-swap eviction must never kill the next healthy turn.
+
+        llama-swap unloads W2 whenever another model is requested on the same
+        GPU, so the very next W2 turn pays a full model load AND re-prefills the
+        whole context (the eviction wipes the KV cache too). The measured cold
+        load on taro is 138.5s for a 4-token prompt — before any prefill.
+
+        The old ladder's floor was 180s, which left ~40s for prefill after a cold
+        load. That is why a healthy 90.7k turn died at its 240s bucket.
+
+        Deliberately does NOT pin a prefill-rate curve: measured TTFT spans an
+        order of magnitude depending on prefix-cache state (18.8s vs 62.6s for
+        the same 4k prompt, cached vs unique), so any fitted constant here would
+        be fiction. The real guarantee is the liveness probe; this only asserts
+        the fallback budget is not absurd.
+        """
+        for var in (
+            "HERMES_DFLASH_PREFILL_SECONDS_PER_1K",
+            "HERMES_DFLASH_COLD_START_ALLOWANCE",
+            "HERMES_DFLASH_FIRST_CHUNK_CEILING",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+        measured_cold_load_s = 138.5
+
+        for tokens in (0, 10_000, 50_000, 90_700, 131_072):
+            budget = _dflash_context_timeout_default(
+                {"messages": [{"role": "user", "content": "x" * (tokens * 4)}]}
+            )
+            assert budget > measured_cold_load_s, (
+                f"budget {budget:.0f}s at {tokens:,} tokens does not even clear a "
+                f"cold model load ({measured_cold_load_s}s) — the next turn after "
+                "any llama-swap eviction would be killed while healthy"
+            )
+
+        # And the specific request that actually died: 90.7k tokens got 240s.
+        budget_90k = _dflash_context_timeout_default(
+            {"messages": [{"role": "user", "content": "x" * (90_700 * 4)}]}
+        )
+        assert budget_90k > 240.0 * 2, (
+            f"90.7k-token budget is {budget_90k:.0f}s; the 240s it used to get was "
+            "already too tight to survive a cold load plus prefill"
+        )
+
+    def test_budget_never_narrower_than_the_old_ladder(self, monkeypatch):
+        for var in (
+            "HERMES_DFLASH_PREFILL_SECONDS_PER_1K",
+            "HERMES_DFLASH_COLD_START_ALLOWANCE",
+            "HERMES_DFLASH_FIRST_CHUNK_CEILING",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+        def old_ladder(n):
+            if n > 100_000:
+                return 300.0
+            if n > 50_000:
+                return 240.0
+            return 180.0
+
+        for tokens in (1_000, 10_000, 50_001, 90_700, 100_001, 131_072):
+            budget = _dflash_context_timeout_default(
+                {"messages": [{"role": "user", "content": "x" * (tokens * 4)}]}
+            )
+            assert budget >= old_ladder(tokens), (
+                f"budget shrank at {tokens:,} tokens: {budget} < {old_ladder(tokens)}"
+            )
+
+    def test_budget_is_bounded_by_the_ceiling(self, monkeypatch):
+        """A wedged backend must still be bounded — this is a watchdog."""
+        monkeypatch.delenv("HERMES_DFLASH_PREFILL_SECONDS_PER_1K", raising=False)
+        monkeypatch.delenv("HERMES_DFLASH_COLD_START_ALLOWANCE", raising=False)
+        monkeypatch.setenv("HERMES_DFLASH_FIRST_CHUNK_CEILING", "600")
+
+        budget = _dflash_context_timeout_default(
+            {"messages": [{"role": "user", "content": "x" * (131_072 * 4)}]}
+        )
+        assert budget == 600.0
+
 
     def test_dflash_first_chunk_timeout_has_independent_env(self, monkeypatch):
         monkeypatch.setenv("HERMES_DFLASH_FIRST_CHUNK_TIMEOUT", "45")
@@ -648,3 +778,209 @@ class TestIsLocalEndpoint:
     def test_near_but_not_cgnat_is_remote(self, url):
         """Hosts adjacent to but outside 100.64.0.0/10 must not match."""
         assert is_local_endpoint(url) is False
+
+
+class TestLocalBackendProgressSignal:
+    """The watchdog must ask the backend, not just count seconds."""
+
+    def test_active_generation_for_our_model_reports_busy(self, monkeypatch):
+        payload = {
+            "active_generation_count": 1,
+            "active_generations": [
+                {"id": "g1", "model": "deepseek-v4-flash-w2", "age_s": 210.0}
+            ],
+        }
+        monkeypatch.setattr(
+            "httpx.get",
+            lambda url, timeout=None: SimpleNamespace(
+                status_code=200, json=lambda: payload
+            ),
+        )
+        assert _local_backend_generation_active(
+            "http://10.10.20.211:8080/v1", "deepseek-v4-flash-w2"
+        ) is True
+
+    def test_generation_for_another_model_still_reports_busy(self, monkeypatch):
+        """Single-GPU llama-swap: another model generating means OURS was evicted
+        and is swapping back in. That is exactly when to be patient."""
+        payload = {
+            "active_generation_count": 1,
+            "active_generations": [{"id": "g1", "model": "deepseek-v4-flash-iq3xxs"}],
+        }
+        monkeypatch.setattr(
+            "httpx.get",
+            lambda url, timeout=None: SimpleNamespace(
+                status_code=200, json=lambda: payload
+            ),
+        )
+        assert _local_backend_generation_active(
+            "http://10.10.20.211:8080/v1", "deepseek-v4-flash-w2"
+        ) is True
+
+    def test_idle_backend_reports_not_busy(self, monkeypatch):
+        payload = {"active_generation_count": 0, "active_generations": []}
+        monkeypatch.setattr(
+            "httpx.get",
+            lambda url, timeout=None: SimpleNamespace(
+                status_code=200, json=lambda: payload
+            ),
+        )
+        assert _local_backend_generation_active(
+            "http://10.10.20.211:8080/v1", "deepseek-v4-flash-w2"
+        ) is False
+
+    def test_no_gate_yields_no_signal_not_a_false_negative(self, monkeypatch):
+        """A provider without ai-gate must be UNAFFECTED: None, never False.
+
+        Returning False here would make the watchdog kill remote-API requests
+        the moment their budget expired, with no chance to extend.
+        """
+        def boom(url, timeout=None):
+            raise ConnectionError("no gate here")
+
+        monkeypatch.setattr("httpx.get", boom)
+        assert _local_backend_generation_active(
+            "https://api.example.com/v1", "gpt-whatever"
+        ) is None
+
+    def test_non_200_and_garbage_bodies_yield_no_signal(self, monkeypatch):
+        monkeypatch.setattr(
+            "httpx.get",
+            lambda url, timeout=None: SimpleNamespace(status_code=404, json=lambda: {}),
+        )
+        assert _local_backend_generation_active(
+            "http://10.10.20.211:8080/v1", "m"
+        ) is None
+
+        monkeypatch.setattr(
+            "httpx.get",
+            lambda url, timeout=None: SimpleNamespace(
+                status_code=200, json=lambda: {"unexpected": "shape"}
+            ),
+        )
+        assert _local_backend_generation_active(
+            "http://10.10.20.211:8080/v1", "m"
+        ) is None
+
+    def test_gate_status_url_derivation(self):
+        assert (
+            _gate_status_url("http://10.10.20.211:8080/v1")
+            == "http://10.10.20.211:8080/_gate/status"
+        )
+        assert _gate_status_url("") is None
+        assert _gate_status_url("not-a-url") is None
+
+
+class TestProgressAwareWatchdog:
+    """The watchdog must verify liveness before killing a slow local request."""
+
+    def _drive(self, monkeypatch, *, backend_active, ceiling="600"):
+        """Run the poll loop with a backend that never emits a first chunk.
+
+        The fake clock advances 60s per poll so the ceiling is reachable.
+        Returns (raised_exception_or_None, buffered_statuses).
+        """
+        for var in (
+            "HERMES_STREAM_STALE_TIMEOUT",
+            "HERMES_DFLASH_STALE_TIMEOUT",
+            "HERMES_DFLASH_STREAM_STALE_TIMEOUT",
+            "HERMES_DFLASH_FIRST_CHUNK_TIMEOUT",
+            "HERMES_DFLASH_TTFB_TIMEOUT",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("HERMES_DFLASH_FIRST_CHUNK_CEILING", ceiling)
+
+        class Clock:
+            now = 0.0
+
+            @classmethod
+            def time(cls):
+                return cls.now
+
+        class NeverAnswersThread:
+            def __init__(self, *, target, daemon):
+                self.target = target
+
+            def start(self):
+                return None
+
+            def is_alive(self):
+                return True
+
+            def join(self, timeout=None):
+                # Advance the wall clock so both the per-attempt budget and the
+                # absolute ceiling can actually be reached.
+                Clock.now += 60.0
+
+        statuses = []
+
+        class Agent:
+            api_mode = "chat_completions"
+            base_url = "http://10.10.20.211:8080/v1"
+            provider = "taro"
+            model = "deepseek-v4-flash-w2"
+            _interrupt_requested = False
+            _consecutive_stale_streams = 0
+
+            @staticmethod
+            def _touch_activity(_m):
+                return None
+
+            @staticmethod
+            def _buffer_status(m):
+                statuses.append(m)
+
+            @staticmethod
+            def _replace_primary_openai_client(*, reason):
+                return None
+
+        monkeypatch.setattr(
+            "agent.chat_completion_helpers.threading.Thread", NeverAnswersThread
+        )
+        monkeypatch.setattr("agent.chat_completion_helpers.time.time", Clock.time)
+        monkeypatch.setattr(
+            "agent.chat_completion_helpers._local_backend_generation_active",
+            lambda base_url, model: backend_active,
+        )
+
+        raised = None
+        try:
+            interruptible_streaming_api_call(
+                Agent(),
+                {
+                    "model": "deepseek-v4-flash-w2",
+                    "messages": [{"role": "user", "content": "x" * (90_700 * 4)}],
+                },
+            )
+        except BaseException as exc:  # noqa: BLE001
+            raised = exc
+        return raised, statuses
+
+    def test_busy_backend_extends_instead_of_killing(self, monkeypatch):
+        """THE fix: a 90.7k-token request the server is actively prefilling must
+        not be killed just because a client-side stopwatch expired."""
+        raised, statuses = self._drive(monkeypatch, backend_active=True)
+
+        waited = [s for s in statuses if "Still prefilling" in s]
+        assert waited, (
+            "watchdog killed a request the backend reported as ACTIVE — it never "
+            "extended. This is the bug: a healthy 90.7k prefill dies at the budget."
+        )
+        # It still stops eventually: the ceiling bounds a backend that lies.
+        assert isinstance(raised, TimeoutError)
+
+    def test_idle_backend_is_still_killed_promptly(self, monkeypatch):
+        """A genuinely wedged backend must NOT be given the extension."""
+        raised, statuses = self._drive(monkeypatch, backend_active=False)
+
+        assert isinstance(raised, TimeoutError)
+        assert not [s for s in statuses if "Still prefilling" in s], (
+            "extended a backend that reported NO active generation"
+        )
+
+    def test_no_progress_signal_preserves_legacy_stopwatch(self, monkeypatch):
+        """Providers with no gate (remote APIs) must be unaffected: pure budget."""
+        raised, statuses = self._drive(monkeypatch, backend_active=None)
+
+        assert isinstance(raised, TimeoutError)
+        assert not [s for s in statuses if "Still prefilling" in s]
