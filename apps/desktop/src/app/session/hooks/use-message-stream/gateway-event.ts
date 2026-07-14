@@ -66,7 +66,11 @@ import {
   toTodoPayload
 } from './utils'
 
-const COMPACTION_RESUME_EVENT_TYPES = new Set([
+// Assistant activity that can only happen once mid-turn compaction has
+// finished: the agent is producing content again. Mid-turn compaction emits a
+// start marker but no matching completion event, so the first resumed activity
+// is the reliable completion signal.
+const COMPACTION_RESUME_EVENT_TYPES: ReadonlySet<string> = new Set([
   'message.delta',
   'message.interim',
   'thinking.delta',
