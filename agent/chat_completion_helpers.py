@@ -251,12 +251,32 @@ def _is_dflash_like_model(model: Any) -> bool:
     return bool(_DFLASH_MODEL_FAMILY_RE.search(str(model or "").strip()))
 
 
+# Providers that front the lifecycle-managed W2 lane.
+#
+# `ai-router` is the ko-nas fleet router (:9081). It proxies to taro's ai-gate,
+# which proxies to llama-swap/vLLM — the SAME physical lane as the `taro`
+# provider, with the same slow cold prefill. It was simply never listed, so the
+# 360s W2 floor did not apply on the path the desktop actually uses: a 90k-token
+# turn fell through to the generic DFlash ladder and got 240s.
+#
+# Deliberately an allowlist, not "any local endpoint serving W2". The floor is
+# route-specific by design (see
+# test_managed_local_w2_timeout_floor_is_route_and_model_specific): an arbitrary
+# LAN provider that happens to serve a W2-named model is NOT this lane and must
+# keep the generic deadline.
+_MANAGED_W2_PROVIDERS = frozenset({
+    "ai-router",
+    "meshboard-qualified-local",
+    "taro",
+})
+
+
 def _is_managed_local_w2_route(agent: Any, model: Any) -> bool:
     """Return whether this is a managed local production W2 route."""
     provider = str(getattr(agent, "provider", "") or "").strip().lower()
     model_id = str(model or "").strip().lower().rsplit("/", 1)[-1]
     return (
-        provider in {"taro", "meshboard-qualified-local"}
+        provider in _MANAGED_W2_PROVIDERS
         and model_id == "deepseek-v4-flash-w2"
     )
 
@@ -342,8 +362,9 @@ def _dflash_context_timeout_default(api_payload: Any) -> float:
         + per_1k * (est_tokens / 1000.0)
     )
     # Never return less than the old ladder would have: this change may only ever
-    # widen a budget, never narrow one.
-    return min(max(budget, _DFLASH_LOCAL_TIMEOUT_DEFAULT_S), ceiling)
+    # widen a budget, never narrow one. Rounded to whole seconds — a watchdog
+    # deadline carrying float noise (360.036s) is just noise.
+    return float(round(min(max(budget, _DFLASH_LOCAL_TIMEOUT_DEFAULT_S), ceiling)))
 
 
 def _gate_status_url(base_url: Any) -> str | None:
@@ -605,12 +626,30 @@ def resolve_dflash_local_first_chunk_timeout(
             agent,
             api_kwargs,
         )
-    if _is_managed_local_w2_route(agent, effective_model):
-        return max(
-            resolved_stream_stale_timeout,
-            _MANAGED_W2_FIRST_CHUNK_TIMEOUT_DEFAULT_S,
-        )
-    return resolved_stream_stale_timeout
+
+    if not _is_managed_local_w2_route(agent, effective_model):
+        # Generic DFlash routes keep the existing policy untouched. The
+        # context-scaled budget below is calibrated on ONE lane (W2 behind
+        # llama-swap on taro); applying its cold-start allowance to an arbitrary
+        # local DFlash provider would inflate that provider's deadline on the
+        # strength of a measurement that says nothing about it.
+        return resolved_stream_stale_timeout
+
+    floor = max(resolved_stream_stale_timeout, _MANAGED_W2_FIRST_CHUNK_TIMEOUT_DEFAULT_S)
+    if floor == float("inf"):
+        return floor
+
+    # The context-scaled budget was UNREACHABLE from the runtime path until now.
+    # `_dflash_context_timeout_default` models what a healthy request actually
+    # costs (cold-start allowance + per-1k prefill), but only the legacy
+    # `_dflash_local_first_chunk_timeout` helper ever called it — this resolver
+    # fell straight through to the stale ladder. So the cost model existed and
+    # was never consulted: a 90.7k-token turn on the managed W2 lane was budgeted
+    # 240s by a step function calibrated against no measurement of anything.
+    #
+    # Take the max, never the min. An explicit config/env value still wins (both
+    # return earlier), so this can only ever widen a budget, never narrow one.
+    return max(floor, _dflash_context_timeout_default(api_kwargs))
 
 
 # ── Cross-turn stale-call circuit breaker (#58962) ─────────────────────
