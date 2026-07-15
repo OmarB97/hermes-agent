@@ -19,6 +19,17 @@ describe('shared session drag working lists', () => {
     expect(next.pinned).toEqual(['p1', 'p2'])
   })
 
+  it('keeps a Pinned preview order authoritative at release', () => {
+    const current: SharedSessionDrag = {
+      activeId: 'p2',
+      from: 'pinned',
+      pinned: ['p1', 'p2'],
+      sessions: ['s1']
+    }
+
+    expect(moveSharedSessionDrag(current, 'pinned', 'p1', false).pinned).toEqual(['p2', 'p1'])
+  })
+
   it('keeps one continuous drag coherent across Sessions and Pinned and back', () => {
     const inSessions = moveSharedSessionDrag(drag(), 'sessions', 's3', true)
     const inPinned = moveSharedSessionDrag(inSessions, 'pinned', 'p1', true)

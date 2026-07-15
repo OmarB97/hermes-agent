@@ -1,7 +1,6 @@
 import {
   closestCenter,
   type CollisionDetection,
-  type DragEndEvent,
   type DragOverEvent,
   type DragStartEvent,
   getFirstCollision,
@@ -241,17 +240,22 @@ export function useSharedSessionDnd({
   const onDragCancel = useCallback(() => commitDrag(null), [commitDrag])
 
   const onDragEnd = useCallback(
-    (event: DragEndEvent) => {
+    () => {
       const settled = dragRef.current
 
       commitDrag(null)
 
-      if (!settled || !event.over) {
+      if (!settled) {
         return
       }
 
-      // Translate visible live ids back to durable lineage-root ids. Preserve
-      // unloaded pins in their original slots instead of dropping them.
+      // The rendered working lists are the authoritative drop preview. At
+      // release dnd-kit can report `over: null` because the animated preview
+      // moved the row out from under the pointer. Requiring a final `over`
+      // recreates the historical snap-back bug, so persist what the user was
+      // visibly holding instead of recomputing from the release frame.
+      // Translate visible live ids back to durable lineage-root ids while
+      // preserving unloaded pins in their original slots.
       const reorderedVisiblePins = settled.pinned.map(id => {
         const session = sessionForId(id)
 
