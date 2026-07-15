@@ -514,10 +514,12 @@ export function DesktopController() {
       for (let index = 0; index < Math.max(1, attempts); index += 1) {
         try {
           const latest = await getSessionMessages(storedSessionId, storedProfile)
+
           const messages = restoreFallbackNotices(
             storedSessionId,
             toChatMessages(latest.messages, latest.turn_outcomes)
           )
+
           updateSessionState(
             runtimeSessionId,
             state => ({
@@ -612,14 +614,20 @@ export function DesktopController() {
   })
 
   const {
+    archiveAllSessions,
     archiveSession,
+    archiveSessionsBulk,
     branchCurrentSession,
     branchStoredSession,
     createBackendSessionForSend,
+    deleteSessionsBulk,
+    haltSessionsBulk,
     openSettings,
+    promptSessionsBulk,
     removeSession,
     resumeSession,
     selectSidebarItem,
+    steerSessionsBulk,
     startFreshSessionDraft
   } = useSessionActions({
     activeSessionId,
@@ -1026,9 +1034,13 @@ export function DesktopController() {
   const sidebar = (
     <ChatSidebar
       currentView={currentView}
+      onArchiveAllSessions={() => archiveAllSessions().then(() => refreshSessions())}
       onArchiveSession={sessionId => void archiveSession(sessionId)}
+      onArchiveSessions={archiveSessionsBulk}
       onBranchSession={sessionId => void branchStoredSession(sessionId)}
       onDeleteSession={sessionId => void removeSession(sessionId)}
+      onDeleteSessions={deleteSessionsBulk}
+      onHaltSessions={haltSessionsBulk}
       onLoadMoreMessaging={loadMoreMessagingForPlatform}
       onLoadMoreProfileSessions={loadMoreSessionsForProfile}
       onLoadMoreSessions={loadMoreSessions}
@@ -1038,7 +1050,9 @@ export function DesktopController() {
       }}
       onNavigate={selectSidebarItem}
       onNewSessionInWorkspace={startSessionInWorkspace}
+      onPromptSessions={promptSessionsBulk}
       onResumeSession={sessionId => navigate(sessionRoute(sessionId))}
+      onSteerSessions={steerSessionsBulk}
       onTriggerCronJob={jobId => {
         void triggerCronJob(jobId)
           .then(() => refreshCronJobs())

@@ -4102,6 +4102,68 @@ class TestCompressionChainProjection:
         restored_ids = [s["id"] for s in db.list_sessions_rich(source="cli", limit=20)]
         assert "tip1" in restored_ids
 
+    def test_archive_session_ids_is_distinct_and_lineage_aware(self, db):
+        import time as _time
+
+        self._build_compression_chain(db, _time.time() - 3600)
+        db.create_session("solo", "cli")
+
+        archived = db.archive_session_ids(
+            ["root1", "tip1", "tip1", "missing", "", "solo"]
+        )
+
+        assert archived == 2
+        assert {
+            sid: db.get_session(sid)["archived"]
+            for sid in ("root1", "delegate1", "mid1", "tip1", "solo")
+        } == {
+            "root1": 1,
+            "delegate1": 0,
+            "mid1": 1,
+            "tip1": 1,
+            "solo": 1,
+        }
+        assert db.archive_session_ids(["tip1", "solo"]) == 0
+
+    def test_archive_session_ids_uses_one_write_transaction(self, db, monkeypatch):
+        for sid in ("batch-a", "batch-b", "batch-c"):
+            db.create_session(sid, "cli")
+
+        original_execute_write = db._execute_write
+        calls = []
+
+        def _counted_execute_write(fn):
+            calls.append(fn)
+            return original_execute_write(fn)
+
+        monkeypatch.setattr(db, "_execute_write", _counted_execute_write)
+
+        assert db.archive_session_ids(["batch-a", "batch-b", "batch-c"]) == 3
+        assert len(calls) == 1
+
+    def test_archive_session_ids_rolls_back_whole_batch_on_failure(self, db):
+        for sid in ("rollback-a", "rollback-b", "rollback-c"):
+            db.create_session(sid, "cli")
+        db._conn.execute(
+            """
+            CREATE TRIGGER fail_archive_mid_batch
+            BEFORE UPDATE OF archived ON sessions
+            WHEN NEW.id = 'rollback-b' AND NEW.archived = 1
+            BEGIN
+              SELECT RAISE(ABORT, 'injected archive failure');
+            END
+            """
+        )
+        db._conn.commit()
+
+        with pytest.raises(sqlite3.IntegrityError, match="injected archive failure"):
+            db.archive_session_ids(["rollback-a", "rollback-b", "rollback-c"])
+
+        assert {
+            sid: db.get_session(sid)["archived"]
+            for sid in ("rollback-a", "rollback-b", "rollback-c")
+        } == {"rollback-a": 0, "rollback-b": 0, "rollback-c": 0}
+
     def test_list_projection_uses_tip_cwd(self, db):
         """Projected lineage rows should carry cwd from the live tip row.
 

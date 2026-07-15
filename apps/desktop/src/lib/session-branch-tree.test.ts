@@ -50,4 +50,14 @@ describe('flattenSessionsWithBranches', () => {
 
     expect(flattenSessionsWithBranches([branch])).toEqual([{ session: branch }])
   })
+
+  it('preserves the supplied root order for a manually reordered sidebar list', () => {
+    const older = session('older', { last_active: 10 })
+    const newer = session('newer', { last_active: 20 })
+
+    expect(flattenSessionsWithBranches([older, newer], { preserveRootOrder: true })).toEqual([
+      { session: older },
+      { session: newer }
+    ])
+  })
 })

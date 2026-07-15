@@ -1,12 +1,14 @@
-import { KeyboardSensor, PointerSensor, useSensor, useSensors } from '@dnd-kit/core'
+import { DndContext, KeyboardSensor, MouseSensor, TouchSensor, useSensor, useSensors } from '@dnd-kit/core'
 import { sortableKeyboardCoordinates } from '@dnd-kit/sortable'
 import { useStore } from '@nanostores/react'
 import type * as React from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
+import type { SessionDragPayload } from '@/app/chat/composer/inline-refs'
 import { PlatformAvatar } from '@/app/messaging/platform-icon'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { KbdGroup } from '@/components/ui/kbd'
 import { SearchField } from '@/components/ui/search-field'
@@ -94,6 +96,7 @@ import {
   sessionPinId,
   setCurrentCwd
 } from '@/store/session'
+import { $sidebarSelection } from '@/store/sidebar-selection'
 
 import { type AppView, ARTIFACTS_ROUTE, MESSAGING_ROUTE, SKILLS_ROUTE } from '../../routes'
 import type { SidebarNavItem } from '../../types'
@@ -120,7 +123,10 @@ import {
   useRepoWorktreeMap
 } from './projects'
 import { SidebarBlankState, SidebarPinnedEmptyState, SidebarSessionSkeletons } from './section-states'
+import { SelectionActionBar } from './selection-action-bar'
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
+import { sharedSessionSectionId, useSharedSessionDnd } from './shared-session-dnd'
+import { placeSessionIdAtAnchor, previewItemsAtAnchor, useSessionDropZone } from './use-session-drop-zone'
 
 // Non-session groups (messaging platforms) stay compact: show a few rows up
 // front, reveal more in larger steps on demand. Keeps a busy platform from
@@ -207,6 +213,12 @@ interface ChatSidebarProps extends React.ComponentProps<typeof Sidebar> {
   onResumeSession: (sessionId: string) => void
   onDeleteSession: (sessionId: string) => void
   onArchiveSession: (sessionId: string) => void
+  onArchiveAllSessions: () => Promise<void> | void
+  onArchiveSessions?: (sessionIds: string[]) => Promise<unknown> | void
+  onDeleteSessions?: (sessionIds: string[]) => Promise<unknown> | void
+  onHaltSessions?: (sessionIds: string[]) => Promise<unknown> | void
+  onPromptSessions?: (sessionIds: string[], text: string) => Promise<unknown> | void
+  onSteerSessions?: (sessionIds: string[], text: string) => Promise<unknown> | void
   onBranchSession: (sessionId: string) => void
   onNewSessionInWorkspace: (path: null | string) => void
   onManageCronJob: (jobId: string) => void
@@ -222,6 +234,12 @@ export function ChatSidebar({
   onResumeSession,
   onDeleteSession,
   onArchiveSession,
+  onArchiveAllSessions,
+  onArchiveSessions,
+  onDeleteSessions,
+  onHaltSessions,
+  onPromptSessions,
+  onSteerSessions,
   onBranchSession,
   onNewSessionInWorkspace,
   onManageCronJob,
@@ -240,6 +258,7 @@ export function ChatSidebar({
   const agentsOpen = useStore($sidebarRecentsOpen)
   const cronOpen = useStore($sidebarCronOpen)
   const selectedSessionId = useStore($selectedStoredSessionId)
+  const selection = useStore($sidebarSelection)
   const sessions = useStore($sessions)
   const cronSessions = useStore($cronSessions)
   const cronJobs = useStore($cronJobs)
@@ -275,6 +294,7 @@ export function ChatSidebar({
   const gatewayState = useStore($gatewayState)
   const dismissedAutoProjects = useStore($dismissedAutoProjectIds)
   const [searchQuery, setSearchQuery] = useState('')
+  const [archiveAllOpen, setArchiveAllOpen] = useState(false)
   const [serverMatches, setServerMatches] = useState<SessionSearchResult[]>([])
   const [searchPending, setSearchPending] = useState(false)
   const [newSessionKbdFlash, setNewSessionKbdFlash] = useState(false)
@@ -284,6 +304,9 @@ export function ChatSidebar({
   const messagingOpenIds = useStore($sidebarMessagingOpenIds)
   // Per-platform count of rows currently revealed (starts at NON_SESSION_INITIAL_ROWS).
   const [messagingVisible, setMessagingVisible] = useState<Record<string, number>>({})
+  // The row whose body is mid-native-drag (drag-to-pin/unpin/reorder). Drives
+  // drop-zone previews and self-anchor filtering while the drag is in flight.
+  const [draggingSession, setDraggingSession] = useState<null | SessionDragPayload>(null)
   const searchInputRef = useRef<HTMLInputElement>(null)
   const trimmedQuery = searchQuery.trim()
 
@@ -318,7 +341,11 @@ export function ChatSidebar({
   const activeSidebarSessionId = currentView === 'chat' ? selectedSessionId : null
 
   const dndSensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+    // PointerSensor activation is unreliable in the packaged Electron app.
+    // Mouse + touch sensors preserve the same distance gate while reliably
+    // starting a reorder outside the dev-server/browser environment.
+    useSensor(MouseSensor, { activationConstraint: { distance: 4 } }),
+    useSensor(TouchSensor, { activationConstraint: { distance: 4 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
   )
 
@@ -346,10 +373,11 @@ export function ChatSidebar({
   const sessionByAnyId = useMemo(() => {
     const map = new Map<string, SessionInfo>()
 
-    // Cron sessions are listed separately but can still be pinned, so index
-    // them too — otherwise a pinned cron job can't resolve into the Pinned
-    // section. Recents take precedence on id collisions (set last).
-    for (const s of [...cronSessions, ...visibleSessions]) {
+    // Cron and messaging sessions are listed in their own sections but can
+    // still be pinned (menu, shift-click, or drag), so index them too —
+    // otherwise their pins resolve to nothing and silently never render in
+    // the Pinned section. Recents take precedence on id collisions (set last).
+    for (const s of [...cronSessions, ...messagingSessions, ...visibleSessions]) {
       map.set(s.id, s)
 
       if (s._lineage_root_id && !map.has(s._lineage_root_id)) {
@@ -358,7 +386,7 @@ export function ChatSidebar({
     }
 
     return map
-  }, [visibleSessions, cronSessions])
+  }, [visibleSessions, cronSessions, messagingSessions])
 
   const pinnedSessions = useMemo(() => {
     const seen = new Set<string>()
@@ -377,6 +405,15 @@ export function ChatSidebar({
   }, [pinnedSessionIds, sessionByAnyId])
 
   const pinnedRealIdSet = useMemo(() => new Set(pinnedSessions.map(s => s.id)), [pinnedSessions])
+  const draggingSessionInfo = draggingSession ? sessionByAnyId.get(draggingSession.id) : null
+
+  const handleSessionDragStart = useCallback((payload: SessionDragPayload) => {
+    setDraggingSession(payload)
+  }, [])
+
+  const handleSessionDragEnd = useCallback(() => {
+    setDraggingSession(null)
+  }, [])
 
   // Full-text search across *all* sessions (not just the loaded page) so 699
   // sessions stay findable. Debounced; loaded sessions are matched instantly
@@ -448,7 +485,8 @@ export function ChatSidebar({
     const next = resolveManualSessionOrderIds(
       unpinnedAgentSessions.map(s => s.id),
       agentOrderIds,
-      agentOrderManual
+      agentOrderManual,
+      visibleSessions.length > 0
     )
 
     if (!next.length && agentOrderManual) {
@@ -464,12 +502,88 @@ export function ChatSidebar({
     if (next.length && !sameIds(next, agentOrderIds)) {
       setSidebarSessionOrderIds(next)
     }
-  }, [agentOrderIds, agentOrderManual, unpinnedAgentSessions])
+  }, [agentOrderIds, agentOrderManual, unpinnedAgentSessions, visibleSessions.length])
 
   const agentSessions = useMemo(
     () => (agentOrderManual ? orderByIds(unpinnedAgentSessions, s => s.id, agentOrderIds) : unpinnedAgentSessions),
     [unpinnedAgentSessions, agentOrderIds, agentOrderManual]
   )
+
+  const agentSessionIdSet = useMemo(() => new Set(agentSessions.map(session => session.id)), [agentSessions])
+
+  // Row bodies are native-draggable (the same drag that drops a session into
+  // the composer), so Pinned/Sessions accept that drag directly: drop a row on
+  // Pinned to pin it, drop a pinned row on Sessions to unpin, or drag inside a
+  // section to reorder. Drops land at the pointer position, and hover previews
+  // animate the row shuffle before the drop is committed.
+  const pinnedDropZone = useSessionDropZone({
+    accepts: () => true,
+    draggingSessionId: draggingSession?.id,
+    onDropSession: (payload, _event, anchor) => {
+      const pinId = payload.pinId ?? payload.id
+      // Translate the anchor row into an index in the RAW pinned-id store:
+      // rendered rows can be a subset of stored ids (a pin whose session isn't
+      // loaded renders nothing), so indexOf the anchor's durable pin id rather
+      // than trusting the rendered position.
+      let index: number | undefined
+
+      if (anchor) {
+        const anchorSession = sessionByAnyId.get(anchor.sessionId)
+        const anchorPinId = anchorSession ? sessionPinId(anchorSession) : anchor.sessionId
+        const ids = payload.pinned ? pinnedSessionIds.filter(id => id !== pinId) : pinnedSessionIds
+        const at = ids.indexOf(anchorPinId)
+
+        if (at >= 0) {
+          index = anchor.before ? at : at + 1
+        }
+      }
+
+      // pinSession(id, index) both pins a new row and — because insertUniqueId
+      // filters the id out before re-inserting — reorders one already pinned,
+      // so it doubles as the reorder path. An already-pinned drop with no usable
+      // anchor is left as a no-op rather than yanked to the end.
+      if (payload.pinned) {
+        if (index != null) {
+          pinSession(pinId, index)
+        }
+      } else {
+        pinSession(pinId, index)
+      }
+
+      setSidebarPinsOpen(true)
+    }
+  })
+
+  const sessionsDropZone = useSessionDropZone({
+    accepts: flags => flags.pinned || Boolean(draggingSession?.id && agentSessionIdSet.has(draggingSession.id)),
+    draggingSessionId: draggingSession?.id,
+    onDropSession: (payload, _event, anchor) => {
+      if (payload.pinned) {
+        unpinSession(payload.pinId ?? payload.id)
+      }
+
+      // Positional drop applies only to the flat list — grouped and ALL-profiles
+      // views derive row order themselves. With no usable anchor (header drop, or
+      // a fresh row the saved order hasn't reconciled yet) the id is simply left
+      // out of the saved order and the reconcile effect surfaces it at the top,
+      // the pre-positional behavior. Manual mode must be flagged for the custom
+      // order to win over the default started_at sort.
+      if (!showAllProfiles && !agentsGrouped) {
+        const nextIds = placeSessionIdAtAnchor(
+          agentSessions.map(session => session.id),
+          payload.id,
+          anchor
+        )
+
+        if (nextIds) {
+          setSidebarSessionOrderManual(true)
+          setSidebarSessionOrderIds(nextIds)
+        }
+      }
+
+      setSidebarRecentsOpen(true)
+    }
+  })
 
   // Recents are local-only: messaging-platform sessions are fetched as their
   // own slice ($messagingSessions) and rendered in self-managed per-platform
@@ -827,25 +941,41 @@ export function ChatSidebar({
       bySource.set(sourceId, list)
     }
 
-    return [...bySource.entries()]
-      .map(([sourceId, list]) => {
-        const ordered = [...list].sort((a, b) => sessionTime(b) - sessionTime(a))
-        const known = messagingPlatformTotals[sourceId]
-        const total = Math.max(ordered.length, known ?? 0)
+    return (
+      [...bySource.entries()]
+        .map(([sourceId, list]) => {
+          const ordered = [...list].sort((a, b) => sessionTime(b) - sessionTime(a))
+          // Pinning MOVES a row to the Pinned section (matching how recents
+          // disappear from Sessions when pinned) — don't render it here too.
+          // Pinned rows still count as LOADED for the load-more math: they're
+          // platform conversations already in memory, just housed elsewhere, so
+          // hiding them must not make the pager think more remain on disk.
+          const rows = ordered.filter(s => !pinnedRealIdSet.has(s.id))
+          const known = messagingPlatformTotals[sourceId]
+          const total = Math.max(ordered.length, known ?? 0)
 
-        return {
-          // Known exact total → more exist iff total exceeds loaded; otherwise
-          // the seed fetch was capped, so assume more until a per-platform load
-          // resolves the count.
-          hasMore: known != null ? known > ordered.length : messagingTruncated,
-          label: sessionSourceLabel(sourceId) ?? sourceId,
-          sessions: ordered,
-          sourceId,
-          total
-        }
-      })
-      .sort((a, b) => sessionTime(b.sessions[0]) - sessionTime(a.sessions[0]))
-  }, [messagingSessions, messagingPlatformTotals, messagingTruncated])
+          return {
+            // Known exact total → more exist iff total exceeds loaded; otherwise
+            // the seed fetch was capped, so assume more until a per-platform load
+            // resolves the count.
+            hasMore: known != null ? known > ordered.length : messagingTruncated,
+            label: sessionSourceLabel(sourceId) ?? sourceId,
+            // Section recency comes from every loaded row (pinned included) so a
+            // platform doesn't reshuffle when its newest thread gets pinned.
+            latestActivity: sessionTime(ordered[0]),
+            loadedCount: ordered.length,
+            sessions: rows,
+            sourceId,
+            total
+          }
+        })
+        // A platform whose every loaded row is pinned (and with nothing more on
+        // disk) has nothing left to show — drop the empty shell. Kept when more
+        // rows exist so its pager stays reachable.
+        .filter(group => group.sessions.length > 0 || group.hasMore)
+        .sort((a, b) => b.latestActivity - a.latestActivity)
+    )
+  }, [messagingSessions, messagingPlatformTotals, messagingTruncated, pinnedRealIdSet])
 
   // ALL-profiles view: one collapsible group per profile, color on the header
   // (not on every row). Default profile floats to the top, the rest alpha.
@@ -896,6 +1026,36 @@ export function ChatSidebar({
   // The flat Sessions list always shows ALL recent sessions; Projects is a
   // parallel grouped view, not a filter on this one — nothing is hidden here.
   const displayAgentSessions = agentSessions
+  const flatSessionDndEnabled = !showAllProfiles && !agentsGrouped
+
+  const sharedSessionDnd = useSharedSessionDnd({
+    enabled: flatSessionDndEnabled,
+    pinnedSessionIds,
+    pinnedSessions,
+    sessionByAnyId,
+    sessions: displayAgentSessions
+  })
+
+  // While a row drag hovers a section, splice the dragged row into the target
+  // list at the anchor so the motion.div rows animate the shuffle before drop.
+  const previewPinnedSessions = useMemo(
+    () => previewItemsAtAnchor(pinnedSessions, draggingSessionInfo, pinnedDropZone.anchor),
+    [draggingSessionInfo, pinnedDropZone.anchor, pinnedSessions]
+  )
+
+  const previewAgentSessions = useMemo(
+    () =>
+      !showAllProfiles && !agentsGrouped
+        ? previewItemsAtAnchor(displayAgentSessions, draggingSessionInfo, sessionsDropZone.anchor)
+        : displayAgentSessions,
+    [agentsGrouped, displayAgentSessions, draggingSessionInfo, sessionsDropZone.anchor, showAllProfiles]
+  )
+
+  const renderedPinnedSessions = flatSessionDndEnabled
+    ? sharedSessionDnd.effectivePinnedSessions
+    : previewPinnedSessions
+
+  const renderedAgentSessions = flatSessionDndEnabled ? sharedSessionDnd.effectiveSessions : previewAgentSessions
 
   // Pagination is scope-aware. In "All profiles" mode it tracks the global
   // unified set. When scoped to one profile it must compare that profile's own
@@ -913,7 +1073,19 @@ export function ChatSidebar({
 
   const hasMoreSessions = knownSessionTotal > loadedSessionCount
 
-  const recentsMeta = countLabel(displayAgentSessions.length, knownSessionTotal)
+  // The server total counts every listable local conversation — including ones
+  // currently pinned, which the recents section deliberately doesn't render.
+  // Pinned rows are always loaded (the refresh keep-set preserves them), so drop
+  // them from BOTH sides of the label; otherwise pinning one row leaves the
+  // count stuck at "17/18" forever, advertising a page that can never arrive.
+  const pinnedFromRecentsCount = useMemo(
+    () => visibleSessions.reduce((count, session) => (pinnedRealIdSet.has(session.id) ? count + 1 : count), 0),
+    [visibleSessions, pinnedRealIdSet]
+  )
+
+  const agentKnownTotal = Math.max(knownSessionTotal - pinnedFromRecentsCount, displayAgentSessions.length)
+
+  const recentsMeta = countLabel(displayAgentSessions.length, agentKnownTotal)
   const displayRecentsCountRef = useRef(0)
   const loadedRecentsCountRef = useRef(0)
   displayRecentsCountRef.current = displayAgentSessions.length
@@ -1005,6 +1177,28 @@ export function ChatSidebar({
   const showSessionSkeletons = sessionsLoading && sortedSessions.length === 0
 
   const showSessionSections = showSessionSkeletons || sortedSessions.length > 0 || projectModel.length > 0
+
+  const selectionSessions = useMemo(() => {
+    if (selection.section === 'pinned') {
+      return renderedPinnedSessions
+    }
+
+    if (selection.section === 'results') {
+      return searchResults
+    }
+
+    if (selection.section === 'sessions') {
+      return renderedAgentSessions
+    }
+
+    if (selection.section?.startsWith('messaging:')) {
+      const sourceId = selection.section.slice('messaging:'.length)
+
+      return messagingGroups.find(group => group.sourceId === sourceId)?.sessions ?? []
+    }
+
+    return []
+  }, [messagingGroups, renderedAgentSessions, renderedPinnedSessions, searchResults, selection.section])
 
   // Each reorderable list reports its OWN new id order; persisting is a direct,
   // typed write — no id-prefix sniffing to figure out which level moved.
@@ -1140,44 +1334,70 @@ export function ChatSidebar({
                 label={s.results}
                 labelMeta={String(searchResults.length)}
                 onArchiveSession={onArchiveSession}
+                onArchiveSessions={onArchiveSessions}
                 onBranchSession={onBranchSession}
                 onDeleteSession={onDeleteSession}
+                onDeleteSessions={onDeleteSessions}
+                onHaltSessions={onHaltSessions}
+                onPromptSessions={onPromptSessions}
                 onResumeSession={onResumeSession}
+                onSteerSessions={onSteerSessions}
                 onToggle={() => undefined}
                 onTogglePin={pinSession}
                 open
                 pinned={false}
                 rootClassName="min-h-32 flex-1 overflow-hidden p-0"
+                sectionKey="results"
                 sessions={searchResults}
                 workingSessionIdSet={workingSessionIdSet}
               />
             )}
 
             {!trimmedQuery && (
-              <SidebarSessionsSection
-                activeSessionId={activeSidebarSessionId}
-                contentClassName={cn('flex max-h-44 flex-col gap-px rounded-lg pb-2 pt-1', GROUP_BODY)}
-                dndSensors={dndSensors}
-                emptyState={<SidebarPinnedEmptyState />}
-                label={s.pinned}
-                onArchiveSession={onArchiveSession}
-                onBranchSession={onBranchSession}
-                onDeleteSession={onDeleteSession}
-                onReorderSessions={reorderPinned}
-                onResumeSession={onResumeSession}
-                onToggle={() => setSidebarPinsOpen(!pinsOpen)}
-                onTogglePin={unpinSession}
-                open={pinsOpen}
-                pinned
-                rootClassName="shrink-0 p-0 pb-1"
-                sessions={pinnedSessions}
-                sortable={pinnedSessions.length > 1}
-                workingSessionIdSet={workingSessionIdSet}
-              />
-            )}
+              <DndContext
+                collisionDetection={sharedSessionDnd.collisionDetection}
+                onDragCancel={sharedSessionDnd.onDragCancel}
+                onDragEnd={sharedSessionDnd.onDragEnd}
+                onDragMove={sharedSessionDnd.onDragMove}
+                onDragOver={sharedSessionDnd.onDragOver}
+                onDragStart={sharedSessionDnd.onDragStart}
+                sensors={dndSensors}
+              >
+                <SidebarSessionsSection
+                  activeSessionId={activeSidebarSessionId}
+                  contentClassName={cn('flex max-h-44 flex-col gap-px rounded-lg pb-2 pt-1', GROUP_BODY)}
+                  dndSensors={dndSensors}
+                  draggingSessionId={sharedSessionDnd.activeId}
+                  dropActive={!flatSessionDndEnabled && pinnedDropZone.active}
+                  dropHandlers={flatSessionDndEnabled ? undefined : pinnedDropZone.dropHandlers}
+                  emptyState={<SidebarPinnedEmptyState />}
+                  label={s.pinned}
+                  onArchiveSession={onArchiveSession}
+                  onArchiveSessions={onArchiveSessions}
+                  onBranchSession={onBranchSession}
+                  onDeleteSession={onDeleteSession}
+                  onDeleteSessions={onDeleteSessions}
+                  onHaltSessions={onHaltSessions}
+                  onPromptSessions={onPromptSessions}
+                  onReorderSessions={reorderPinned}
+                  onResumeSession={onResumeSession}
+                  onSessionDragEnd={flatSessionDndEnabled ? undefined : handleSessionDragEnd}
+                  onSessionDragStart={flatSessionDndEnabled ? undefined : handleSessionDragStart}
+                  onSteerSessions={onSteerSessions}
+                  onToggle={() => setSidebarPinsOpen(!pinsOpen)}
+                  onTogglePin={unpinSession}
+                  open={pinsOpen}
+                  pinned
+                  rootClassName="shrink-0 p-0 pb-1"
+                  sectionKey="pinned"
+                  sessionDndId={sharedSessionSectionId('pinned')}
+                  sessions={renderedPinnedSessions}
+                  sharedSessionDnd={flatSessionDndEnabled}
+                  sortable={flatSessionDndEnabled ? pinnedSessions.length > 0 : pinnedSessions.length > 1}
+                  workingSessionIdSet={workingSessionIdSet}
+                />
 
-            {!trimmedQuery && (
-              <SidebarSessionsSection
+                <SidebarSessionsSection
                 activeProjectId={activeProjectId}
                 activeSessionId={activeSidebarSessionId}
                 collapsible={!inProject}
@@ -1191,7 +1411,11 @@ export function ChatSidebar({
                   // virtualized long list, which must keep its own scroller.
                   !recentsVirtualizes && COMPACT_FLAT
                 )}
+                disableVirtualization={Boolean(sharedSessionDnd.activeId)}
                 dndSensors={dndSensors}
+                draggingSessionId={sharedSessionDnd.activeId}
+                dropActive={!flatSessionDndEnabled && sessionsDropZone.active}
+                dropHandlers={flatSessionDndEnabled ? undefined : sessionsDropZone.dropHandlers}
                 emptyState={
                   showSessionSkeletons ? (
                     <SidebarSessionSkeletons />
@@ -1266,6 +1490,22 @@ export function ChatSidebar({
                           <Codicon name="add" size="0.75rem" />
                         </Button>
                       ) : null}
+                      {!showAllProfiles && agentSessions.length > 0 ? (
+                        <Button
+                          aria-label={s.archiveAllAria}
+                          className={HEADER_ACTION_BTN}
+                          disabled={sessionsLoading}
+                          onClick={event => {
+                            event.stopPropagation()
+                            setArchiveAllOpen(true)
+                          }}
+                          size="icon-xs"
+                          title={s.archiveAllTitle}
+                          variant="ghost"
+                        >
+                          <Codicon name="archive" size="0.75rem" />
+                        </Button>
+                      ) : null}
                       <div className="grid size-6 place-items-center">
                         {!showAllProfiles && agentSessions.length > 0 ? (
                           <Button
@@ -1301,13 +1541,20 @@ export function ChatSidebar({
                 }
                 liveSessions={inProject ? agentSessions : undefined}
                 onArchiveSession={onArchiveSession}
+                onArchiveSessions={onArchiveSessions}
                 onBranchSession={onBranchSession}
                 onDeleteSession={onDeleteSession}
+                onDeleteSessions={onDeleteSessions}
                 onEnterProject={onEnterProject}
+                onHaltSessions={onHaltSessions}
                 onNewSessionInWorkspace={showAllProfiles ? undefined : onNewSessionInWorkspace}
+                onPromptSessions={onPromptSessions}
                 onReorderProjects={showAllProfiles ? undefined : reorderProjects}
                 onReorderSessions={showAllProfiles ? undefined : reorderSessions}
                 onResumeSession={onResumeSession}
+                onSessionDragEnd={flatSessionDndEnabled ? undefined : handleSessionDragEnd}
+                onSessionDragStart={flatSessionDndEnabled ? undefined : handleSessionDragStart}
+                onSteerSessions={onSteerSessions}
                 onToggle={() => setSidebarRecentsOpen(!agentsOpen)}
                 onTogglePin={pinSession}
                 open={agentsOpen}
@@ -1325,10 +1572,14 @@ export function ChatSidebar({
                   'min-h-32 flex-1 overflow-hidden p-0',
                   !recentsVirtualizes && 'compact:min-h-0 compact:flex-none compact:overflow-visible'
                 )}
-                sessions={displayAgentSessions}
-                sortable={!showAllProfiles && agentSessions.length > 1}
+                sectionKey={!worktreeGroupingActive && !showAllProfiles ? 'sessions' : undefined}
+                sessionDndId={sharedSessionSectionId('sessions')}
+                sessions={renderedAgentSessions}
+                sharedSessionDnd={flatSessionDndEnabled}
+                sortable={!showAllProfiles && agentSessions.length > 0}
                 workingSessionIdSet={workingSessionIdSet}
               />
+              </DndContext>
             )}
 
             {!trimmedQuery &&
@@ -1350,7 +1601,13 @@ export function ChatSidebar({
                         <SidebarLoadMoreRow
                           loading={Boolean(messagingLoadMorePending[group.sourceId])}
                           onClick={() => revealMoreMessaging(group.sourceId, group.sessions.length, group.hasMore)}
-                          step={Math.min(NON_SESSION_LOAD_STEP, Math.max(0, group.total - shownSessions.length))}
+                          step={Math.min(
+                            NON_SESSION_LOAD_STEP,
+                            // What a click can reveal: rows hidden behind the
+                            // visible cap plus rows still on disk. Pinned rows
+                            // are loaded-but-housed-in-Pinned — never countable.
+                            Math.max(0, group.sessions.length - shownSessions.length + group.total - group.loadedCount)
+                          )}
                         />
                       ) : null
                     }
@@ -1363,15 +1620,23 @@ export function ChatSidebar({
                         platformName={group.label}
                       />
                     }
-                    labelMeta={countLabel(group.sessions.length, group.total)}
+                    labelMeta={countLabel(group.loadedCount, group.total)}
                     onArchiveSession={onArchiveSession}
+                    onArchiveSessions={onArchiveSessions}
                     onDeleteSession={onDeleteSession}
+                    onDeleteSessions={onDeleteSessions}
+                    onHaltSessions={onHaltSessions}
+                    onPromptSessions={onPromptSessions}
                     onResumeSession={onResumeSession}
+                    onSessionDragEnd={handleSessionDragEnd}
+                    onSessionDragStart={handleSessionDragStart}
+                    onSteerSessions={onSteerSessions}
                     onToggle={() => toggleSidebarMessagingOpen(group.sourceId)}
                     onTogglePin={pinSession}
                     open={messagingOpenIds.includes(group.sourceId)}
                     pinned={false}
                     rootClassName="shrink-0 p-0"
+                    sectionKey={`messaging:${group.sourceId}`}
                     sessions={shownSessions}
                     workingSessionIdSet={workingSessionIdSet}
                   />
@@ -1394,12 +1659,40 @@ export function ChatSidebar({
 
         {contentVisible && !showSessionSections && <SidebarBlankState onNewProject={openProjectCreate} />}
 
+        {contentVisible && selection.ids.length > 0 && (
+          <SelectionActionBar
+            onArchiveSessions={onArchiveSessions}
+            onDeleteSessions={onDeleteSessions}
+            onHaltSessions={onHaltSessions}
+            onPromptSessions={onPromptSessions}
+            onSteerSessions={onSteerSessions}
+            sessions={selectionSessions}
+          />
+        )}
+
         {contentVisible && (
           <div className="shrink-0 px-0.5 pb-1 pt-0.5">
             <ProfileRail />
           </div>
         )}
       </SidebarContent>
+      <ConfirmDialog
+        busyLabel={s.archiveAllSubmitting}
+        confirmLabel={s.archiveAllConfirm}
+        description={
+          <>
+            {s.archiveAllDialogDesc}
+            <span className="mt-2 block rounded-md border border-(--ui-stroke-tertiary) bg-(--ui-control-background) px-3 py-2 text-xs text-(--ui-text-secondary)">
+              {s.archiveAllChecked(agentSessions.length)}
+            </span>
+          </>
+        }
+        destructive
+        onClose={() => setArchiveAllOpen(false)}
+        onConfirm={onArchiveAllSessions}
+        open={archiveAllOpen}
+        title={s.archiveAllDialogTitle}
+      />
       <ProjectDialog />
     </Sidebar>
   )
@@ -1408,7 +1701,13 @@ export function ChatSidebar({
 interface MessagingSection {
   sourceId: string
   label: string
+  /** Rows this section renders (pinned rows excluded — they live in Pinned). */
   sessions: SessionInfo[]
+  /** Loaded conversations for this platform, pinned included — the honest
+   * "loaded" side of the count label and load-more math. */
+  loadedCount: number
+  /** Latest activity across every loaded row (pinned included). */
+  latestActivity: number
   total: number
   hasMore: boolean
 }

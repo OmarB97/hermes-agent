@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import type { ChatMessage } from '@/lib/chat-messages'
-import { $currentFallbackPolicy, setCurrentFallbackPolicy } from '@/store/session'
+import { $currentFallbackPolicy, $currentUsage, setCurrentFallbackPolicy } from '@/store/session'
 import type { SessionInfo } from '@/types/hermes'
 
 import {
@@ -11,6 +11,7 @@ import {
   reconcileResumeMessages,
   sessionMatchesStoredId,
   sessionShouldHaveTranscript,
+  storedSessionUsagePreview,
   toBranchMessages
 } from './utils'
 
@@ -27,6 +28,27 @@ describe('applyRuntimeInfo', () => {
     expect($currentFallbackPolicy.get()).toBe('local-only')
 
     setCurrentFallbackPolicy('')
+  })
+
+  it('retains persisted context occupancy when warm runtime usage is partial', () => {
+    const persisted = storedSessionUsagePreview(
+      session({
+        api_call_count: 4,
+        compression_count: 1,
+        context_length: 200_000,
+        input_tokens: 12_000,
+        last_prompt_tokens: 50_000,
+        output_tokens: 3_000,
+        total_tokens: 15_000
+      })
+    )
+
+    expect(
+      applyRuntimeInfo({ usage: { calls: 4, input: 12_000, output: 3_000, total: 15_000 } }, persisted)
+    ).toMatchObject({
+      usage: { context_max: 200_000, context_percent: 25, context_used: 50_000 }
+    })
+    expect($currentUsage.get()).toMatchObject({ context_max: 200_000, context_percent: 25, context_used: 50_000 })
   })
 })
 

@@ -208,6 +208,9 @@ export const $connection = atom<HermesConnection | null>(null)
 export const $gatewayState = atom('idle')
 export const $sessions = atom<SessionInfo[]>([])
 export const $sessionsTotal = atom<number>(0)
+export const $archivedSessions = atom<SessionInfo[]>([])
+export const $archivedSessionsTotal = atom<number>(0)
+export const $archivedSessionsLoading = atom(false)
 // Cron-job sessions (source === 'cron') are fetched as their own list so the
 // scheduler's always-newest sessions never crowd recents out of the page
 // budget. Powers the collapsed "Cron jobs" sidebar section.
@@ -307,6 +310,9 @@ export const setConnection = (next: Updater<HermesConnection | null>) => updateA
 export const setGatewayState = (next: Updater<string>) => updateAtom($gatewayState, next)
 export const setSessions = (next: Updater<SessionInfo[]>) => updateAtom($sessions, next)
 export const setSessionsTotal = (next: Updater<number>) => updateAtom($sessionsTotal, next)
+export const setArchivedSessions = (next: Updater<SessionInfo[]>) => updateAtom($archivedSessions, next)
+export const setArchivedSessionsTotal = (next: Updater<number>) => updateAtom($archivedSessionsTotal, next)
+export const setArchivedSessionsLoading = (next: Updater<boolean>) => updateAtom($archivedSessionsLoading, next)
 export const setCronSessions = (next: Updater<SessionInfo[]>) => updateAtom($cronSessions, next)
 export const setMessagingSessions = (next: Updater<SessionInfo[]>) => updateAtom($messagingSessions, next)
 export const setMessagingPlatformTotals = (next: Updater<Record<string, number>>) =>
@@ -314,6 +320,24 @@ export const setMessagingPlatformTotals = (next: Updater<Record<string, number>>
 export const setMessagingTruncated = (next: Updater<boolean>) => updateAtom($messagingTruncated, next)
 export const setSessionProfileTotals = (next: Updater<Record<string, number>>) =>
   updateAtom($sessionProfileTotals, next)
+export const adjustSessionProfileTotal = (profileKey: string, delta: number) =>
+  $sessionProfileTotals.set(
+    profileKey in $sessionProfileTotals.get()
+      ? {
+          ...$sessionProfileTotals.get(),
+          [profileKey]: Math.max(0, ($sessionProfileTotals.get()[profileKey] ?? 0) + delta)
+        }
+      : $sessionProfileTotals.get()
+  )
+export const adjustMessagingPlatformTotal = (sourceId: string, delta: number) =>
+  $messagingPlatformTotals.set(
+    sourceId in $messagingPlatformTotals.get()
+      ? {
+          ...$messagingPlatformTotals.get(),
+          [sourceId]: Math.max(0, ($messagingPlatformTotals.get()[sourceId] ?? 0) + delta)
+        }
+      : $messagingPlatformTotals.get()
+  )
 export const setSessionsLoading = (next: Updater<boolean>) => updateAtom($sessionsLoading, next)
 export const setWorkingSessionIds = (next: Updater<string[]>) => updateAtom($workingSessionIds, next)
 export const setActiveSessionId = (next: Updater<string | null>) => updateAtom($activeSessionId, next)
@@ -459,6 +483,12 @@ const settledSessionExpiry = new Map<string, number>()
 
 function markSessionSettled(sessionId: string) {
   settledSessionExpiry.set(sessionId, Date.now() + SESSION_SETTLE_GRACE_MS)
+}
+
+export function shieldSessionFromMerge(sessionId: string) {
+  if (sessionId) {
+    markSessionSettled(sessionId)
+  }
 }
 
 function clearSessionSettled(sessionId: string) {

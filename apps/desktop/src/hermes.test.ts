@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
+  bulkArchiveSessions,
+  deleteSession,
   getCronJobs,
   getGlobalModelInfo,
   getGlobalModelOptions,
@@ -10,7 +12,8 @@ import {
   getSessionMessages,
   getStatus,
   listAllProfileSessions,
-  listSessions
+  listSessions,
+  setSessionArchived
 } from './hermes'
 import { refreshActiveProfile } from './store/profile'
 
@@ -132,6 +135,44 @@ describe('Hermes REST session helpers', () => {
     expect(api).toHaveBeenCalledWith({
       path: '/api/sessions/session-1/messages?profile=xiaoxuxu',
       profile: 'xiaoxuxu'
+    })
+  })
+
+  it('routes bulk archive to the owning profile and deduplicates preserved ids', async () => {
+    api.mockResolvedValue({ archived: 3, ok: true })
+
+    await bulkArchiveSessions(['pinned', 'pinned', 'running'], 'coder')
+
+    expect(api).toHaveBeenCalledWith({
+      body: { preserve_ids: ['pinned', 'running'], profile: 'coder' },
+      method: 'POST',
+      path: '/api/sessions/bulk-archive',
+      profile: 'coder'
+    })
+  })
+
+  it('carries the owning profile through both archive routing layers', async () => {
+    api.mockResolvedValue({ ok: true })
+
+    await setSessionArchived('session-1', true, 'default')
+
+    expect(api).toHaveBeenCalledWith({
+      body: { archived: true, profile: 'default' },
+      method: 'PATCH',
+      path: '/api/sessions/session-1',
+      profile: 'default'
+    })
+  })
+
+  it('carries the owning profile in delete routing and the REST query', async () => {
+    api.mockResolvedValue({ ok: true })
+
+    await deleteSession('session-1', 'default')
+
+    expect(api).toHaveBeenCalledWith({
+      method: 'DELETE',
+      path: '/api/sessions/session-1?profile=default',
+      profile: 'default'
     })
   })
 

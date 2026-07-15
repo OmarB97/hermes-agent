@@ -7,7 +7,20 @@ export function reconcileFreshFirst(currentIds: string[], orderIds: string[]): s
   return [...currentIds.filter(id => !retainedSet.has(id)), ...retained]
 }
 
-export function resolveManualSessionOrderIds(currentIds: string[], orderIds: string[], manual: boolean): string[] {
+export function resolveManualSessionOrderIds(
+  currentIds: string[],
+  orderIds: string[],
+  manual: boolean,
+  listReady = true
+): string[] {
+  // The sidebar mounts before its first session page arrives. Preserve the
+  // saved order through that empty loading frame; treating it as an
+  // authoritative empty list clears both the order and its manual-mode flag
+  // before the real rows render.
+  if (!listReady) {
+    return orderIds
+  }
+
   if (!manual || !currentIds.length || !orderIds.length) {
     return []
   }

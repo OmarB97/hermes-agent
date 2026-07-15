@@ -2,6 +2,7 @@ import { getSession } from '@/hermes'
 import { type ChatMessage, chatMessageText } from '@/lib/chat-messages'
 import { normalizeFallbackPolicyValue, normalizePersonalityValue } from '@/lib/chat-runtime'
 import { embeddedImageUrls, textWithoutEmbeddedImages } from '@/lib/embedded-images'
+import { emptyUsageStats, mergeUsageSnapshot } from '@/lib/token-usage'
 import { requestDesktopOnboarding } from '@/store/onboarding'
 import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/profile'
 import {
@@ -21,7 +22,7 @@ import {
   setYoloActive
 } from '@/store/session'
 import { reportBackendContract, reportInstallMethodWarning } from '@/store/updates'
-import type { SessionCreateResponse, SessionInfo, SessionRuntimeInfo } from '@/types/hermes'
+import type { SessionCreateResponse, SessionInfo, SessionRuntimeInfo, UsageStats } from '@/types/hermes'
 
 import type { ClientSessionState } from '../../../types'
 
@@ -263,11 +264,38 @@ type SessionRuntimeStatePatch = Partial<
     | 'provider'
     | 'reasoningEffort'
     | 'serviceTier'
+    | 'usage'
     | 'yolo'
   >
 >
 
-export function applyRuntimeInfo(info: SessionRuntimeInfo | undefined): SessionRuntimeStatePatch | null {
+export function storedSessionUsagePreview(stored: SessionInfo): UsageStats {
+  const input = stored.input_tokens || 0
+  const output = stored.output_tokens || 0
+  const contextUsed = stored.last_prompt_tokens || 0
+  const contextMax = stored.context_length || 0
+
+  const usage: UsageStats = {
+    calls: stored.api_call_count || 0,
+    compressions: stored.compression_count || 0,
+    input,
+    output,
+    total: stored.total_tokens || input + output
+  }
+
+  if (contextUsed > 0 && contextMax > 0) {
+    usage.context_used = contextUsed
+    usage.context_max = contextMax
+    usage.context_percent = Math.max(0, Math.min(100, Math.round((contextUsed / contextMax) * 100)))
+  }
+
+  return usage
+}
+
+export function applyRuntimeInfo(
+  info: SessionRuntimeInfo | undefined,
+  usageFallback: UsageStats = emptyUsageStats()
+): SessionRuntimeStatePatch | null {
   if (!info) {
     return null
   }
@@ -338,7 +366,13 @@ export function applyRuntimeInfo(info: SessionRuntimeInfo | undefined): SessionR
   }
 
   if (info.usage) {
-    setCurrentUsage(current => ({ ...current, ...info.usage }))
+    // A warm deferred agent can report cumulative counters before its context
+    // compressor has restored the persisted window occupancy. Seed from the
+    // stored session so that partial runtime usage cannot make the context bar
+    // disappear during an otherwise-successful session switch.
+    const usage = mergeUsageSnapshot(usageFallback, info.usage, { allowContextDecrease: true })
+    setCurrentUsage(usage)
+    sessionState.usage = usage
   }
 
   return sessionState

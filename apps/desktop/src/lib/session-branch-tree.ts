@@ -5,10 +5,17 @@ export interface SidebarSessionEntry {
   session: SessionInfo
 }
 
+interface FlattenSessionsOptions {
+  preserveRootOrder?: boolean
+}
+
 const recency = (session: SessionInfo): number => session.last_active || session.started_at || 0
 
 /** Flat list with branch/fork sessions nested visually under their parent. */
-export function flattenSessionsWithBranches(sessions: readonly SessionInfo[]): SidebarSessionEntry[] {
+export function flattenSessionsWithBranches(
+  sessions: readonly SessionInfo[],
+  { preserveRootOrder = false }: FlattenSessionsOptions = {}
+): SidebarSessionEntry[] {
   if (sessions.length < 2) {
     return sessions.map(session => ({ session }))
   }
@@ -92,11 +99,15 @@ export function flattenSessionsWithBranches(sessions: readonly SessionInfo[]): S
     children?.forEach((child, index) => emit(child, index === children.length - 1 ? '└─ ' : '├─ '))
   }
 
-  sessions
+  const roots = sessions
     .filter(session => !nestedIds.has(session.id))
     .map((session, index) => ({ index, session }))
-    .sort((a, b) => groupRecency(b.session) - groupRecency(a.session) || a.index - b.index)
-    .forEach(({ session }) => emit(session))
+
+  if (!preserveRootOrder) {
+    roots.sort((a, b) => groupRecency(b.session) - groupRecency(a.session) || a.index - b.index)
+  }
+
+  roots.forEach(({ session }) => emit(session))
 
   for (const session of sessions) {
     if (!seen.has(session.id)) {

@@ -353,6 +353,13 @@ def test_session_resume_defaults_to_deferred_build(server, monkeypatch):
                 "id": target,
                 "model": "vendor/cool-model",
                 "model_config": {"provider": "vendor"},
+                "api_call_count": 9,
+                "compression_count": 2,
+                "context_length": 131_072,
+                "input_tokens": 120_000,
+                "last_prompt_tokens": 98_304,
+                "output_tokens": 4_000,
+                "total_tokens": 124_000,
             }
 
         def get_session_by_title(self, _title):
@@ -404,6 +411,20 @@ def test_session_resume_defaults_to_deferred_build(server, monkeypatch):
     assert result["info"]["model"] == "vendor/cool-model"
     assert result["info"]["provider"] == "vendor"
     assert result["info"]["desktop_contract"] == server.DESKTOP_BACKEND_CONTRACT
+    assert result["info"]["usage"] == {
+        "calls": 9,
+        "completion": 4_000,
+        "compressions": 2,
+        "context_max": 131_072,
+        "context_percent": 75,
+        "context_used": 98_304,
+        "input": 120_000,
+        "model": "vendor/cool-model",
+        "output": 4_000,
+        "prompt": 120_000,
+        "reasoning": 0,
+        "total": 124_000,
+    }
 
     sid = result["session_id"]
     session = server._sessions[sid]

@@ -3,6 +3,10 @@ import { describe, expect, it } from 'vitest'
 import { orderByIds, reconcileOrderIds, resolveManualSessionOrderIds, sameIds } from './order'
 
 describe('resolveManualSessionOrderIds', () => {
+  it('preserves the saved order until the first session page is ready', () => {
+    expect(resolveManualSessionOrderIds([], ['older', 'newest'], true, false)).toEqual(['older', 'newest'])
+  })
+
   it('clears legacy auto-seeded order until the user manually reorders sessions', () => {
     expect(resolveManualSessionOrderIds(['newest', 'older'], ['older', 'newest'], false)).toEqual([])
   })
