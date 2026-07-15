@@ -176,14 +176,21 @@ export function useSharedSessionDnd({
         pointerYRef.current = args.pointerCoordinates.y
       }
 
-      const pointerHits = pointerWithin(args)
+      // The active sortable remains a droppable container and moves under the
+      // pointer. Never let it win its own collision: doing so reports `over`
+      // as the dragged row forever, so a same-lane move can animate without
+      // ever recognizing the sibling underneath (and then snaps back).
+      const activeId = String(args.active.id)
+      const pointerHits = pointerWithin(args).filter(hit => String(hit.id) !== activeId)
       const rowUnderPointer = pointerHits.find(hit => !parseSectionId(String(hit.id)))
 
       if (rowUnderPointer) {
         return [{ id: rowUnderPointer.id }]
       }
 
-      const intersections = pointerHits.length ? pointerHits : rectIntersection(args)
+      const intersections = (pointerHits.length ? pointerHits : rectIntersection(args)).filter(
+        hit => String(hit.id) !== activeId
+      )
       let overId = getFirstCollision(intersections, 'id')
 
       if (overId == null) {
@@ -195,7 +202,9 @@ export function useSharedSessionDnd({
       if (lane) {
         const ids = lane === 'pinned' ? (drag?.pinned ?? basePinnedIds) : (drag?.sessions ?? baseSessionIds)
         const idSet = new Set(ids)
-        const rows = args.droppableContainers.filter(container => idSet.has(String(container.id)))
+        const rows = args.droppableContainers.filter(
+          container => String(container.id) !== activeId && idSet.has(String(container.id))
+        )
 
         if (rows.length) {
           const closest = closestCenter({ ...args, droppableContainers: rows })
