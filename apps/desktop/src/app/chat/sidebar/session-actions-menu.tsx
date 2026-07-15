@@ -22,9 +22,12 @@ import { exportSession } from '@/lib/session-export'
 import { activeGateway } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
 import { $activeSessionId, $selectedStoredSessionId, setSessions } from '@/store/session'
+import { clearSidebarSelection } from '@/store/sidebar-selection'
 import { canOpenSessionWindow, openSessionInNewWindow } from '@/store/windows'
 
 import type { SessionTitleResponse } from '../../types'
+
+import { BulkRuntimeTextDialog, type BulkRuntimeTextMode } from './bulk-runtime-text-dialog'
 
 // Rename a session, preferring the gateway's session.title RPC over REST.
 //
@@ -83,6 +86,18 @@ interface SessionActions {
 }
 
 type MenuItem = typeof DropdownMenuItem | typeof ContextMenuItem
+type BulkSessionHandler = (sessionIds: string[]) => Promise<unknown> | void
+
+export interface SessionBulkContextActions {
+  onArchiveSessions?: BulkSessionHandler
+  onDeleteSessions?: BulkSessionHandler
+  onHaltSessions?: BulkSessionHandler
+  onPromptSessions?: (sessionIds: string[], text: string) => Promise<unknown> | void
+  onSteerSessions?: (sessionIds: string[], text: string) => Promise<unknown> | void
+  sessionIds: readonly string[]
+}
+
+type PendingBulkAction = 'archive' | 'delete' | 'halt' | 'prompt' | 'steer' | null
 
 interface ItemSpec {
   className?: string
@@ -245,22 +260,158 @@ export function SessionActionsMenu({ children, align = 'end', sideOffset = 6, ..
 }
 
 interface SessionContextMenuProps extends SessionActions {
+  bulkActions?: SessionBulkContextActions
   children: React.ReactNode
 }
 
-export function SessionContextMenu({ children, ...actions }: SessionContextMenuProps) {
+function useBulkSessionActions({
+  onArchiveSessions,
+  onDeleteSessions,
+  onHaltSessions,
+  onPromptSessions,
+  onSteerSessions,
+  sessionIds
+}: SessionBulkContextActions) {
+  const { t } = useI18n()
+  const s = t.sidebar.bulk
+  const [pending, setPending] = useState<PendingBulkAction>(null)
+  const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false)
+  const [runtimeTextMode, setRuntimeTextMode] = useState<BulkRuntimeTextMode | null>(null)
+  const count = sessionIds.length
+
+  const runBulk = async (action: Exclude<PendingBulkAction, null>, run?: BulkSessionHandler) => {
+    if (pending || !run) {
+      return
+    }
+
+    setPending(action)
+
+    try {
+      await run([...sessionIds])
+      clearSidebarSelection()
+    } finally {
+      setPending(null)
+    }
+  }
+
+  const submitRuntimeText = (mode: BulkRuntimeTextMode, text: string) => {
+    setRuntimeTextMode(null)
+    triggerHaptic('submit')
+    void runBulk(mode, ids => (mode === 'prompt' ? onPromptSessions?.(ids, text) : onSteerSessions?.(ids, text)))
+  }
+
+  const items: ItemSpec[] = [
+    {
+      disabled: pending !== null || !onPromptSessions,
+      icon: 'arrow-up',
+      label: s.promptCount(count),
+      onSelect: () => setRuntimeTextMode('prompt')
+    },
+    {
+      disabled: pending !== null || !onSteerSessions,
+      icon: 'comment-discussion',
+      label: s.steerCount(count),
+      onSelect: () => setRuntimeTextMode('steer')
+    },
+    {
+      className: 'text-destructive focus:text-destructive',
+      disabled: pending !== null || !onHaltSessions,
+      icon: 'debug-stop',
+      label: s.haltCount(count),
+      onSelect: () => void runBulk('halt', onHaltSessions),
+      variant: 'destructive'
+    },
+    {
+      disabled: pending !== null || !onArchiveSessions,
+      icon: 'archive',
+      label: s.archiveCount(count),
+      onSelect: () => void runBulk('archive', onArchiveSessions)
+    },
+    {
+      className: 'text-destructive focus:text-destructive',
+      disabled: pending !== null || !onDeleteSessions,
+      icon: 'trash',
+      label: s.deleteCount(count),
+      onSelect: () => setConfirmDeleteOpen(true),
+      variant: 'destructive'
+    }
+  ]
+
+  const renderItems = (Item: MenuItem) =>
+    items.map(spec => (
+      <Item
+        className={spec.className}
+        disabled={spec.disabled}
+        key={spec.label}
+        onSelect={spec.onSelect}
+        variant={spec.variant}
+      >
+        <Codicon name={spec.icon} size="0.875rem" />
+        <span>{spec.label}</span>
+      </Item>
+    ))
+
+  const dialogs = (
+    <>
+      <Dialog onOpenChange={setConfirmDeleteOpen} open={confirmDeleteOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>{s.deleteDialogTitle(count)}</DialogTitle>
+            <DialogDescription>{s.deleteDialogDesc}</DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button onClick={() => setConfirmDeleteOpen(false)} type="button" variant="ghost">
+              {t.common.cancel}
+            </Button>
+            <Button
+              onClick={() => {
+                setConfirmDeleteOpen(false)
+                void runBulk('delete', onDeleteSessions)
+              }}
+              type="button"
+              variant="destructive"
+            >
+              {s.deleteConfirm}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      <BulkRuntimeTextDialog
+        count={count}
+        mode={runtimeTextMode}
+        onOpenChange={open => setRuntimeTextMode(open ? runtimeTextMode : null)}
+        onSubmit={submitRuntimeText}
+        pending={pending !== null}
+      />
+    </>
+  )
+
+  return { count, dialogs, renderItems }
+}
+
+export function SessionContextMenu({ bulkActions, children, ...actions }: SessionContextMenuProps) {
   const { t } = useI18n()
   const { renameDialog, renderItems } = useSessionActions(actions)
+
+  const bulk = useBulkSessionActions({
+    ...bulkActions,
+    sessionIds: bulkActions?.sessionIds ?? []
+  })
+
+  const showBulkMenu = Boolean(bulkActions && bulkActions.sessionIds.length > 1)
 
   return (
     <>
       <ContextMenu>
         <ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
-        <ContextMenuContent aria-label={t.sidebar.row.actionsFor(actions.title)} className="w-40">
-          {renderItems(ContextMenuItem)}
+        <ContextMenuContent
+          aria-label={showBulkMenu ? t.sidebar.bulk.selectedCount(bulk.count) : t.sidebar.row.actionsFor(actions.title)}
+          className="w-48"
+        >
+          {showBulkMenu ? bulk.renderItems(ContextMenuItem) : renderItems(ContextMenuItem)}
         </ContextMenuContent>
       </ContextMenu>
-      {renameDialog}
+      {showBulkMenu ? bulk.dialogs : renameDialog}
     </>
   )
 }

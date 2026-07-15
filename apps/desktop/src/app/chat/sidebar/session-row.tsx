@@ -18,7 +18,7 @@ import { $attentionSessionIds, sessionPinId } from '@/store/session'
 import { canOpenSessionWindow, openSessionInNewWindow } from '@/store/windows'
 
 import { SidebarRowBody, SidebarRowGrab, SidebarRowLabel, SidebarRowLead, SidebarRowShell } from './chrome'
-import { SessionActionsMenu, SessionContextMenu } from './session-actions-menu'
+import { SessionActionsMenu, type SessionBulkContextActions, SessionContextMenu } from './session-actions-menu'
 
 interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
   session: SessionInfo
@@ -41,15 +41,25 @@ interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
   /** Native session-drag started on the row body — hands the owner the payload
    * so it can drive drop-zone previews while the drag is in flight. */
   onSessionDragStart?: (payload: SessionDragPayload) => void
+  /** Row participates in its section's multi-select. */
+  selectable?: boolean
+  /** At least one row in this section is selected. */
+  selectionActive?: boolean
+  /** This row is included in the current section selection. */
+  checked?: boolean
+  onToggleSelect?: (mode: 'range' | 'single') => void
+  bulkSelectedSessionIds?: readonly string[]
+  onArchiveSelectedSessions?: SessionBulkContextActions['onArchiveSessions']
+  onDeleteSelectedSessions?: SessionBulkContextActions['onDeleteSessions']
+  onHaltSelectedSessions?: SessionBulkContextActions['onHaltSessions']
+  onPromptSelectedSessions?: SessionBulkContextActions['onPromptSessions']
+  onSteerSelectedSessions?: SessionBulkContextActions['onSteerSessions']
 }
 
 const AGE_KEY = { day: 'ageDay', hour: 'ageHour', minute: 'ageMin' } as const
 
 function isNestedDragControl(target: EventTarget | null): boolean {
-  return (
-    target instanceof HTMLElement &&
-    Boolean(target.closest('[data-reorder-handle], [data-session-row-actions]'))
-  )
+  return target instanceof HTMLElement && Boolean(target.closest('[data-reorder-handle], [data-session-row-actions]'))
 }
 
 function formatAge(seconds: number, r: Translations['sidebar']['row']): string {
@@ -75,6 +85,16 @@ export function SidebarSessionRow({
   dragHandleProps,
   onSessionDragEnd,
   onSessionDragStart,
+  selectable = false,
+  selectionActive = false,
+  checked = false,
+  onToggleSelect,
+  bulkSelectedSessionIds,
+  onArchiveSelectedSessions,
+  onDeleteSelectedSessions,
+  onHaltSelectedSessions,
+  onPromptSelectedSessions,
+  onSteerSelectedSessions,
   className,
   style,
   ref,
@@ -95,8 +115,25 @@ export function SidebarSessionRow({
   // session is waiting on the user.
   const needsInput = useStore($attentionSessionIds).includes(session.id)
 
+  const bulkContextActions =
+    checked && bulkSelectedSessionIds && bulkSelectedSessionIds.length > 1
+      ? {
+          onArchiveSessions: onArchiveSelectedSessions,
+          onDeleteSessions: onDeleteSelectedSessions,
+          onHaltSessions: onHaltSelectedSessions,
+          onPromptSessions: onPromptSelectedSessions,
+          onSteerSessions: onSteerSelectedSessions,
+          sessionIds: bulkSelectedSessionIds
+        }
+      : undefined
+
+  const toggleSelect = (mode: 'range' | 'single') => {
+    triggerHaptic('selection')
+    onToggleSelect?.(mode)
+  }
+
   const rowDragActivationProps =
-    reorderable && dragHandleProps
+    reorderable && dragHandleProps && !selectionActive
       ? {
           onKeyDown: (event: React.KeyboardEvent<HTMLElement>) => {
             if (!isNestedDragControl(event.target)) {
@@ -123,6 +160,7 @@ export function SidebarSessionRow({
 
   return (
     <SessionContextMenu
+      bulkActions={bulkContextActions}
       onArchive={onArchive}
       onBranch={onBranch}
       onDelete={onDelete}
@@ -184,7 +222,7 @@ export function SidebarSessionRow({
             }
             className={cn(
               'group row-hover relative',
-              isSelected && 'bg-(--ui-row-active-background)',
+              (isSelected || checked) && 'bg-(--ui-row-active-background)',
               isWorking && 'text-foreground',
               // Opaque surface while lifted so the dragged row erases what's under
               // it (translucency let the rows below bleed through).
@@ -197,8 +235,34 @@ export function SidebarSessionRow({
             <SidebarRowBody
               className={cn('z-0 group-hover:pr-12', branchStem && 'pl-3.5')}
               data-session-row-main
-              draggable={!reorderable}
+              draggable={!reorderable && !selectionActive}
               onClick={event => {
+                const canSelect = Boolean(selectable && onToggleSelect)
+
+                if (canSelect && (event.metaKey || event.ctrlKey || event.altKey)) {
+                  event.preventDefault()
+                  event.stopPropagation()
+                  toggleSelect('single')
+
+                  return
+                }
+
+                if (canSelect && event.shiftKey) {
+                  event.preventDefault()
+                  event.stopPropagation()
+                  toggleSelect('range')
+
+                  return
+                }
+
+                if (canSelect && selectionActive) {
+                  event.preventDefault()
+                  event.stopPropagation()
+                  toggleSelect('single')
+
+                  return
+                }
+
                 if (event.shiftKey) {
                   event.preventDefault()
                   event.stopPropagation()
@@ -223,6 +287,7 @@ export function SidebarSessionRow({
 
                 onResume()
               }}
+              onDoubleClick={selectionActive ? onResume : undefined}
               onDragEnd={event => {
                 // The row button is the concrete native drag source. Keeping
                 // this lifecycle off the sortable wrapper avoids Electron's
@@ -245,7 +310,22 @@ export function SidebarSessionRow({
                 onSessionDragStart?.(payload)
               }}
             >
-              {reorderable ? (
+              {selectionActive ? (
+                <SidebarRowLead>
+                  <span aria-checked={checked} className="grid size-3 place-items-center" role="checkbox">
+                    <span
+                      className={cn(
+                        'grid size-3 place-items-center rounded-[3px] border transition-colors',
+                        checked
+                          ? 'border-foreground/80 bg-foreground/90 text-(--ui-sidebar-surface-background,var(--background))'
+                          : 'border-(--ui-stroke-secondary) bg-transparent'
+                      )}
+                    >
+                      {checked && <Codicon name="check" size="0.5rem" />}
+                    </span>
+                  </span>
+                </SidebarRowLead>
+              ) : reorderable ? (
                 <SidebarRowGrab
                   ariaLabel={handleLabel}
                   dragging={dragging}

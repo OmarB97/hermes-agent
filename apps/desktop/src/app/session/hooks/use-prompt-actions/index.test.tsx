@@ -347,6 +347,73 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
     expect($composerDraft.get()).toBe('/ pasted context that must not vanish')
     expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
   })
+
+  it('interrupts an active turn before dispatching /compress', async () => {
+    const methods: string[] = []
+    const busyRef = { current: true }
+
+    const requestGateway = vi.fn(async (method: string) => {
+      methods.push(method)
+
+      if (method === 'command.dispatch') {
+        return { output: 'Compressed: 42 messages to 8', type: 'exec' } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        busyRef={busyRef}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+
+    await handle!.submitText('/compress')
+
+    expect(methods).toEqual(['session.interrupt', 'command.dispatch'])
+    expect(requestGateway).toHaveBeenCalledWith('session.interrupt', { session_id: RUNTIME_SESSION_ID })
+    expect(requestGateway).toHaveBeenCalledWith('command.dispatch', {
+      arg: '',
+      name: 'compress',
+      session_id: RUNTIME_SESSION_ID
+    })
+    expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
+  })
+
+  it('recovers when the gateway still reports busy at the idle edge', async () => {
+    const methods: string[] = []
+    let dispatchAttempts = 0
+
+    const requestGateway = vi.fn(async (method: string) => {
+      methods.push(method)
+
+      if (method === 'command.dispatch') {
+        dispatchAttempts += 1
+
+        if (dispatchAttempts === 1) {
+          throw new Error('4009: session busy')
+        }
+
+        return { output: 'Compressed: 42 messages to 8', type: 'exec' } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+    )
+
+    await handle!.submitText('/compress')
+
+    expect(methods).toEqual(['command.dispatch', 'session.interrupt', 'command.dispatch'])
+    expect(dispatchAttempts).toBe(2)
+  })
 })
 
 describe('usePromptActions desktop slash pickers', () => {

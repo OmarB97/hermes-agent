@@ -53,6 +53,8 @@ import type { SessionCreateResponse, SessionInfo, SessionResumeResponse, UsageSt
 
 import { NEW_CHAT_ROUTE, sessionRoute, SETTINGS_ROUTE } from '../../../routes'
 import type { ClientSessionState, SidebarNavItem } from '../../../types'
+import { archiveStoredSessions, deleteStoredSessions } from '../../session-bulk-actions'
+import { haltStoredSessions, promptStoredSessions, steerStoredSessions } from '../../session-bulk-runtime-actions'
 
 import {
   applyRuntimeInfo,
@@ -957,6 +959,92 @@ export function useSessionActions({
     [copy, selectedStoredSessionId, startFreshSessionDraft]
   )
 
+  const archiveSessionsBulk = useCallback(
+    async (sessionIds: string[]) => {
+      clearNotifications()
+
+      const result = await archiveStoredSessions(sessionIds, {
+        onAfterHide: targets => {
+          tombstoneSessions(targets.flatMap(session => sessionAliasIds(session)))
+
+          if (
+            selectedStoredSessionId &&
+            targets.some(session => sessionMatchesStoredId(session, selectedStoredSessionId))
+          ) {
+            startFreshSessionDraft(true)
+          }
+        }
+      })
+
+      if (result.failed.length) {
+        untombstoneSessions(result.failed.flatMap(session => sessionAliasIds(session)))
+      }
+
+      if (result.ok.length) {
+        broadcastSessionsChanged()
+      }
+
+      return result
+    },
+    [selectedStoredSessionId, startFreshSessionDraft]
+  )
+
+  const deleteSessionsBulk = useCallback(
+    async (sessionIds: string[]) => {
+      clearNotifications()
+
+      const result = await deleteStoredSessions(sessionIds, {
+        onAfterHide: async targets => {
+          tombstoneSessions(targets.flatMap(session => sessionAliasIds(session)))
+
+          if (
+            !selectedStoredSessionId ||
+            !targets.some(session => sessionMatchesStoredId(session, selectedStoredSessionId))
+          ) {
+            return
+          }
+
+          const closingRuntimeId = activeSessionId
+          startFreshSessionDraft(true)
+
+          if (closingRuntimeId) {
+            await requestGateway('session.close', { session_id: closingRuntimeId }).catch(() => undefined)
+            clearQueuedPrompts(closingRuntimeId)
+          }
+        }
+      })
+
+      if (result.failed.length) {
+        untombstoneSessions(result.failed.flatMap(session => sessionAliasIds(session)))
+      }
+
+      if (result.ok.length) {
+        broadcastSessionsChanged()
+      }
+
+      return result
+    },
+    [activeSessionId, requestGateway, selectedStoredSessionId, startFreshSessionDraft]
+  )
+
+  const promptSessionsBulk = useCallback((sessionIds: string[], text: string) => {
+    clearNotifications()
+
+    return promptStoredSessions(sessionIds, text)
+  }, [])
+
+  const steerSessionsBulk = useCallback((sessionIds: string[], text: string) => {
+    clearNotifications()
+
+    return steerStoredSessions(sessionIds, text)
+  }, [])
+
+  const haltSessionsBulk = useCallback((sessionIds: string[]) => {
+    clearNotifications()
+
+    return haltStoredSessions(sessionIds)
+  }, [])
+
   const archiveAllSessions = useCallback(async () => {
     clearNotifications()
 
@@ -1005,14 +1093,19 @@ export function useSessionActions({
   return {
     archiveAllSessions,
     archiveSession,
+    archiveSessionsBulk,
     branchCurrentSession,
     branchStoredSession,
     closeSettings,
     createBackendSessionForSend,
+    deleteSessionsBulk,
+    haltSessionsBulk,
     openSettings,
+    promptSessionsBulk,
     removeSession,
     resumeSession,
     selectSidebarItem,
+    steerSessionsBulk,
     startFreshSessionDraft
   }
 }

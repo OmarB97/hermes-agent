@@ -96,6 +96,7 @@ import {
   sessionPinId,
   setCurrentCwd
 } from '@/store/session'
+import { $sidebarSelection } from '@/store/sidebar-selection'
 
 import { type AppView, ARTIFACTS_ROUTE, MESSAGING_ROUTE, SKILLS_ROUTE } from '../../routes'
 import type { SidebarNavItem } from '../../types'
@@ -122,6 +123,7 @@ import {
   useRepoWorktreeMap
 } from './projects'
 import { SidebarBlankState, SidebarPinnedEmptyState, SidebarSessionSkeletons } from './section-states'
+import { SelectionActionBar } from './selection-action-bar'
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
 import { sharedSessionSectionId, useSharedSessionDnd } from './shared-session-dnd'
 import { placeSessionIdAtAnchor, previewItemsAtAnchor, useSessionDropZone } from './use-session-drop-zone'
@@ -212,6 +214,11 @@ interface ChatSidebarProps extends React.ComponentProps<typeof Sidebar> {
   onDeleteSession: (sessionId: string) => void
   onArchiveSession: (sessionId: string) => void
   onArchiveAllSessions: () => Promise<void> | void
+  onArchiveSessions?: (sessionIds: string[]) => Promise<unknown> | void
+  onDeleteSessions?: (sessionIds: string[]) => Promise<unknown> | void
+  onHaltSessions?: (sessionIds: string[]) => Promise<unknown> | void
+  onPromptSessions?: (sessionIds: string[], text: string) => Promise<unknown> | void
+  onSteerSessions?: (sessionIds: string[], text: string) => Promise<unknown> | void
   onBranchSession: (sessionId: string) => void
   onNewSessionInWorkspace: (path: null | string) => void
   onManageCronJob: (jobId: string) => void
@@ -228,6 +235,11 @@ export function ChatSidebar({
   onDeleteSession,
   onArchiveSession,
   onArchiveAllSessions,
+  onArchiveSessions,
+  onDeleteSessions,
+  onHaltSessions,
+  onPromptSessions,
+  onSteerSessions,
   onBranchSession,
   onNewSessionInWorkspace,
   onManageCronJob,
@@ -246,6 +258,7 @@ export function ChatSidebar({
   const agentsOpen = useStore($sidebarRecentsOpen)
   const cronOpen = useStore($sidebarCronOpen)
   const selectedSessionId = useStore($selectedStoredSessionId)
+  const selection = useStore($sidebarSelection)
   const sessions = useStore($sessions)
   const cronSessions = useStore($cronSessions)
   const cronJobs = useStore($cronJobs)
@@ -1165,6 +1178,28 @@ export function ChatSidebar({
 
   const showSessionSections = showSessionSkeletons || sortedSessions.length > 0 || projectModel.length > 0
 
+  const selectionSessions = useMemo(() => {
+    if (selection.section === 'pinned') {
+      return renderedPinnedSessions
+    }
+
+    if (selection.section === 'results') {
+      return searchResults
+    }
+
+    if (selection.section === 'sessions') {
+      return renderedAgentSessions
+    }
+
+    if (selection.section?.startsWith('messaging:')) {
+      const sourceId = selection.section.slice('messaging:'.length)
+
+      return messagingGroups.find(group => group.sourceId === sourceId)?.sessions ?? []
+    }
+
+    return []
+  }, [messagingGroups, renderedAgentSessions, renderedPinnedSessions, searchResults, selection.section])
+
   // Each reorderable list reports its OWN new id order; persisting is a direct,
   // typed write — no id-prefix sniffing to figure out which level moved.
   const reorderSessions = (ids: string[]) => {
@@ -1299,14 +1334,20 @@ export function ChatSidebar({
                 label={s.results}
                 labelMeta={String(searchResults.length)}
                 onArchiveSession={onArchiveSession}
+                onArchiveSessions={onArchiveSessions}
                 onBranchSession={onBranchSession}
                 onDeleteSession={onDeleteSession}
+                onDeleteSessions={onDeleteSessions}
+                onHaltSessions={onHaltSessions}
+                onPromptSessions={onPromptSessions}
                 onResumeSession={onResumeSession}
+                onSteerSessions={onSteerSessions}
                 onToggle={() => undefined}
                 onTogglePin={pinSession}
                 open
                 pinned={false}
                 rootClassName="min-h-32 flex-1 overflow-hidden p-0"
+                sectionKey="results"
                 sessions={searchResults}
                 workingSessionIdSet={workingSessionIdSet}
               />
@@ -1332,10 +1373,15 @@ export function ChatSidebar({
                   emptyState={<SidebarPinnedEmptyState />}
                   label={s.pinned}
                   onArchiveSession={onArchiveSession}
+                  onArchiveSessions={onArchiveSessions}
                   onBranchSession={onBranchSession}
                   onDeleteSession={onDeleteSession}
+                  onDeleteSessions={onDeleteSessions}
+                  onHaltSessions={onHaltSessions}
+                  onPromptSessions={onPromptSessions}
                   onReorderSessions={reorderPinned}
                   onResumeSession={onResumeSession}
+                  onSteerSessions={onSteerSessions}
                   onSessionDragEnd={flatSessionDndEnabled ? undefined : handleSessionDragEnd}
                   onSessionDragStart={flatSessionDndEnabled ? undefined : handleSessionDragStart}
                   onToggle={() => setSidebarPinsOpen(!pinsOpen)}
@@ -1343,6 +1389,7 @@ export function ChatSidebar({
                   open={pinsOpen}
                   pinned
                   rootClassName="shrink-0 p-0 pb-1"
+                  sectionKey="pinned"
                   sessionDndId={sharedSessionSectionId('pinned')}
                   sessions={renderedPinnedSessions}
                   sharedSessionDnd={flatSessionDndEnabled}
@@ -1494,13 +1541,18 @@ export function ChatSidebar({
                 }
                 liveSessions={inProject ? agentSessions : undefined}
                 onArchiveSession={onArchiveSession}
+                onArchiveSessions={onArchiveSessions}
                 onBranchSession={onBranchSession}
                 onDeleteSession={onDeleteSession}
+                onDeleteSessions={onDeleteSessions}
+                onHaltSessions={onHaltSessions}
                 onEnterProject={onEnterProject}
                 onNewSessionInWorkspace={showAllProfiles ? undefined : onNewSessionInWorkspace}
+                onPromptSessions={onPromptSessions}
                 onReorderProjects={showAllProfiles ? undefined : reorderProjects}
                 onReorderSessions={showAllProfiles ? undefined : reorderSessions}
                 onResumeSession={onResumeSession}
+                onSteerSessions={onSteerSessions}
                 onSessionDragEnd={flatSessionDndEnabled ? undefined : handleSessionDragEnd}
                 onSessionDragStart={flatSessionDndEnabled ? undefined : handleSessionDragStart}
                 onToggle={() => setSidebarRecentsOpen(!agentsOpen)}
@@ -1521,6 +1573,7 @@ export function ChatSidebar({
                   !recentsVirtualizes && 'compact:min-h-0 compact:flex-none compact:overflow-visible'
                 )}
                 sessionDndId={sharedSessionSectionId('sessions')}
+                sectionKey={!worktreeGroupingActive && !showAllProfiles ? 'sessions' : undefined}
                 sessions={renderedAgentSessions}
                 sharedSessionDnd={flatSessionDndEnabled}
                 sortable={!showAllProfiles && agentSessions.length > 0}
@@ -1569,8 +1622,13 @@ export function ChatSidebar({
                     }
                     labelMeta={countLabel(group.loadedCount, group.total)}
                     onArchiveSession={onArchiveSession}
+                    onArchiveSessions={onArchiveSessions}
                     onDeleteSession={onDeleteSession}
+                    onDeleteSessions={onDeleteSessions}
+                    onHaltSessions={onHaltSessions}
+                    onPromptSessions={onPromptSessions}
                     onResumeSession={onResumeSession}
+                    onSteerSessions={onSteerSessions}
                     onSessionDragEnd={handleSessionDragEnd}
                     onSessionDragStart={handleSessionDragStart}
                     onToggle={() => toggleSidebarMessagingOpen(group.sourceId)}
@@ -1578,6 +1636,7 @@ export function ChatSidebar({
                     open={messagingOpenIds.includes(group.sourceId)}
                     pinned={false}
                     rootClassName="shrink-0 p-0"
+                    sectionKey={`messaging:${group.sourceId}`}
                     sessions={shownSessions}
                     workingSessionIdSet={workingSessionIdSet}
                   />
@@ -1599,6 +1658,17 @@ export function ChatSidebar({
         )}
 
         {contentVisible && !showSessionSections && <SidebarBlankState onNewProject={openProjectCreate} />}
+
+        {contentVisible && selection.ids.length > 0 && (
+          <SelectionActionBar
+            onArchiveSessions={onArchiveSessions}
+            onDeleteSessions={onDeleteSessions}
+            onHaltSessions={onHaltSessions}
+            onPromptSessions={onPromptSessions}
+            onSteerSessions={onSteerSessions}
+            sessions={selectionSessions}
+          />
+        )}
 
         {contentVisible && (
           <div className="shrink-0 px-0.5 pb-1 pt-0.5">
