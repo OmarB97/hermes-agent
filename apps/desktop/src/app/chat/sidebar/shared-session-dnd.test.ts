@@ -1,6 +1,9 @@
+import { renderHook } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 
-import { moveSharedSessionDrag, type SharedSessionDrag } from './shared-session-dnd'
+import type { SessionInfo } from '@/hermes'
+
+import { moveSharedSessionDrag, type SharedSessionDrag, useSharedSessionDnd } from './shared-session-dnd'
 
 function drag(): SharedSessionDrag {
   return {
@@ -12,6 +15,24 @@ function drag(): SharedSessionDrag {
 }
 
 describe('shared session drag working lists', () => {
+  it('updates the working preview on every drag move, not only when the anchor row changes', () => {
+    const pinned = [{ id: 'p1' }, { id: 'p2' }] as SessionInfo[]
+    const sessions = [{ id: 's1' }, { id: 's2' }, { id: 's3' }] as SessionInfo[]
+    const sessionByAnyId = new Map([...pinned, ...sessions].map(session => [session.id, session]))
+
+    const { result } = renderHook(() =>
+      useSharedSessionDnd({
+        enabled: true,
+        pinnedSessionIds: pinned.map(session => session.id),
+        pinnedSessions: pinned,
+        sessionByAnyId,
+        sessions
+      })
+    )
+
+    expect(result.current.onDragMove).toBe(result.current.onDragOver)
+  })
+
   it('reorders organically within Sessions without an insertion-line model', () => {
     const next = moveSharedSessionDrag(drag(), 'sessions', 's3', true)
 
@@ -28,6 +49,16 @@ describe('shared session drag working lists', () => {
     }
 
     expect(moveSharedSessionDrag(current, 'pinned', 'p1', false).pinned).toEqual(['p2', 'p1'])
+  })
+
+  it('keeps a cross-lane first-slot preview stable after the anchor index shifts', () => {
+    const enteredAfterFirst = moveSharedSessionDrag(drag(), 'pinned', 'p1', true)
+    const movedBeforeFirst = moveSharedSessionDrag(enteredAfterFirst, 'pinned', 'p1', false)
+    const repeatedBeforeFirst = moveSharedSessionDrag(movedBeforeFirst, 'pinned', 'p1', false)
+
+    expect(enteredAfterFirst.pinned).toEqual(['p1', 's2', 'p2'])
+    expect(movedBeforeFirst.pinned).toEqual(['s2', 'p1', 'p2'])
+    expect(repeatedBeforeFirst).toBe(movedBeforeFirst)
   })
 
   it('keeps one continuous drag coherent across Sessions and Pinned and back', () => {

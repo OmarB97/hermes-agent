@@ -1,13 +1,13 @@
 import {
   closestCenter,
   type CollisionDetection,
+  type DragMoveEvent,
   type DragOverEvent,
   type DragStartEvent,
   getFirstCollision,
   pointerWithin,
   rectIntersection
 } from '@dnd-kit/core'
-import { arrayMove } from '@dnd-kit/sortable'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import type { SessionInfo } from '@/hermes'
@@ -58,17 +58,21 @@ export function moveSharedSessionDrag(
   const target = targetLane === 'pinned' ? current.pinned : current.sessions
   const other = (targetLane === 'pinned' ? current.sessions : current.pinned).filter(id => id !== current.activeId)
   const activeIndex = target.indexOf(current.activeId)
-  const overIndex = target.indexOf(overId)
+  const targetWithoutActive = target.filter(id => id !== current.activeId)
+  const overIndex = targetWithoutActive.indexOf(overId)
   let nextTarget: string[]
 
   if (overIndex >= 0 && overId !== current.activeId) {
-    if (activeIndex >= 0) {
-      nextTarget = arrayMove(target, activeIndex, overIndex)
-    } else {
-      const insertAt = overIndex + (after ? 1 : 0)
+    // Always express the working order as an insertion relative to the row
+    // under the pointer. Once a cross-lane preview has inserted the active row,
+    // arrayMove's raw target index becomes unstable: excluding the active row
+    // from collision detection makes the anchor's index change after every
+    // preview shuffle, which can toggle a "before the first row" drop back to
+    // one slot below it. Removing the active id first keeps before/after
+    // semantics invariant across repeated hover frames and approach direction.
+    const insertAt = overIndex + (after ? 1 : 0)
 
-      nextTarget = [...target.slice(0, insertAt), current.activeId, ...target.slice(insertAt)]
-    }
+    nextTarget = [...targetWithoutActive.slice(0, insertAt), current.activeId, ...targetWithoutActive.slice(insertAt)]
   } else if (activeIndex >= 0) {
     nextTarget = target
   } else {
@@ -191,6 +195,7 @@ export function useSharedSessionDnd({
       const intersections = (pointerHits.length ? pointerHits : rectIntersection(args)).filter(
         hit => String(hit.id) !== activeId
       )
+
       let overId = getFirstCollision(intersections, 'id')
 
       if (overId == null) {
@@ -202,6 +207,7 @@ export function useSharedSessionDnd({
       if (lane) {
         const ids = lane === 'pinned' ? (drag?.pinned ?? basePinnedIds) : (drag?.sessions ?? baseSessionIds)
         const idSet = new Set(ids)
+
         const rows = args.droppableContainers.filter(
           container => String(container.id) !== activeId && idSet.has(String(container.id))
         )
@@ -239,8 +245,8 @@ export function useSharedSessionDnd({
     [basePinnedIds, baseSessionIds, commitDrag, containerForId, enabled]
   )
 
-  const onDragOver = useCallback(
-    (event: DragOverEvent) => {
+  const updateDragPreview = useCallback(
+    (event: DragMoveEvent | DragOverEvent) => {
       const current = dragRef.current
 
       if (!current || !event.over) {
@@ -346,7 +352,8 @@ export function useSharedSessionDnd({
     effectiveSessions,
     onDragCancel,
     onDragEnd,
-    onDragOver,
+    onDragMove: updateDragPreview,
+    onDragOver: updateDragPreview,
     onDragStart
   }
 }

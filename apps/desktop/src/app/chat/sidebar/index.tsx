@@ -1316,6 +1316,7 @@ export function ChatSidebar({
                 collisionDetection={sharedSessionDnd.collisionDetection}
                 onDragCancel={sharedSessionDnd.onDragCancel}
                 onDragEnd={sharedSessionDnd.onDragEnd}
+                onDragMove={sharedSessionDnd.onDragMove}
                 onDragOver={sharedSessionDnd.onDragOver}
                 onDragStart={sharedSessionDnd.onDragStart}
                 sensors={dndSensors}
