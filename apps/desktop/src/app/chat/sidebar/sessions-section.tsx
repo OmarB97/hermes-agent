@@ -221,6 +221,7 @@ export function SidebarSessionsSection({
   // Pinned and flat Sessions already arrive in their authoritative persisted
   // order. Branch flattening may nest children, but it must not silently sort
   // the top-level rows by last_active and undo a successful manual drop.
+
   const displayEntries = useMemo(
     () => flattenSessionsWithBranches(sessions, { preserveRootOrder: sessionsDraggable }),
     [sessions, sessionsDraggable]
@@ -397,6 +398,7 @@ export function SidebarSessionsSection({
         (dropActive || sharedDropActive) &&
           'rounded-lg bg-(--ui-control-hover-background) ring-1 ring-inset ring-(--ui-stroke-tertiary)'
       )}
+      data-session-dnd-lane={sharedSessionDnd ? (pinned ? 'pinned' : 'sessions') : undefined}
       ref={sharedSessionDnd ? setSharedDropRef : undefined}
       {...dropHandlers}
     >

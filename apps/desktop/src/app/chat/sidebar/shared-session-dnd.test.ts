@@ -3,7 +3,12 @@ import { describe, expect, it } from 'vitest'
 
 import type { SessionInfo } from '@/hermes'
 
-import { moveSharedSessionDrag, type SharedSessionDrag, useSharedSessionDnd } from './shared-session-dnd'
+import {
+  moveSharedSessionDrag,
+  type SharedSessionDrag,
+  sharedSessionReleaseAnchor,
+  useSharedSessionDnd
+} from './shared-session-dnd'
 
 function drag(): SharedSessionDrag {
   return {
@@ -15,6 +20,18 @@ function drag(): SharedSessionDrag {
 }
 
 describe('shared session drag working lists', () => {
+  it('uses the physical release position even before the last preview frame renders', () => {
+    const rows = [
+      { height: 26, id: 'p1', top: 100 },
+      { height: 26, id: 'p2', top: 127 },
+      { height: 26, id: 's2', top: 154 }
+    ]
+
+    expect(sharedSessionReleaseAnchor(rows, 's2', 99)).toEqual({ after: false, overId: 'p1' })
+    expect(sharedSessionReleaseAnchor(rows, 's2', 106)).toEqual({ after: false, overId: 'p1' })
+    expect(sharedSessionReleaseAnchor(rows, 's2', 120)).toEqual({ after: true, overId: 'p1' })
+  })
+
   it('updates the working preview on every drag move, not only when the anchor row changes', () => {
     const pinned = [{ id: 'p1' }, { id: 'p2' }] as SessionInfo[]
     const sessions = [{ id: 's1' }, { id: 's2' }, { id: 's3' }] as SessionInfo[]

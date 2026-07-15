@@ -49,6 +49,92 @@ export interface SharedSessionDrag {
   sessions: string[]
 }
 
+interface SharedSessionReleasePlacement {
+  after: boolean
+  overId: string
+  targetLane: SharedSessionDndLane
+}
+
+interface SharedSessionReleaseRow {
+  height: number
+  id: string
+  top: number
+}
+
+/** Resolve the final physical pointer position against stable row anchors.
+ * This is deliberately independent of dnd-kit's last `over` event: a quick
+ * release can arrive before React has rendered the final preview frame. */
+export function sharedSessionReleaseAnchor(
+  rows: readonly SharedSessionReleaseRow[],
+  activeId: string,
+  pointerY: number
+): null | Pick<SharedSessionReleasePlacement, 'after' | 'overId'> {
+  const candidates = rows.filter(row => row.id !== activeId).sort((a, b) => a.top - b.top)
+
+  if (!candidates.length) {
+    return null
+  }
+
+  const containing = candidates.find(row => pointerY >= row.top && pointerY <= row.top + row.height)
+
+  const anchor =
+    containing ??
+    candidates.reduce((closest, row) => {
+      const closestDistance = Math.abs(pointerY - (closest.top + closest.height / 2))
+      const rowDistance = Math.abs(pointerY - (row.top + row.height / 2))
+
+      return rowDistance < closestDistance ? row : closest
+    })
+
+  return { after: pointerY > anchor.top + anchor.height / 2, overId: anchor.id }
+}
+
+function releasePoint(event: Event): null | { x: number; y: number } {
+  if (event instanceof MouseEvent || event instanceof PointerEvent) {
+    return { x: event.clientX, y: event.clientY }
+  }
+
+  if (event instanceof TouchEvent) {
+    const touch = event.changedTouches[0] ?? event.touches[0]
+
+    return touch ? { x: touch.clientX, y: touch.clientY } : null
+  }
+
+  return null
+}
+
+function releasePlacementAtPoint(
+  activeId: string,
+  x: number,
+  y: number
+): null | SharedSessionReleasePlacement {
+  const sections = [...document.querySelectorAll<HTMLElement>('[data-session-dnd-lane]')]
+
+  const section = sections.find(element => {
+    const rect = element.getBoundingClientRect()
+
+    return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
+  })
+
+  const targetLane = section?.dataset.sessionDndLane as SharedSessionDndLane | undefined
+
+  if (!section || (targetLane !== 'pinned' && targetLane !== 'sessions')) {
+    return null
+  }
+
+  const rows = [...section.querySelectorAll<HTMLElement>('[data-session-id]')].map(element => {
+    const rect = element.getBoundingClientRect()
+
+    return { height: rect.height, id: element.dataset.sessionId ?? '', top: rect.top }
+  })
+
+  const anchor = sharedSessionReleaseAnchor(rows, activeId, y)
+
+  return anchor
+    ? { ...anchor, targetLane }
+    : { after: false, overId: sharedSessionSectionId(targetLane), targetLane }
+}
+
 export function moveSharedSessionDrag(
   current: SharedSessionDrag,
   targetLane: SharedSessionDndLane,
@@ -113,21 +199,46 @@ export function useSharedSessionDnd({
   const dragRef = useRef<null | SharedSessionDrag>(null)
   const pointerYRef = useRef<null | number>(null)
   const releasedRef = useRef(false)
+  const releasePlacementRef = useRef<null | SharedSessionReleasePlacement>(null)
 
   useEffect(() => {
-    const markReleased = () => {
-      releasedRef.current = true
+    const trackPointer = (event: Event) => {
+      const point = releasePoint(event)
+
+      if (point) {
+        pointerYRef.current = point.y
+      }
     }
 
-    // Electron can cancel a dnd-kit drag after the physical release when the
-    // animated preview has moved the last collision target away. Remember the
-    // release in capture phase so that cancellation can still commit the exact
-    // list the user was visibly holding.
+    const markReleased = (event: Event) => {
+      const point = releasePoint(event)
+
+      releasedRef.current = true
+
+      if (point) {
+        pointerYRef.current = point.y
+
+        const activeId = dragRef.current?.activeId
+
+        releasePlacementRef.current = activeId ? releasePlacementAtPoint(activeId, point.x, point.y) : null
+      }
+    }
+
+    // Native capture listeners see the physical pointer before dnd-kit's
+    // scheduled drag callbacks. That closes the one-frame gap where a quick
+    // release otherwise commits the previous preview slot (or no cross-lane
+    // move at all).
+    window.addEventListener('pointermove', trackPointer, true)
+    window.addEventListener('mousemove', trackPointer, true)
+    window.addEventListener('touchmove', trackPointer, true)
     window.addEventListener('pointerup', markReleased, true)
     window.addEventListener('mouseup', markReleased, true)
     window.addEventListener('touchend', markReleased, true)
 
     return () => {
+      window.removeEventListener('pointermove', trackPointer, true)
+      window.removeEventListener('mousemove', trackPointer, true)
+      window.removeEventListener('touchmove', trackPointer, true)
       window.removeEventListener('pointerup', markReleased, true)
       window.removeEventListener('mouseup', markReleased, true)
       window.removeEventListener('touchend', markReleased, true)
@@ -240,6 +351,7 @@ export function useSharedSessionDnd({
       }
 
       releasedRef.current = false
+      releasePlacementRef.current = null
       commitDrag({ activeId, from, pinned: [...basePinnedIds], sessions: [...baseSessionIds] })
     },
     [basePinnedIds, baseSessionIds, commitDrag, containerForId, enabled]
@@ -275,7 +387,19 @@ export function useSharedSessionDnd({
   )
 
   const commitSettledDrag = useCallback(() => {
-    const settled = dragRef.current
+    let settled = dragRef.current
+    const releasePlacement = releasePlacementRef.current
+
+    releasePlacementRef.current = null
+
+    if (settled && releasePlacement) {
+      settled = moveSharedSessionDrag(
+        settled,
+        releasePlacement.targetLane,
+        releasePlacement.overId,
+        releasePlacement.after
+      )
+    }
 
     commitDrag(null)
 
@@ -340,6 +464,7 @@ export function useSharedSessionDnd({
       return
     }
 
+    releasePlacementRef.current = null
     commitDrag(null)
   }, [commitDrag, commitSettledDrag])
 
