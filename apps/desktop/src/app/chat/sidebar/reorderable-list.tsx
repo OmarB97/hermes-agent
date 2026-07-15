@@ -61,7 +61,38 @@ export function ReorderableList({
   )
 }
 
-export function useSortableBindings(id: string) {
+interface SortableRowStyleOptions {
+  isDragging: boolean
+  previewOwnsLayout?: boolean
+  transform: null | { y: number }
+  transition?: string
+}
+
+/** Shared session drag reorders the DOM immediately and lets Motion spring the
+ * displaced row chrome from its presentation position. dnd-kit's sibling
+ * transforms must stay off in that mode: applying both systems moves the same
+ * row twice, makes the preview trail the pointer, and turns collision rects
+ * into moving targets. The lifted row alone keeps dnd-kit's 1:1 pointer
+ * transform. Standalone reorder lists retain their normal sortable transforms. */
+export function sortableRowStyle({
+  isDragging,
+  previewOwnsLayout = false,
+  transform,
+  transition
+}: SortableRowStyleOptions): React.CSSProperties {
+  const useSortableTransform = isDragging || !previewOwnsLayout
+
+  return {
+    // Uniform vertical list: only ever translate on Y. Ignoring x and the
+    // scaleX/scaleY that CSS.Transform.toString would emit keeps a dragged
+    // group/row from drifting sideways or morphing its size mid-drag.
+    transform: useSortableTransform && transform ? `translate3d(0px, ${transform.y}px, 0)` : undefined,
+    transition: isDragging || previewOwnsLayout ? undefined : transition,
+    willChange: isDragging ? 'transform' : undefined
+  }
+}
+
+export function useSortableBindings(id: string, options: { previewOwnsLayout?: boolean } = {}) {
   const { attributes, isDragging, listeners, setNodeRef, transform, transition } = useSortable({ id })
 
   return {
@@ -69,13 +100,11 @@ export function useSortableBindings(id: string) {
     dragHandleProps: { ...attributes, ...listeners },
     ref: setNodeRef,
     reorderable: true as const,
-    style: {
-      // Uniform vertical list: only ever translate on Y. Ignoring x and the
-      // scaleX/scaleY that CSS.Transform.toString would emit keeps a dragged
-      // group/row from drifting sideways or morphing its size mid-drag.
-      transform: transform ? `translate3d(0px, ${transform.y}px, 0)` : undefined,
-      transition: isDragging ? undefined : transition,
-      willChange: isDragging ? 'transform' : undefined
-    }
+    style: sortableRowStyle({
+      isDragging,
+      previewOwnsLayout: options.previewOwnsLayout,
+      transform,
+      transition
+    })
   }
 }

@@ -185,8 +185,11 @@ export function SidebarSessionRow({
       >
         <motion.div
           data-session-row-chrome
-          layout="position"
-          transition={{ layout: { duration: 0.16, ease: [0.2, 0, 0, 1] } }}
+          // The lifted row stays glued to the pointer through dnd-kit's direct
+          // transform. Only displaced siblings spring between slots; animating
+          // the active chrome too adds a second, lagging offset under the cursor.
+          layout={dragging ? false : 'position'}
+          transition={{ layout: { bounce: 0, duration: 0.2, type: 'spring' } }}
           {...rowDragActivationProps}
         >
           <SidebarRowShell

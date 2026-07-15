@@ -316,7 +316,8 @@ export function useSharedSessionDnd({
       const lane = parseSectionId(String(overId))
 
       if (lane) {
-        const ids = lane === 'pinned' ? (drag?.pinned ?? basePinnedIds) : (drag?.sessions ?? baseSessionIds)
+        const current = dragRef.current
+        const ids = lane === 'pinned' ? (current?.pinned ?? basePinnedIds) : (current?.sessions ?? baseSessionIds)
         const idSet = new Set(ids)
 
         const rows = args.droppableContainers.filter(
@@ -334,7 +335,7 @@ export function useSharedSessionDnd({
 
       return [{ id: overId }]
     },
-    [basePinnedIds, baseSessionIds, drag]
+    [basePinnedIds, baseSessionIds]
   )
 
   const onDragStart = useCallback(

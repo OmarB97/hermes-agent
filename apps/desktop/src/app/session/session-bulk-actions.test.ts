@@ -98,6 +98,18 @@ describe('archiveStoredSessions', () => {
     expect($messagingPlatformTotals.get()).toEqual({ telegram: 4 })
   })
 
+  it('resolves a selected compression alias to the live stored row', async () => {
+    $sessions.set([
+      session({ id: 'tip', _lineage_ids: ['root', 'mid', 'tip'], _lineage_root_id: 'root' })
+    ])
+
+    const result = await archiveStoredSessions(['root'], { silent: true })
+
+    expect(result.ok.map(s => s.id)).toEqual(['tip'])
+    expect($sessions.get()).toEqual([])
+    expect(mockedSetArchived).toHaveBeenCalledWith('tip', true, 'default')
+  })
+
   it('rolls back only the failed rows and reports both outcomes', async () => {
     mockedSetArchived.mockImplementation(id =>
       id === 'a1' ? Promise.reject(new Error('boom')) : Promise.resolve({ ok: true })
@@ -115,15 +127,14 @@ describe('archiveStoredSessions', () => {
     expect($archivedSessions.get().some(s => s.id === 'a2')).toBe(true)
   })
 
-  it('strips pins (live + lineage-root ids) and restores them on failure', async () => {
-    $sessions.set([session({ id: 'tip', _lineage_root_id: 'root' })])
-    $pinnedSessionIds.set(['root', 'other'])
+  it('strips every lineage alias pin and restores them on failure', async () => {
+    $sessions.set([session({ id: 'tip', _lineage_ids: ['root', 'mid', 'tip'], _lineage_root_id: 'root' })])
+    $pinnedSessionIds.set(['root', 'mid', 'tip', 'other'])
     mockedSetArchived.mockRejectedValue(new Error('offline'))
 
     await archiveStoredSessions(['tip'], { silent: true })
 
-    expect($pinnedSessionIds.get()).toContain('root')
-    expect($pinnedSessionIds.get()).toContain('other')
+    expect(new Set($pinnedSessionIds.get())).toEqual(new Set(['root', 'mid', 'tip', 'other']))
 
     mockedSetArchived.mockResolvedValue({ ok: true })
     await archiveStoredSessions(['tip'], { silent: true })

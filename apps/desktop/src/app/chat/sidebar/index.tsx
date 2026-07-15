@@ -344,8 +344,8 @@ export function ChatSidebar({
     // PointerSensor activation is unreliable in the packaged Electron app.
     // Mouse + touch sensors preserve the same distance gate while reliably
     // starting a reorder outside the dev-server/browser environment.
-    useSensor(MouseSensor, { activationConstraint: { distance: 6 } }),
-    useSensor(TouchSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(MouseSensor, { activationConstraint: { distance: 4 } }),
+    useSensor(TouchSensor, { activationConstraint: { distance: 4 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
   )
 
@@ -1381,9 +1381,9 @@ export function ChatSidebar({
                   onPromptSessions={onPromptSessions}
                   onReorderSessions={reorderPinned}
                   onResumeSession={onResumeSession}
-                  onSteerSessions={onSteerSessions}
                   onSessionDragEnd={flatSessionDndEnabled ? undefined : handleSessionDragEnd}
                   onSessionDragStart={flatSessionDndEnabled ? undefined : handleSessionDragStart}
+                  onSteerSessions={onSteerSessions}
                   onToggle={() => setSidebarPinsOpen(!pinsOpen)}
                   onTogglePin={unpinSession}
                   open={pinsOpen}
@@ -1545,16 +1545,16 @@ export function ChatSidebar({
                 onBranchSession={onBranchSession}
                 onDeleteSession={onDeleteSession}
                 onDeleteSessions={onDeleteSessions}
-                onHaltSessions={onHaltSessions}
                 onEnterProject={onEnterProject}
+                onHaltSessions={onHaltSessions}
                 onNewSessionInWorkspace={showAllProfiles ? undefined : onNewSessionInWorkspace}
                 onPromptSessions={onPromptSessions}
                 onReorderProjects={showAllProfiles ? undefined : reorderProjects}
                 onReorderSessions={showAllProfiles ? undefined : reorderSessions}
                 onResumeSession={onResumeSession}
-                onSteerSessions={onSteerSessions}
                 onSessionDragEnd={flatSessionDndEnabled ? undefined : handleSessionDragEnd}
                 onSessionDragStart={flatSessionDndEnabled ? undefined : handleSessionDragStart}
+                onSteerSessions={onSteerSessions}
                 onToggle={() => setSidebarRecentsOpen(!agentsOpen)}
                 onTogglePin={pinSession}
                 open={agentsOpen}
@@ -1572,8 +1572,8 @@ export function ChatSidebar({
                   'min-h-32 flex-1 overflow-hidden p-0',
                   !recentsVirtualizes && 'compact:min-h-0 compact:flex-none compact:overflow-visible'
                 )}
-                sessionDndId={sharedSessionSectionId('sessions')}
                 sectionKey={!worktreeGroupingActive && !showAllProfiles ? 'sessions' : undefined}
+                sessionDndId={sharedSessionSectionId('sessions')}
                 sessions={renderedAgentSessions}
                 sharedSessionDnd={flatSessionDndEnabled}
                 sortable={!showAllProfiles && agentSessions.length > 0}
@@ -1628,9 +1628,9 @@ export function ChatSidebar({
                     onHaltSessions={onHaltSessions}
                     onPromptSessions={onPromptSessions}
                     onResumeSession={onResumeSession}
-                    onSteerSessions={onSteerSessions}
                     onSessionDragEnd={handleSessionDragEnd}
                     onSessionDragStart={handleSessionDragStart}
+                    onSteerSessions={onSteerSessions}
                     onToggle={() => toggleSidebarMessagingOpen(group.sourceId)}
                     onTogglePin={pinSession}
                     open={messagingOpenIds.includes(group.sourceId)}

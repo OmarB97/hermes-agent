@@ -61,6 +61,39 @@ def _cwd_prefix_clause(cwd_prefix: str) -> Tuple[str, List[str]]:
     return "(s.cwd = ? OR s.cwd LIKE ? OR s.cwd LIKE ?)", [prefix, f"{prefix}/%", f"{prefix}\\%"]
 
 
+def _preferred_compression_child_sql(parent_alias: str) -> str:
+    """SQL subquery selecting the one continuation Hermes projects forward."""
+    return f"""
+        SELECT candidate.id
+        FROM sessions candidate
+        WHERE candidate.parent_session_id = {parent_alias}.id
+          AND json_extract(
+                COALESCE(candidate.model_config, '{{}}'),
+                '$._branched_from'
+              ) IS NULL
+          AND json_extract(
+                COALESCE(candidate.model_config, '{{}}'),
+                '$._delegate_from'
+              ) IS NULL
+          AND COALESCE(candidate.source, '') != 'tool'
+        ORDER BY
+          CASE
+            WHEN candidate.end_reason = 'compression' THEN 0
+            WHEN candidate.ended_at IS NULL THEN 1
+            ELSE 2
+          END,
+          COALESCE(
+            (SELECT MAX(m.timestamp)
+             FROM messages m
+             WHERE m.session_id = candidate.id),
+            candidate.started_at
+          ) DESC,
+          candidate.started_at DESC,
+          candidate.id DESC
+        LIMIT 1
+    """
+
+
 # A child session counts as a /branch (kept visible, never cascade-deleted) if
 # it carries the stable marker OR the legacy end_reason heuristic holds.
 _BRANCH_CHILD_SQL = (
@@ -3148,45 +3181,139 @@ class SessionDB:
         displayed tip lets the still-unarchived root resurrect it on refresh.
         Returns True when at least one row was updated.
         """
-        def _do(conn):
-            cursor = conn.execute(
-                """
+        normalized = str(session_id or "").strip()
+        if not normalized:
+            return False
+
+        transitioned = self._execute_write(
+            lambda conn: self._set_session_ids_archived_in_conn(
+                conn, [normalized], archived
+            )
+        )
+        return transitioned > 0
+
+    @staticmethod
+    def _compression_lineages_for_session_ids(
+        conn: sqlite3.Connection,
+        session_ids: List[str],
+    ) -> Dict[str, List[str]]:
+        """Resolve requested aliases into guarded compression lineages.
+
+        A parent link alone is not enough: branch, delegate, tool, and stale
+        websocket children also have ``parent_session_id``. Traversal uses the
+        same preferred-child rules as projection/resume. Inputs are chunked
+        below SQLite's bind limit while the caller keeps the surrounding write
+        transaction atomic.
+        """
+        lineages: Dict[str, set] = {}
+        unique_ids = list(dict.fromkeys(session_ids))
+        for start in range(0, len(unique_ids), 400):
+            chunk = unique_ids[start : start + 400]
+            values = ",".join("(?)" for _ in chunk)
+            rows = conn.execute(
+                f"""
                 WITH RECURSIVE
-                  ancestors(id) AS (
-                    SELECT ?
-                    UNION
-                    SELECT parent.id
+                  requested(seed) AS (VALUES {values}),
+                  ancestors(seed, id, parent_session_id, depth, path) AS (
+                    SELECT r.seed, s.id, s.parent_session_id, 0,
+                           ',' || s.id || ','
+                    FROM requested r
+                    JOIN sessions s ON s.id = r.seed
+                    UNION ALL
+                    SELECT a.seed, parent.id, parent.parent_session_id,
+                           a.depth + 1, a.path || parent.id || ','
                     FROM ancestors a
                     JOIN sessions child ON child.id = a.id
                     JOIN sessions parent ON parent.id = child.parent_session_id
                     WHERE parent.end_reason = 'compression'
+                      AND child.id = (
+                        {_preferred_compression_child_sql('parent')}
+                      )
+                      AND instr(a.path, ',' || parent.id || ',') = 0
                   ),
-                  descendants(id) AS (
-                    SELECT ?
-                    UNION
-                    SELECT child.id
+                  roots(seed, root_id) AS (
+                    SELECT a.seed, a.id
+                    FROM ancestors a
+                    WHERE NOT EXISTS (
+                      SELECT 1
+                      FROM ancestors higher
+                      WHERE higher.seed = a.seed AND higher.depth > a.depth
+                    )
+                  ),
+                  descendants(seed, root_id, id, depth, path) AS (
+                    SELECT r.seed, r.root_id, r.root_id, 0,
+                           ',' || r.root_id || ','
+                    FROM roots r
+                    UNION ALL
+                    SELECT d.seed, d.root_id, child.id, d.depth + 1,
+                           d.path || child.id || ','
                     FROM descendants d
                     JOIN sessions parent ON parent.id = d.id
-                    JOIN sessions child ON child.parent_session_id = parent.id
+                    JOIN sessions child ON child.id = (
+                      {_preferred_compression_child_sql('parent')}
+                    )
                     WHERE parent.end_reason = 'compression'
-                  ),
-                  lineage(id) AS (
-                    SELECT id FROM ancestors
-                    UNION
-                    SELECT id FROM descendants
+                      AND instr(d.path, ',' || child.id || ',') = 0
                   )
-                UPDATE sessions
-                SET archived = ?
-                WHERE id IN (SELECT id FROM lineage)
+                SELECT root_id, id, depth
+                FROM descendants
+                ORDER BY root_id, depth, id
                 """,
-                (session_id, session_id, 1 if archived else 0),
+                chunk,
+            ).fetchall()
+            for row in rows:
+                lineages.setdefault(row["root_id"], set()).add(row["id"])
+
+        return {
+            root_id: sorted(ids)
+            for root_id, ids in lineages.items()
+        }
+
+    @classmethod
+    def _set_session_ids_archived_in_conn(
+        cls,
+        conn: sqlite3.Connection,
+        session_ids: List[str],
+        archived: bool,
+    ) -> int:
+        """Set logical conversations inside the caller's transaction.
+
+        Returns the number of distinct logical conversations whose persisted
+        state actually changed. Unknown IDs and already-matching conversations
+        do not inflate the result.
+        """
+        lineages = cls._compression_lineages_for_session_ids(conn, session_ids)
+        if not lineages:
+            return 0
+
+        target = 1 if archived else 0
+        all_ids = sorted({sid for ids in lineages.values() for sid in ids})
+        changed_ids = set()
+        for start in range(0, len(all_ids), 500):
+            chunk = all_ids[start : start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                f"SELECT id FROM sessions "
+                f"WHERE id IN ({placeholders}) AND archived != ?",
+                [*chunk, target],
+            ).fetchall()
+            changed_ids.update(row["id"] for row in rows)
+
+        if not changed_ids:
+            return 0
+
+        for start in range(0, len(all_ids), 500):
+            chunk = all_ids[start : start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            conn.execute(
+                f"UPDATE sessions SET archived = ? "
+                f"WHERE id IN ({placeholders}) AND archived != ?",
+                [target, *chunk, target],
             )
-            rowcount = cursor.rowcount
-            if rowcount is None or rowcount < 0:
-                rowcount = conn.execute("SELECT changes()").fetchone()[0]
-            return rowcount
-        rowcount = self._execute_write(_do)
-        return rowcount > 0
+
+        return sum(
+            1 for ids in lineages.values() if changed_ids.intersection(ids)
+        )
 
     def archive_surfaced_sessions(
         self,
@@ -3199,8 +3326,9 @@ class SessionDB:
 
         This backs an explicit desktop "archive all" action. The caller passes
         client-owned preserved IDs such as pins, the selected chat, and running
-        sessions. Compression continuations are archived by lineage root so one
-        logical conversation moves together.
+        sessions. Compression continuations are archived through their surfaced
+        alias so one logical conversation moves together without accidentally
+        selecting a visible branch sibling from the root.
         """
         preserved = {
             str(sid).strip()
@@ -3225,12 +3353,17 @@ class SessionDB:
             sid = str(session.get("id") or "").strip()
             if not sid:
                 continue
-            root_id = str(session.get("_lineage_root_id") or sid).strip()
-            target_id = root_id or sid
-            if target_id in seen_targets:
+            root_id = str(session.get("_lineage_root_id") or sid).strip() or sid
+            lineage_ids = {
+                str(lineage_id).strip()
+                for lineage_id in (session.get("_lineage_ids") or [root_id, sid])
+                if str(lineage_id).strip()
+            }
+            lineage_ids.update((root_id, sid))
+            if root_id in seen_targets:
                 continue
-            seen_targets.add(target_id)
-            if sid in preserved or target_id in preserved:
+            seen_targets.add(root_id)
+            if preserved.intersection(lineage_ids):
                 continue
 
             started_at = float(session.get("started_at") or 0)
@@ -3244,9 +3377,9 @@ class SessionDB:
             if recently_active:
                 continue
 
-            archive_ids.append(target_id)
+            archive_ids.append(sid)
 
-        return self.archive_sessions(archive_ids)
+        return self.archive_session_ids(archive_ids)
 
     def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
         """Look up a session by exact title. Returns session dict or None."""
@@ -3471,9 +3604,10 @@ class SessionDB:
                 SELECT c.root_id, child.id, c.depth + 1, c.path || child.id || ','
                 FROM chain c
                 JOIN sessions parent ON parent.id = c.cur_id
-                JOIN sessions child ON child.parent_session_id = c.cur_id
+                JOIN sessions child ON child.id = (
+                  {_preferred_compression_child_sql('parent')}
+                )
                 WHERE parent.end_reason = 'compression'
-                  AND child.started_at >= parent.ended_at
                   AND instr(c.path, ',' || child.id || ',') = 0
             )
             SELECT root_id, cur_id, depth
@@ -3829,28 +3963,31 @@ class SessionDB:
 
         return sessions
 
-    def archive_sessions(self, session_ids: List[str]) -> int:
-        """Soft-archive the listed sessions. Unknown IDs are skipped.
+    def archive_session_ids(self, session_ids: List[str]) -> int:
+        """Soft-archive the listed logical conversations.
 
-        Returns the number of rows that were actually archived.
+        Compression ancestors and continuations move together in one database
+        transaction. Unknown, empty, duplicate, and already-archived aliases
+        are skipped. Returns the number of distinct logical conversations that
+        transitioned to archived.
         """
         if not session_ids:
             return 0
 
-        def _do(conn):
-            updated = 0
-            for start in range(0, len(session_ids), 500):
-                chunk = session_ids[start:start + 500]
-                placeholders = ",".join("?" * len(chunk))
-                cursor = conn.execute(
-                    f"UPDATE sessions SET archived = 1 "
-                    f"WHERE archived = 0 AND id IN ({placeholders})",
-                    chunk,
-                )
-                updated += cursor.rowcount
-            return updated
-
-        return self._execute_write(_do)
+        normalized = list(
+            dict.fromkeys(
+                value
+                for session_id in session_ids
+                if (value := str(session_id or "").strip())
+            )
+        )
+        if not normalized:
+            return 0
+        return self._execute_write(
+            lambda conn: self._set_session_ids_archived_in_conn(
+                conn, normalized, True
+            )
+        )
 
     def archive_descendants(self) -> int:
         """Archive sessions whose entire ancestor chain is already archived.

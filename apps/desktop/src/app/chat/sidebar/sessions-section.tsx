@@ -313,7 +313,7 @@ export function SidebarSessionsSection({
     }
 
     return draggable && !branchStem ? (
-      <SortableSidebarSessionRow key={session.id} {...rowProps} />
+      <SortableSidebarSessionRow key={session.id} previewOwnsLayout={Boolean(sharedSessionDnd)} {...rowProps} />
     ) : (
       <SidebarSessionRow key={session.id} {...rowProps} />
     )
@@ -512,10 +512,11 @@ interface SortableSessionRowProps {
   onResume: () => void
   onSessionDragEnd?: () => void
   onSessionDragStart?: (payload: SessionDragPayload) => void
+  previewOwnsLayout?: boolean
 }
 
-function SortableSidebarSessionRow(props: SortableSessionRowProps) {
-  return <SidebarSessionRow {...props} {...useSortableBindings(props.session.id)} />
+function SortableSidebarSessionRow({ previewOwnsLayout, ...props }: SortableSessionRowProps) {
+  return <SidebarSessionRow {...props} {...useSortableBindings(props.session.id, { previewOwnsLayout })} />
 }
 
 function SortableProjectOverviewRow(props: React.ComponentProps<typeof ProjectOverviewRow>) {

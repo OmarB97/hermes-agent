@@ -12,7 +12,7 @@ import {
   $sessions,
   adjustMessagingPlatformTotal,
   adjustSessionProfileTotal,
-  sessionPinId,
+  sessionAliasIds,
   setArchivedSessions,
   setArchivedSessionsTotal,
   setCronSessions,
@@ -47,25 +47,26 @@ interface LocatedSessionRow {
 const MESSAGING_SOURCES = new Set<string>(MESSAGING_SESSION_SOURCE_IDS)
 
 function locateStoredSession(sessionId: string): LocatedSessionRow | null {
-  const agent = $sessions.get().find(s => s.id === sessionId)
+  const matches = (session: SessionInfo) => sessionAliasIds(session).includes(sessionId)
+  const agent = $sessions.get().find(matches)
 
   if (agent) {
     return { session: agent, slice: 'agent' }
   }
 
-  const messaging = $messagingSessions.get().find(s => s.id === sessionId)
+  const messaging = $messagingSessions.get().find(matches)
 
   if (messaging) {
     return { session: messaging, slice: 'messaging' }
   }
 
-  const cron = $cronSessions.get().find(s => s.id === sessionId)
+  const cron = $cronSessions.get().find(matches)
 
   if (cron) {
     return { session: cron, slice: 'cron' }
   }
 
-  const archived = $archivedSessions.get().find(s => s.id === sessionId)
+  const archived = $archivedSessions.get().find(matches)
 
   if (archived) {
     return { session: archived, slice: 'archived' }
@@ -168,8 +169,9 @@ function stripPinsFor(rows: SessionInfo[]): string[] {
   const doomed = new Set<string>()
 
   for (const session of rows) {
-    doomed.add(session.id)
-    doomed.add(sessionPinId(session))
+    for (const id of sessionAliasIds(session)) {
+      doomed.add(id)
+    }
   }
 
   const next = before.filter(id => !doomed.has(id))
@@ -182,8 +184,8 @@ function stripPinsFor(rows: SessionInfo[]): string[] {
 }
 
 function restorePinsFor(session: SessionInfo, pinnedBefore: string[]) {
-  const pinId = sessionPinId(session)
-  const lost = pinnedBefore.filter(id => id === session.id || id === pinId)
+  const aliases = new Set(sessionAliasIds(session))
+  const lost = pinnedBefore.filter(id => aliases.has(id))
 
   if (!lost.length) {
     return
