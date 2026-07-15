@@ -95,9 +95,11 @@ describe('SidebarSessionRow native drag activation', () => {
   })
 
   it('keeps the sortable wrapper out of the native drag path', () => {
+    const onMouseDown = vi.fn()
+
     const { container } = render(
       <SidebarSessionRow
-        dragHandleProps={{ onMouseDown: vi.fn() }}
+        dragHandleProps={{ onMouseDown }}
         isPinned
         isSelected={false}
         isWorking={false}
@@ -111,9 +113,17 @@ describe('SidebarSessionRow native drag activation', () => {
     )
 
     const anchor = container.querySelector('[data-session-id]') as HTMLDivElement
+    const chrome = container.querySelector('[data-session-row-chrome]') as HTMLDivElement
     const rowButton = container.querySelector('[data-session-row-main]') as HTMLButtonElement
+    const actions = container.querySelector('[data-session-row-actions]') as HTMLButtonElement
 
     expect(anchor.draggable).toBe(false)
-    expect(rowButton.draggable).toBe(true)
+    expect(rowButton.draggable).toBe(false)
+
+    fireEvent.mouseDown(chrome)
+    expect(onMouseDown).toHaveBeenCalledTimes(1)
+
+    fireEvent.mouseDown(actions)
+    expect(onMouseDown).toHaveBeenCalledTimes(1)
   })
 })

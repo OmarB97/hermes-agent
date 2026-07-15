@@ -45,6 +45,13 @@ interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
 
 const AGE_KEY = { day: 'ageDay', hour: 'ageHour', minute: 'ageMin' } as const
 
+function isNestedDragControl(target: EventTarget | null): boolean {
+  return (
+    target instanceof HTMLElement &&
+    Boolean(target.closest('[data-reorder-handle], [data-session-row-actions]'))
+  )
+}
+
 function formatAge(seconds: number, r: Translations['sidebar']['row']): string {
   const { unit, value } = coarseElapsed(Date.now() - seconds * 1000)
 
@@ -88,6 +95,32 @@ export function SidebarSessionRow({
   // session is waiting on the user.
   const needsInput = useStore($attentionSessionIds).includes(session.id)
 
+  const rowDragActivationProps =
+    reorderable && dragHandleProps
+      ? {
+          onKeyDown: (event: React.KeyboardEvent<HTMLElement>) => {
+            if (!isNestedDragControl(event.target)) {
+              dragHandleProps.onKeyDown?.(event)
+            }
+          },
+          onMouseDown: (event: React.MouseEvent<HTMLElement>) => {
+            if (!isNestedDragControl(event.target)) {
+              dragHandleProps.onMouseDown?.(event)
+            }
+          },
+          onPointerDown: (event: React.PointerEvent<HTMLElement>) => {
+            if (!isNestedDragControl(event.target)) {
+              dragHandleProps.onPointerDown?.(event)
+            }
+          },
+          onTouchStart: (event: React.TouchEvent<HTMLElement>) => {
+            if (!isNestedDragControl(event.target)) {
+              dragHandleProps.onTouchStart?.(event)
+            }
+          }
+        }
+      : undefined
+
   return (
     <SessionContextMenu
       onArchive={onArchive}
@@ -112,7 +145,12 @@ export function SidebarSessionRow({
         style={style}
         {...rest}
       >
-        <motion.div layout="position" transition={{ layout: { duration: 0.16, ease: [0.2, 0, 0, 1] } }}>
+        <motion.div
+          data-session-row-chrome
+          layout="position"
+          transition={{ layout: { duration: 0.16, ease: [0.2, 0, 0, 1] } }}
+          {...rowDragActivationProps}
+        >
           <SidebarRowShell
             actions={
               <div className="relative z-2 grid w-[1.375rem] place-items-center">
@@ -134,6 +172,7 @@ export function SidebarSessionRow({
                   <Button
                     aria-label={r.actionsFor(title)}
                     className="size-5 rounded-[4px] bg-transparent text-transparent transition-colors duration-100 hover:bg-(--ui-control-active-background) hover:text-foreground focus-visible:bg-(--ui-control-active-background) focus-visible:text-foreground focus-visible:ring-0 data-[state=open]:bg-(--ui-control-active-background) data-[state=open]:text-foreground group-hover:text-(--ui-text-tertiary) [&_svg]:size-3.5!"
+                    data-session-row-actions
                     size="icon"
                     title={r.sessionActions}
                     variant="ghost"
@@ -158,7 +197,7 @@ export function SidebarSessionRow({
             <SidebarRowBody
               className={cn('z-0 group-hover:pr-12', branchStem && 'pl-3.5')}
               data-session-row-main
-              draggable
+              draggable={!reorderable}
               onClick={event => {
                 if (event.shiftKey) {
                   event.preventDefault()

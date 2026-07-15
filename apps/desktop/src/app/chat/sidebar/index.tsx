@@ -1,4 +1,4 @@
-import { KeyboardSensor, MouseSensor, TouchSensor, useSensor, useSensors } from '@dnd-kit/core'
+import { DndContext, KeyboardSensor, MouseSensor, TouchSensor, useSensor, useSensors } from '@dnd-kit/core'
 import { sortableKeyboardCoordinates } from '@dnd-kit/sortable'
 import { useStore } from '@nanostores/react'
 import type * as React from 'react'
@@ -123,6 +123,7 @@ import {
 } from './projects'
 import { SidebarBlankState, SidebarPinnedEmptyState, SidebarSessionSkeletons } from './section-states'
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
+import { sharedSessionSectionId, useSharedSessionDnd } from './shared-session-dnd'
 import { placeSessionIdAtAnchor, previewItemsAtAnchor, useSessionDropZone } from './use-session-drop-zone'
 
 // Non-session groups (messaging platforms) stay compact: show a few rows up
@@ -1011,6 +1012,15 @@ export function ChatSidebar({
   // The flat Sessions list always shows ALL recent sessions; Projects is a
   // parallel grouped view, not a filter on this one — nothing is hidden here.
   const displayAgentSessions = agentSessions
+  const flatSessionDndEnabled = !showAllProfiles && !agentsGrouped
+
+  const sharedSessionDnd = useSharedSessionDnd({
+    enabled: flatSessionDndEnabled,
+    pinnedSessionIds,
+    pinnedSessions,
+    sessionByAnyId,
+    sessions: displayAgentSessions
+  })
 
   // While a row drag hovers a section, splice the dragged row into the target
   // list at the anchor so the motion.div rows animate the shuffle before drop.
@@ -1026,6 +1036,12 @@ export function ChatSidebar({
         : displayAgentSessions,
     [agentsGrouped, displayAgentSessions, draggingSessionInfo, sessionsDropZone.anchor, showAllProfiles]
   )
+
+  const renderedPinnedSessions = flatSessionDndEnabled
+    ? sharedSessionDnd.effectivePinnedSessions
+    : previewPinnedSessions
+
+  const renderedAgentSessions = flatSessionDndEnabled ? sharedSessionDnd.effectiveSessions : previewAgentSessions
 
   // Pagination is scope-aware. In "All profiles" mode it tracks the global
   // unified set. When scoped to one profile it must compare that profile's own
@@ -1296,34 +1312,43 @@ export function ChatSidebar({
             )}
 
             {!trimmedQuery && (
-              <SidebarSessionsSection
-                activeSessionId={activeSidebarSessionId}
-                contentClassName={cn('flex max-h-44 flex-col gap-px rounded-lg pb-2 pt-1', GROUP_BODY)}
-                dndSensors={dndSensors}
-                dropActive={pinnedDropZone.active}
-                dropHandlers={pinnedDropZone.dropHandlers}
-                emptyState={<SidebarPinnedEmptyState />}
-                label={s.pinned}
-                onArchiveSession={onArchiveSession}
-                onBranchSession={onBranchSession}
-                onDeleteSession={onDeleteSession}
-                onReorderSessions={reorderPinned}
-                onResumeSession={onResumeSession}
-                onSessionDragEnd={handleSessionDragEnd}
-                onSessionDragStart={handleSessionDragStart}
-                onToggle={() => setSidebarPinsOpen(!pinsOpen)}
-                onTogglePin={unpinSession}
-                open={pinsOpen}
-                pinned
-                rootClassName="shrink-0 p-0 pb-1"
-                sessions={previewPinnedSessions}
-                sortable={pinnedSessions.length > 1}
-                workingSessionIdSet={workingSessionIdSet}
-              />
-            )}
+              <DndContext
+                collisionDetection={sharedSessionDnd.collisionDetection}
+                onDragCancel={sharedSessionDnd.onDragCancel}
+                onDragEnd={sharedSessionDnd.onDragEnd}
+                onDragOver={sharedSessionDnd.onDragOver}
+                onDragStart={sharedSessionDnd.onDragStart}
+                sensors={dndSensors}
+              >
+                <SidebarSessionsSection
+                  activeSessionId={activeSidebarSessionId}
+                  contentClassName={cn('flex max-h-44 flex-col gap-px rounded-lg pb-2 pt-1', GROUP_BODY)}
+                  dndSensors={dndSensors}
+                  draggingSessionId={sharedSessionDnd.activeId}
+                  dropActive={!flatSessionDndEnabled && pinnedDropZone.active}
+                  dropHandlers={flatSessionDndEnabled ? undefined : pinnedDropZone.dropHandlers}
+                  emptyState={<SidebarPinnedEmptyState />}
+                  label={s.pinned}
+                  onArchiveSession={onArchiveSession}
+                  onBranchSession={onBranchSession}
+                  onDeleteSession={onDeleteSession}
+                  onReorderSessions={reorderPinned}
+                  onResumeSession={onResumeSession}
+                  onSessionDragEnd={flatSessionDndEnabled ? undefined : handleSessionDragEnd}
+                  onSessionDragStart={flatSessionDndEnabled ? undefined : handleSessionDragStart}
+                  onToggle={() => setSidebarPinsOpen(!pinsOpen)}
+                  onTogglePin={unpinSession}
+                  open={pinsOpen}
+                  pinned
+                  rootClassName="shrink-0 p-0 pb-1"
+                  sessionDndId={sharedSessionSectionId('pinned')}
+                  sessions={renderedPinnedSessions}
+                  sharedSessionDnd={flatSessionDndEnabled}
+                  sortable={flatSessionDndEnabled ? pinnedSessions.length > 0 : pinnedSessions.length > 1}
+                  workingSessionIdSet={workingSessionIdSet}
+                />
 
-            {!trimmedQuery && (
-              <SidebarSessionsSection
+                <SidebarSessionsSection
                 activeProjectId={activeProjectId}
                 activeSessionId={activeSidebarSessionId}
                 collapsible={!inProject}
@@ -1337,9 +1362,11 @@ export function ChatSidebar({
                   // virtualized long list, which must keep its own scroller.
                   !recentsVirtualizes && COMPACT_FLAT
                 )}
+                disableVirtualization={Boolean(sharedSessionDnd.activeId)}
                 dndSensors={dndSensors}
-                dropActive={sessionsDropZone.active}
-                dropHandlers={sessionsDropZone.dropHandlers}
+                draggingSessionId={sharedSessionDnd.activeId}
+                dropActive={!flatSessionDndEnabled && sessionsDropZone.active}
+                dropHandlers={flatSessionDndEnabled ? undefined : sessionsDropZone.dropHandlers}
                 emptyState={
                   showSessionSkeletons ? (
                     <SidebarSessionSkeletons />
@@ -1472,8 +1499,8 @@ export function ChatSidebar({
                 onReorderProjects={showAllProfiles ? undefined : reorderProjects}
                 onReorderSessions={showAllProfiles ? undefined : reorderSessions}
                 onResumeSession={onResumeSession}
-                onSessionDragEnd={handleSessionDragEnd}
-                onSessionDragStart={handleSessionDragStart}
+                onSessionDragEnd={flatSessionDndEnabled ? undefined : handleSessionDragEnd}
+                onSessionDragStart={flatSessionDndEnabled ? undefined : handleSessionDragStart}
                 onToggle={() => setSidebarRecentsOpen(!agentsOpen)}
                 onTogglePin={pinSession}
                 open={agentsOpen}
@@ -1491,10 +1518,13 @@ export function ChatSidebar({
                   'min-h-32 flex-1 overflow-hidden p-0',
                   !recentsVirtualizes && 'compact:min-h-0 compact:flex-none compact:overflow-visible'
                 )}
-                sessions={previewAgentSessions}
-                sortable={!showAllProfiles && agentSessions.length > 1}
+                sessionDndId={sharedSessionSectionId('sessions')}
+                sessions={renderedAgentSessions}
+                sharedSessionDnd={flatSessionDndEnabled}
+                sortable={!showAllProfiles && agentSessions.length > 0}
                 workingSessionIdSet={workingSessionIdSet}
               />
+              </DndContext>
             )}
 
             {!trimmedQuery &&
