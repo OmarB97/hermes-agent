@@ -90,6 +90,39 @@ describe('desktop live per-session context usage', () => {
     })
   })
 
+  it('keeps the final live context snapshot after the turn completes', async () => {
+    await mount()
+
+    act(() =>
+      handleEvent!({
+        payload: {
+          context_length: 131_072,
+          context_pct: 75,
+          context_tokens: 98_304,
+          total_tokens: 124_000
+        },
+        session_id: ACTIVE_ID,
+        type: 'token.usage'
+      })
+    )
+
+    act(() =>
+      handleEvent!({
+        payload: { text: 'done' },
+        session_id: ACTIVE_ID,
+        type: 'message.complete'
+      })
+    )
+
+    expect(states.get(ACTIVE_ID)?.busy).toBe(false)
+    expect(states.get(ACTIVE_ID)?.usage).toMatchObject({
+      context_max: 131_072,
+      context_percent: 75,
+      context_used: 98_304,
+      total: 124_000
+    })
+  })
+
   it('updates a background session cache without overwriting the active session cache', async () => {
     states.get(ACTIVE_ID)!.usage = {
       calls: 1,
