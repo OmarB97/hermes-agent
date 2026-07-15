@@ -6498,6 +6498,7 @@ ipcMain.handle('hermes:requestMicrophoneAccess', async () => {
 //   GET    /api/sessions/{id}[/messages] → read from remote
 //   DELETE /api/sessions/{id}            → delete on remote
 //   PATCH  /api/sessions/{id}            → rename/archive on remote
+//   POST   /api/sessions/bulk-archive     → bulk archive on remote
 async function interceptSessionRequestForRemote(request) {
   if (typeof request?.path !== 'string') {
     return undefined
@@ -6524,14 +6525,17 @@ async function interceptSessionRequestForRemote(request) {
     return mergeRemoteProfileSessions(searchParams, remoteProfiles)
   }
 
-  // Per-session read/mutation. Owner is in ?profile= (reads) or request.profile
-  // (mutations). Two remote shapes:
+  // Session read/mutation. Owner is in ?profile= (reads/deletes),
+  // request.profile, or the mutation body. Two remote shapes:
   //  - per-profile override: route to that profile's own remote, sans profile
   //    param (it serves its own state.db natively).
   //  - global remote mode: ONE backend serves every profile via ?profile=, so
   //    route there and KEEP the profile param so it opens the right state.db.
-  if (/^\/api\/sessions\/[^/]+(\/messages)?$/.test(pathname)) {
-    const profile = (searchParams.get('profile') || request.profile || '').trim()
+  const isPerSessionRequest = /^\/api\/sessions\/[^/]+(\/messages)?$/.test(pathname)
+  const isBulkArchiveRequest = method === 'POST' && pathname === '/api/sessions/bulk-archive'
+  if (isPerSessionRequest || isBulkArchiveRequest) {
+    const bodyProfile = typeof request.body?.profile === 'string' ? request.body.profile : ''
+    const profile = (searchParams.get('profile') || request.profile || bodyProfile || '').trim()
     if (!profile) {
       return undefined
     }

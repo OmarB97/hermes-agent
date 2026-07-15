@@ -1166,6 +1166,55 @@ class TestWebServerEndpoints:
         assert "current" not in archived_ids
         assert "recent-live" not in archived_ids
 
+    def test_bulk_archive_mutates_only_the_requested_profile(self):
+        """The desktop's `default`/named profile tag must reach the DB layer.
+
+        Without this, Electron can route the request to a healthy backend and
+        still archive that process's own state.db. The sidebar then removes the
+        requested rows optimistically and resurrects them on its next refresh.
+        """
+        from hermes_state import SessionDB
+        from hermes_cli import profiles as profiles_mod
+
+        worker_home = profiles_mod.get_profile_dir("worker")
+        worker_home.mkdir(parents=True, exist_ok=True)
+
+        default_db = SessionDB()
+        try:
+            default_db.create_session("default-old", "cli")
+            default_db.append_message("default-old", "user", "default")
+            default_db.end_session("default-old", end_reason="done")
+        finally:
+            default_db.close()
+
+        worker_db = SessionDB(db_path=worker_home / "state.db")
+        try:
+            worker_db.create_session("worker-old", "cli")
+            worker_db.append_message("worker-old", "user", "worker")
+            worker_db.end_session("worker-old", end_reason="done")
+        finally:
+            worker_db.close()
+
+        resp = self.client.post(
+            "/api/sessions/bulk-archive",
+            json={
+                "profile": "worker",
+                "min_messages": 1,
+                "active_grace_seconds": 0,
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "archived": 1}
+
+        default_db = SessionDB()
+        worker_db = SessionDB(db_path=worker_home / "state.db")
+        try:
+            assert default_db.get_session("default-old")["archived"] == 0
+            assert worker_db.get_session("worker-old")["archived"] == 1
+        finally:
+            default_db.close()
+            worker_db.close()
+
     def test_bulk_archive_preserves_branch_and_intermediate_lineage_alias(self):
         """Archive projected tips without sweeping branch siblings or pins."""
         import time as _time

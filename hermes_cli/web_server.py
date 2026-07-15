@@ -9469,6 +9469,7 @@ class BulkArchiveSessions(BaseModel):
     preserve_ids: Optional[List[str]] = None
     min_messages: Optional[int] = 1
     active_grace_seconds: Optional[int] = None
+    profile: Optional[str] = None
 
 
 @app.post("/api/sessions/bulk-archive")
@@ -9498,9 +9499,7 @@ async def bulk_archive_sessions_endpoint(body: BulkArchiveSessions):
         else cfg.get("auto_archive_active_grace_seconds", 300)
     )
 
-    from hermes_state import SessionDB
-
-    db = SessionDB()
+    db = _open_session_db_for_profile(body.profile)
     try:
         archived = db.archive_surfaced_sessions(
             preserve_ids=preserve_ids,
@@ -9752,8 +9751,9 @@ async def delete_session_endpoint(session_id: str, profile: Optional[str] = None
 class SessionRename(BaseModel):
     title: Optional[str] = None
     archived: Optional[bool] = None
-    # Mutate a session belonging to another profile (opens its state.db). Omit
-    # for the current/default profile.
+    # Explicitly select the row's owning state.db. Cross-profile desktop lists
+    # use `default` for the root DB, which may differ from the serving process's
+    # active profile, so callers preserve this tag even for default rows.
     profile: Optional[str] = None
 
 
