@@ -316,7 +316,10 @@ export interface SessionCreateResponse {
 }
 
 export interface SessionInfo {
+  api_call_count?: number
   archived?: boolean
+  compression_count?: number
+  context_length?: number
   cwd?: null | string
   /** Git branch checked out in {@link cwd} when the session started/resumed.
    *  The sidebar groups main-checkout sessions by this so feature-branch work
@@ -337,9 +340,11 @@ export interface SessionInfo {
   input_tokens: number
   is_active: boolean
   last_active: number
+  last_prompt_tokens?: number
   message_count: number
   model: null | string
   output_tokens: number
+  total_tokens?: number
   /** Parent conversation when this row is a /branch fork. */
   parent_session_id?: null | string
   preview: null | string

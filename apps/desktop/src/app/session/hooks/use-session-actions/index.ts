@@ -65,6 +65,7 @@ import {
   resolveStoredSession,
   sessionMatchesStoredId,
   sessionShouldHaveTranscript,
+  storedSessionUsagePreview,
   toBranchMessages,
   upsertOptimisticSession
 } from './utils'
@@ -79,13 +80,6 @@ function pinnedAliasesFor(session: SessionInfo | null | undefined, fallbackId: s
   }
 
   return aliases
-}
-
-function storedSessionUsagePreview(stored: SessionInfo): UsageStats {
-  const input = stored.input_tokens || 0
-  const output = stored.output_tokens || 0
-
-  return { calls: 0, input, output, total: input + output }
 }
 
 interface SessionActionsOptions {
@@ -393,13 +387,15 @@ export function useSessionActions({
         const stored =
           $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId)) ?? storedForProfile
 
-        const cachedViewState =
-          !cachedState.model && stored?.model != null
-            ? {
-                ...cachedState,
-                model: stored.model || ''
-              }
-            : cachedState
+        const cachedViewState = stored
+          ? {
+              ...cachedState,
+              ...(!cachedState.model && stored.model != null ? { model: stored.model || '' } : {}),
+              usage: mergeUsageSnapshot(storedSessionUsagePreview(stored), cachedState.usage, {
+                allowContextDecrease: true
+              })
+            }
+          : cachedState
 
         if (cachedViewState !== cachedState) {
           sessionStateByRuntimeIdRef.current.set(cachedRuntimeId, cachedViewState)
@@ -570,7 +566,7 @@ export function useSessionActions({
 
         setActiveSessionId(resumed.session_id)
         activeSessionIdRef.current = resumed.session_id
-        const runtimeInfo = applyRuntimeInfo(resumed.info)
+        const runtimeInfo = applyRuntimeInfo(resumed.info, stored ? storedSessionUsagePreview(stored) : undefined)
 
         patchSessionWorkspace(storedSessionId, runtimeInfo?.cwd)
 
