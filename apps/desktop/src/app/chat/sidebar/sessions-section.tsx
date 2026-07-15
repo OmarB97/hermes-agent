@@ -218,7 +218,13 @@ export function SidebarSessionsSection({
   // The flat recents/pinned list is the only place sessions reorder by hand;
   // grouped/tree views always sort by creation date and never drag.
   const sessionsDraggable = sortable && (sharedSessionDnd || !!onReorderSessions)
-  const displayEntries = useMemo(() => flattenSessionsWithBranches(sessions), [sessions])
+  // Pinned and flat Sessions already arrive in their authoritative persisted
+  // order. Branch flattening may nest children, but it must not silently sort
+  // the top-level rows by last_active and undo a successful manual drop.
+  const displayEntries = useMemo(
+    () => flattenSessionsWithBranches(sessions, { preserveRootOrder: sessionsDraggable }),
+    [sessions, sessionsDraggable]
+  )
 
   const renderRow = (session: SessionInfo, draggable: boolean, branchStem?: string) => {
     const rowProps = {
