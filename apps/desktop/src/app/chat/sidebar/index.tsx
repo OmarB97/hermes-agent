@@ -472,7 +472,8 @@ export function ChatSidebar({
     const next = resolveManualSessionOrderIds(
       unpinnedAgentSessions.map(s => s.id),
       agentOrderIds,
-      agentOrderManual
+      agentOrderManual,
+      visibleSessions.length > 0
     )
 
     if (!next.length && agentOrderManual) {
@@ -488,7 +489,7 @@ export function ChatSidebar({
     if (next.length && !sameIds(next, agentOrderIds)) {
       setSidebarSessionOrderIds(next)
     }
-  }, [agentOrderIds, agentOrderManual, unpinnedAgentSessions])
+  }, [agentOrderIds, agentOrderManual, unpinnedAgentSessions, visibleSessions.length])
 
   const agentSessions = useMemo(
     () => (agentOrderManual ? orderByIds(unpinnedAgentSessions, s => s.id, agentOrderIds) : unpinnedAgentSessions),
