@@ -1,7 +1,10 @@
-import type { useSensors } from '@dnd-kit/core'
+import { useDroppable, type useSensors } from '@dnd-kit/core'
+import { SortableContext, verticalListSortingStrategy } from '@dnd-kit/sortable'
+import { useStore } from '@nanostores/react'
 import type * as React from 'react'
-import { useMemo } from 'react'
+import { useCallback, useEffect, useMemo } from 'react'
 
+import type { SessionDragPayload } from '@/app/chat/composer/inline-refs'
 import { SidebarPanelLabel } from '@/app/shell/sidebar-label'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
 import { SidebarGroup, SidebarGroupContent } from '@/components/ui/sidebar'
@@ -10,6 +13,13 @@ import type { SessionInfo } from '@/hermes'
 import { flattenSessionsWithBranches } from '@/lib/session-branch-tree'
 import { cn } from '@/lib/utils'
 import { sessionPinId } from '@/store/session'
+import {
+  $sidebarSelection,
+  pruneSidebarSelection,
+  rangeSelectSessions,
+  type SidebarSectionKey,
+  toggleSessionSelected
+} from '@/store/sidebar-selection'
 
 import { SidebarCount } from './chrome'
 import {
@@ -88,11 +98,17 @@ interface SidebarSessionsSectionProps {
   workingSessionIdSet: Set<string>
   onResumeSession: (sessionId: string) => void
   onDeleteSession: (sessionId: string) => void
+  onDeleteSessions?: (sessionIds: string[]) => Promise<unknown> | void
   onArchiveSession: (sessionId: string) => void
+  onArchiveSessions?: (sessionIds: string[]) => Promise<unknown> | void
+  onHaltSessions?: (sessionIds: string[]) => Promise<unknown> | void
+  onPromptSessions?: (sessionIds: string[], text: string) => Promise<unknown> | void
+  onSteerSessions?: (sessionIds: string[], text: string) => Promise<unknown> | void
   onBranchSession?: (sessionId: string, profile?: string) => void
   onTogglePin: (sessionId: string) => void
   onNewSessionInWorkspace?: (path: null | string) => void
   pinned: boolean
+  sectionKey?: SidebarSectionKey
   rootClassName?: string
   contentClassName?: string
   emptyState: React.ReactNode
@@ -139,6 +155,20 @@ interface SidebarSessionsSectionProps {
   // lists (Pinned / search results) in the All-profiles view, where no group
   // header communicates ownership (#66003).
   showProfileTags?: boolean
+  // Pinned + Sessions share one parent DndContext in the flat view. Each
+  // section contributes its own droppable bucket + SortableContext.
+  sharedSessionDnd?: boolean
+  sessionDndId?: string
+  draggingSessionId?: null | string
+  disableVirtualization?: boolean
+  // Native session-drag (drag-to-pin/unpin/reorder): the owner hands each row
+  // body's drag start/end down so it can drive drop-zone previews in flight.
+  onSessionDragEnd?: () => void
+  onSessionDragStart?: (payload: SessionDragPayload) => void
+  /** True while an acceptable row drag hovers this section (lights the frame). */
+  dropActive?: boolean
+  /** Native session-drag drop target handlers, spread onto the section frame. */
+  dropHandlers?: Pick<React.DOMAttributes<HTMLDivElement>, 'onDragEnter' | 'onDragLeave' | 'onDragOver' | 'onDrop'>
 }
 
 export function SidebarSessionsSection({
@@ -150,11 +180,17 @@ export function SidebarSessionsSection({
   workingSessionIdSet,
   onResumeSession,
   onDeleteSession,
+  onDeleteSessions,
   onArchiveSession,
+  onArchiveSessions,
+  onHaltSessions,
+  onPromptSessions,
+  onSteerSessions,
   onBranchSession,
   onTogglePin,
   onNewSessionInWorkspace,
   pinned,
+  sectionKey,
   rootClassName,
   contentClassName,
   emptyState,
@@ -179,9 +215,25 @@ export function SidebarSessionsSection({
   onReorderProjects,
   projectBackRow,
   dndSensors,
-  showProfileTags = false
+  showProfileTags = false,
+  sharedSessionDnd = false,
+  sessionDndId,
+  draggingSessionId,
+  disableVirtualization = false,
+  onSessionDragEnd,
+  onSessionDragStart,
+  dropActive = false,
+  dropHandlers
 }: SidebarSessionsSectionProps) {
+  const { isOver: sharedDropActive, setNodeRef: setSharedDropRef } = useDroppable({
+    disabled: !sharedSessionDnd || !sessionDndId,
+    id: sessionDndId ?? `disabled:${label}`
+  })
+
   const sectionOpen = collapsible ? open : true
+  const selection = useStore($sidebarSelection)
+  const selectable = Boolean(sectionKey)
+  const selectionActive = selectable && selection.section === sectionKey && selection.ids.length > 0
   const hasGroupedSessions = Boolean(groups?.some(group => group.sessions.length > 0))
   // A defined project list is itself content (even an empty project should
   // render as a drill-in row so the user can see it exists).
@@ -193,27 +245,79 @@ export function SidebarSessionsSection({
 
   // The flat recents/pinned list is the only place sessions reorder by hand;
   // grouped/tree views always sort by creation date and never drag.
-  const sessionsDraggable = sortable && !!onReorderSessions
-  const displayEntries = useMemo(() => flattenSessionsWithBranches(sessions), [sessions])
+  const preservesRootOrder = sortable && (sharedSessionDnd || !!onReorderSessions)
+  const sessionsDraggable = preservesRootOrder && !selectionActive
+  // Pinned and flat Sessions already arrive in their authoritative persisted
+  // order. Branch flattening may nest children, but it must not silently sort
+  // the top-level rows by last_active and undo a successful manual drop.
+
+  const displayEntries = useMemo(
+    () => flattenSessionsWithBranches(sessions, { preserveRootOrder: preservesRootOrder }),
+    [preservesRootOrder, sessions]
+  )
+
+  const orderedIds = useMemo(() => displayEntries.map(entry => entry.session.id), [displayEntries])
+
+  const selectedIdSet = useMemo(
+    () => (selectionActive ? new Set(selection.ids) : undefined),
+    [selection.ids, selectionActive]
+  )
+
+  useEffect(() => {
+    if (sectionKey) {
+      pruneSidebarSelection(
+        sectionKey,
+        displayEntries.map(entry => entry.session)
+      )
+    }
+  }, [displayEntries, sectionKey])
+
+  const handleToggleSelect = useCallback(
+    (sessionId: string, mode: 'range' | 'single') => {
+      if (!sectionKey) {
+        return
+      }
+
+      if (mode === 'range') {
+        rangeSelectSessions(sectionKey, sessionId, orderedIds, activeSessionId)
+      } else {
+        toggleSessionSelected(sectionKey, sessionId)
+      }
+    },
+    [activeSessionId, orderedIds, sectionKey]
+  )
 
   const renderRow = (session: SessionInfo, draggable: boolean, branchStem?: string) => {
+    const checked = selectedIdSet?.has(session.id) ?? false
+
     const rowProps = {
+      bulkSelectedSessionIds: checked && selection.ids.length > 1 ? selection.ids : undefined,
       branchStem,
+      checked,
       isPinned: pinned,
       isSelected: session.id === activeSessionId,
       isWorking: workingSessionIdSet.has(session.id),
+      dragging: session.id === draggingSessionId,
       onArchive: () => onArchiveSession(session.id),
+      onArchiveSelectedSessions: onArchiveSessions,
       onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
       onDelete: () => onDeleteSession(session.id),
+      onDeleteSelectedSessions: onDeleteSessions,
+      onHaltSelectedSessions: onHaltSessions,
       onPin: () => onTogglePin(sessionPinId(session)),
+      onPromptSelectedSessions: onPromptSessions,
       onResume: () => onResumeSession(session.id),
+      onSteerSelectedSessions: onSteerSessions,
+      onToggleSelect: sectionKey ? (mode: 'range' | 'single') => handleToggleSelect(session.id, mode) : undefined,
       reorderable: draggable && !branchStem,
       session,
+      selectable,
+      selectionActive,
       showProfile: showProfileTags
     }
 
     return draggable && !branchStem ? (
-      <SortableSidebarSessionRow key={session.id} {...rowProps} />
+      <SortableSidebarSessionRow key={session.id} previewOwnsLayout={Boolean(sharedSessionDnd)} {...rowProps} />
     ) : (
       <SidebarSessionRow key={session.id} {...rowProps} />
     )
@@ -224,6 +328,7 @@ export function SidebarSessionsSection({
     flattenSessionsWithBranches(items).map(({ branchStem, session }) => renderRow(session, false, branchStem))
 
   const flatVirtualized =
+    !disableVirtualization &&
     !showEmptyState &&
     !groups?.length &&
     !projectOverview?.length &&
@@ -312,25 +417,48 @@ export function SidebarSessionsSection({
         className={contentClassName}
         entries={displayEntries}
         onArchiveSession={onArchiveSession}
+        onArchiveSessions={onArchiveSessions}
         onBranchSession={onBranchSession}
         onDeleteSession={onDeleteSession}
+        onDeleteSessions={onDeleteSessions}
+        onHaltSessions={onHaltSessions}
+        onPromptSessions={onPromptSessions}
         onResumeSession={onResumeSession}
+        onSessionDragEnd={onSessionDragEnd}
+        onSessionDragStart={onSessionDragStart}
+        onSteerSessions={onSteerSessions}
         onTogglePin={onTogglePin}
+        onToggleSelect={sectionKey ? handleToggleSelect : undefined}
         pinned={pinned}
         showProfileTags={showProfileTags}
+        sectionKey={sectionKey}
+        selectable={selectable}
+        selectedIds={selectedIdSet}
+        selectedSessionIds={selection.ids}
+        selectionActive={selectionActive}
         sortable={sessionsDraggable}
         workingSessionIdSet={workingSessionIdSet}
       />
     )
 
     inner =
-      sessionsDraggable && onReorderSessions ? (
+      sharedSessionDnd && sessionsDraggable ? (
+        <SortableContext items={sessions.map(s => s.id)} strategy={verticalListSortingStrategy}>
+          {virtual}
+        </SortableContext>
+      ) : sessionsDraggable && onReorderSessions ? (
         <ReorderableList ids={sessions.map(s => s.id)} onReorder={onReorderSessions} sensors={dndSensors}>
           {virtual}
         </ReorderableList>
       ) : (
         virtual
       )
+  } else if (sharedSessionDnd && sessionsDraggable) {
+    inner = (
+      <SortableContext items={sessions.map(s => s.id)} strategy={verticalListSortingStrategy}>
+        {displayEntries.map(({ branchStem, session }) => renderRow(session, true, branchStem))}
+      </SortableContext>
+    )
   } else if (sessionsDraggable && onReorderSessions) {
     inner = (
       <ReorderableList ids={sessions.map(s => s.id)} onReorder={onReorderSessions} sensors={dndSensors}>
@@ -346,7 +474,19 @@ export function SidebarSessionsSection({
   const resolvedContentClassName = cn(contentClassName, flatVirtualized && 'overflow-y-visible')
 
   return (
-    <SidebarGroup className={rootClassName}>
+    <SidebarGroup
+      className={cn(
+        rootClassName,
+        // Light the whole section (header included — drops there count too, even
+        // collapsed) while an acceptable row drag hovers it.
+        (dropActive || sharedDropActive) &&
+          'rounded-lg bg-(--ui-control-hover-background) ring-1 ring-inset ring-(--ui-stroke-tertiary)'
+      )}
+      data-session-dnd-lane={sharedSessionDnd ? (pinned ? 'pinned' : 'sessions') : undefined}
+      data-sidebar-session-section={sectionKey}
+      ref={sharedSessionDnd ? setSharedDropRef : undefined}
+      {...dropHandlers}
+    >
       <SidebarSectionHeader
         action={headerAction}
         collapsible={collapsible}
@@ -375,10 +515,13 @@ interface SortableSessionRowProps {
   onDelete: () => void
   onPin: () => void
   onResume: () => void
+  onSessionDragEnd?: () => void
+  onSessionDragStart?: (payload: SessionDragPayload) => void
+  previewOwnsLayout?: boolean
 }
 
-function SortableSidebarSessionRow(props: SortableSessionRowProps) {
-  return <SidebarSessionRow {...props} {...useSortableBindings(props.session.id)} />
+function SortableSidebarSessionRow({ previewOwnsLayout, ...props }: SortableSessionRowProps) {
+  return <SidebarSessionRow {...props} {...useSortableBindings(props.session.id, { previewOwnsLayout })} />
 }
 
 function SortableProjectOverviewRow(props: React.ComponentProps<typeof ProjectOverviewRow>) {

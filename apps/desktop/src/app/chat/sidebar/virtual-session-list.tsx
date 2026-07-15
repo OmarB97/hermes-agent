@@ -3,10 +3,12 @@ import { CSS } from '@dnd-kit/utilities'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { type FC, useCallback, useRef } from 'react'
 
+import type { SessionDragPayload } from '@/app/chat/composer/inline-refs'
 import type { SessionInfo } from '@/hermes'
 import { type SidebarSessionEntry } from '@/lib/session-branch-tree'
 import { cn } from '@/lib/utils'
 import { sessionPinId } from '@/store/session'
+import type { SidebarSectionKey } from '@/store/sidebar-selection'
 
 import { SidebarSessionRow } from './session-row'
 
@@ -22,6 +24,16 @@ interface SessionRowCommonProps {
   onResume: () => void
   reorderable?: boolean
   showProfile?: boolean
+  selectable?: boolean
+  selectionActive?: boolean
+  checked?: boolean
+  onToggleSelect?: (mode: 'range' | 'single') => void
+  bulkSelectedSessionIds?: readonly string[]
+  onArchiveSelectedSessions?: (sessionIds: string[]) => Promise<unknown> | void
+  onDeleteSelectedSessions?: (sessionIds: string[]) => Promise<unknown> | void
+  onHaltSelectedSessions?: (sessionIds: string[]) => Promise<unknown> | void
+  onPromptSelectedSessions?: (sessionIds: string[], text: string) => Promise<unknown> | void
+  onSteerSelectedSessions?: (sessionIds: string[], text: string) => Promise<unknown> | void
 }
 
 interface VirtualSessionListProps {
@@ -29,13 +41,26 @@ interface VirtualSessionListProps {
   className?: string
   entries: SidebarSessionEntry[]
   onArchiveSession: (sessionId: string) => void
+  onArchiveSessions?: (sessionIds: string[]) => Promise<unknown> | void
   onBranchSession?: (sessionId: string, profile?: string) => void
   onDeleteSession: (sessionId: string) => void
+  onDeleteSessions?: (sessionIds: string[]) => Promise<unknown> | void
+  onHaltSessions?: (sessionIds: string[]) => Promise<unknown> | void
+  onPromptSessions?: (sessionIds: string[], text: string) => Promise<unknown> | void
   onResumeSession: (sessionId: string) => void
+  onSessionDragEnd?: () => void
+  onSessionDragStart?: (payload: SessionDragPayload) => void
   onTogglePin: (sessionId: string) => void
+  onToggleSelect?: (sessionId: string, mode: 'range' | 'single') => void
   pinned: boolean
   showProfileTags?: boolean
+  sectionKey?: SidebarSectionKey
+  selectable?: boolean
+  selectedIds?: ReadonlySet<string>
+  selectedSessionIds?: readonly string[]
+  selectionActive?: boolean
   sortable: boolean
+  onSteerSessions?: (sessionIds: string[], text: string) => Promise<unknown> | void
   workingSessionIdSet: Set<string>
 }
 
@@ -47,13 +72,26 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
   className,
   entries,
   onArchiveSession,
+  onArchiveSessions,
   onBranchSession,
   onDeleteSession,
+  onDeleteSessions,
+  onHaltSessions,
+  onPromptSessions,
   onResumeSession,
+  onSessionDragEnd,
+  onSessionDragStart,
   onTogglePin,
+  onToggleSelect,
   pinned,
   showProfileTags = false,
+  sectionKey,
+  selectable = false,
+  selectedIds,
+  selectedSessionIds,
+  selectionActive = false,
   sortable,
+  onSteerSessions,
   workingSessionIdSet
 }) => {
   const scrollerRef = useRef<HTMLDivElement | null>(null)
@@ -84,16 +122,26 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
     const reorderable = sortable && !branchStem
 
     const commonProps: SessionRowCommonProps = {
+      bulkSelectedSessionIds: selectedIds?.has(session.id) ? selectedSessionIds : undefined,
+      checked: selectedIds?.has(session.id) ?? false,
       branchStem,
       isPinned: pinned,
       isSelected: session.id === activeSessionId,
       isWorking: workingSessionIdSet.has(session.id),
       onArchive: () => onArchiveSession(session.id),
+      onArchiveSelectedSessions: onArchiveSessions,
       onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
       onDelete: () => onDeleteSession(session.id),
+      onDeleteSelectedSessions: onDeleteSessions,
+      onHaltSelectedSessions: onHaltSessions,
       onPin: () => onTogglePin(sessionPinId(session)),
+      onPromptSelectedSessions: onPromptSessions,
       onResume: () => onResumeSession(session.id),
+      onSteerSelectedSessions: onSteerSessions,
+      onToggleSelect: sectionKey && onToggleSelect ? mode => onToggleSelect(session.id, mode) : undefined,
       reorderable,
+      selectable,
+      selectionActive,
       showProfile: showProfileTags
     }
 

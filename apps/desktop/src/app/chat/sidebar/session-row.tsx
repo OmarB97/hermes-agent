@@ -21,7 +21,7 @@ import { $attentionSessionIds, $stalledSessionIds, openSessionTile } from '@/sto
 import { canOpenSessionWindow, openSessionInNewWindow } from '@/store/windows'
 
 import { SidebarRowBody, SidebarRowGrab, SidebarRowLabel, SidebarRowLead, SidebarRowShell } from './chrome'
-import { SessionActionsMenu, SessionContextMenu } from './session-actions-menu'
+import { SessionActionsMenu, type SessionBulkContextActions, SessionContextMenu } from './session-actions-menu'
 import { type SessionDotState, sessionDotState, sessionShowsRunningArc } from './session-row-state'
 import { useProfilePrewarm } from './use-profile-prewarm'
 
@@ -44,6 +44,19 @@ interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
    *  flat cross-profile lists — Pinned and search results in the All-profiles
    *  view — where no group header communicates ownership (#66003). */
   showProfile?: boolean
+  /** Row participates in its section's multi-select. */
+  selectable?: boolean
+  /** At least one row in this section is selected. */
+  selectionActive?: boolean
+  /** This row is included in the current section selection. */
+  checked?: boolean
+  onToggleSelect?: (mode: 'range' | 'single') => void
+  bulkSelectedSessionIds?: readonly string[]
+  onArchiveSelectedSessions?: SessionBulkContextActions['onArchiveSessions']
+  onDeleteSelectedSessions?: SessionBulkContextActions['onDeleteSessions']
+  onHaltSelectedSessions?: SessionBulkContextActions['onHaltSessions']
+  onPromptSelectedSessions?: SessionBulkContextActions['onPromptSessions']
+  onSteerSelectedSessions?: SessionBulkContextActions['onSteerSessions']
 }
 
 const AGE_KEY = { day: 'ageDay', hour: 'ageHour', minute: 'ageMin' } as const
@@ -70,6 +83,16 @@ export function SidebarSessionRow({
   dragging = false,
   dragHandleProps,
   showProfile = false,
+  selectable = false,
+  selectionActive = false,
+  checked = false,
+  onToggleSelect,
+  bulkSelectedSessionIds,
+  onArchiveSelectedSessions,
+  onDeleteSelectedSessions,
+  onHaltSelectedSessions,
+  onPromptSelectedSessions,
+  onSteerSelectedSessions,
   className,
   style,
   ref,
@@ -105,8 +128,26 @@ export function SidebarSessionRow({
   // to collapse them at the leaf is backwards.
   const dotState = sessionDotState({ hasBackground, isStalled, isUnread, isWorking, needsInput })
 
+  const bulkContextActions =
+    checked && bulkSelectedSessionIds && bulkSelectedSessionIds.length > 1
+      ? {
+          onArchiveSessions: onArchiveSelectedSessions,
+          onDeleteSessions: onDeleteSelectedSessions,
+          onHaltSessions: onHaltSelectedSessions,
+          onPromptSessions: onPromptSelectedSessions,
+          onSteerSessions: onSteerSelectedSessions,
+          sessionIds: bulkSelectedSessionIds
+        }
+      : undefined
+
+  const toggleSelect = (mode: 'range' | 'single') => {
+    triggerHaptic('selection')
+    onToggleSelect?.(mode)
+  }
+
   return (
     <SessionContextMenu
+      bulkActions={bulkContextActions}
       onArchive={onArchive}
       onBranch={onBranch}
       onDelete={onDelete}
@@ -147,7 +188,7 @@ export function SidebarSessionRow({
         }
         className={cn(
           'group row-hover relative',
-          isSelected && 'bg-(--ui-row-active-background)',
+          (isSelected || checked) && 'bg-(--ui-row-active-background)',
           isWorking && 'text-foreground',
           // Opaque surface while lifted so the dragged row erases what's under
           // it (translucency let the rows below bleed through).
@@ -163,7 +204,7 @@ export function SidebarSessionRow({
           // (never native HTML5 DnD: no macOS snap-back, Esc aborts
           // instantly). Sub-threshold releases stay ordinary clicks, so
           // resume / pin / open-in-window are untouched.
-          if ((event.target as HTMLElement).closest('[data-reorder-handle], [data-row-actions]')) {
+          if (selectionActive || (event.target as HTMLElement).closest('[data-reorder-handle], [data-row-actions]')) {
             return
           }
 
@@ -182,6 +223,7 @@ export function SidebarSessionRow({
         {sessionShowsRunningArc({ isWorking, needsInput }) && <span aria-hidden="true" className="arc-border" />}
         <SidebarRowBody
           className={cn('z-0 group-hover:pr-12', branchStem && 'pl-3.5')}
+          data-session-row-main
           // Middle-click = open in a new tab (browser muscle memory). Swallow
           // the mousedown so Chromium doesn't enter autoscroll mode.
           onAuxClick={event => {
@@ -194,6 +236,31 @@ export function SidebarSessionRow({
           }}
           onClick={event => {
             const mod = event.metaKey || event.ctrlKey
+            const canSelect = Boolean(selectable && onToggleSelect)
+
+            if (canSelect && (mod || event.altKey)) {
+              event.preventDefault()
+              event.stopPropagation()
+              toggleSelect('single')
+
+              return
+            }
+
+            if (canSelect && event.shiftKey) {
+              event.preventDefault()
+              event.stopPropagation()
+              toggleSelect('range')
+
+              return
+            }
+
+            if (canSelect && selectionActive) {
+              event.preventDefault()
+              event.stopPropagation()
+              toggleSelect('single')
+
+              return
+            }
 
             // ⇧⌘-click → pop into its own window (needs standalone windows).
             if (mod && event.shiftKey && canOpenSessionWindow()) {
@@ -229,7 +296,22 @@ export function SidebarSessionRow({
           }}
           onMouseDown={event => event.button === 1 && event.preventDefault()}
         >
-          {reorderable ? (
+          {selectionActive ? (
+            <SidebarRowLead>
+              <span aria-checked={checked} className="grid size-3 place-items-center" role="checkbox">
+                <span
+                  className={cn(
+                    'grid size-3 place-items-center rounded-[3px] border transition-colors',
+                    checked
+                      ? 'border-foreground/80 bg-foreground/90 text-(--ui-sidebar-surface-background,var(--background))'
+                      : 'border-(--ui-stroke-secondary) bg-transparent'
+                  )}
+                >
+                  {checked && <Codicon name="check" size="0.5rem" />}
+                </span>
+              </span>
+            </SidebarRowLead>
+          ) : reorderable ? (
             <SidebarRowGrab
               ariaLabel={handleLabel}
               dragging={dragging}

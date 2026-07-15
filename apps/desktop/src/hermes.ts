@@ -532,16 +532,32 @@ export async function listSidebarSessions(req: SidebarSessionsRequest): Promise<
   }
 }
 
-// Mutations take the owning `profile` so Electron routes them to that profile's
-// backend (remote pool or local primary) via request.profile — matching the
-// read path. A remote session's row lives only on its remote host, so a mutation
-// that hit the local primary would no-op or 404. Omit for the current/default.
+// Mutations carry the owning `profile` at both routing layers: request.profile
+// tells Electron which backend owns the request, while body/query profile tells
+// a shared local or global-remote backend which state.db to mutate. In
+// particular, cross-profile lists tag the root database as `default`; dropping
+// that second tag makes optimistic archive/delete changes reappear on refresh.
 export function setSessionArchived(id: string, archived: boolean, profile?: string | null): Promise<{ ok: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean }>({
     ...(profile ? { profile } : {}),
     path: `/api/sessions/${encodeURIComponent(id)}`,
     method: 'PATCH',
-    body: { archived }
+    body: { archived, ...(profile ? { profile } : {}) }
+  })
+}
+
+export function bulkArchiveSessions(
+  preserveIds: string[] = [],
+  profile?: string | null
+): Promise<{ ok: boolean; archived: number }> {
+  return window.hermesDesktop.api<{ ok: boolean; archived: number }>({
+    ...(profile ? { profile } : {}),
+    path: '/api/sessions/bulk-archive',
+    method: 'POST',
+    body: {
+      preserve_ids: Array.from(new Set(preserveIds.filter(Boolean))).slice(0, 5000),
+      ...(profile ? { profile } : {})
+    }
   })
 }
 
@@ -578,9 +594,11 @@ export function getSessionMessages(id: string, profile?: string | null): Promise
 }
 
 export function deleteSession(id: string, profile?: string | null): Promise<{ ok: boolean }> {
+  const suffix = profile ? `?profile=${encodeURIComponent(profile)}` : ''
+
   return window.hermesDesktop.api<{ ok: boolean }>({
     ...(profile ? { profile } : {}),
-    path: `/api/sessions/${encodeURIComponent(id)}`,
+    path: `/api/sessions/${encodeURIComponent(id)}${suffix}`,
     method: 'DELETE'
   })
 }

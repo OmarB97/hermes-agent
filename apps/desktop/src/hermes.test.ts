@@ -7,6 +7,8 @@ import {
   AUDIO_TRANSCRIBE_MIN_REQUEST_TIMEOUT_MS,
   audioSpeakRequestTimeoutMs,
   audioTranscribeRequestTimeoutMs,
+  bulkArchiveSessions,
+  deleteSession,
   getCronJobs,
   getGlobalModelInfo,
   getGlobalModelOptions,
@@ -20,7 +22,8 @@ import {
   listSidebarSessions,
   resetSidebarBatchCapability,
   speakText,
-  transcribeAudio
+  transcribeAudio,
+  setSessionArchived
 } from './hermes'
 import { refreshActiveProfile } from './store/profile'
 
@@ -383,6 +386,44 @@ describe('Hermes REST helpers', () => {
       method: 'POST',
       path: '/api/audio/transcribe',
       timeoutMs: AUDIO_TRANSCRIBE_MIN_REQUEST_TIMEOUT_MS
+    })
+  })
+
+  it('routes bulk archive to the owning profile and deduplicates preserved ids', async () => {
+    api.mockResolvedValue({ archived: 3, ok: true })
+
+    await bulkArchiveSessions(['pinned', 'pinned', 'running'], 'coder')
+
+    expect(api).toHaveBeenCalledWith({
+      body: { preserve_ids: ['pinned', 'running'], profile: 'coder' },
+      method: 'POST',
+      path: '/api/sessions/bulk-archive',
+      profile: 'coder'
+    })
+  })
+
+  it('carries the owning profile through both archive routing layers', async () => {
+    api.mockResolvedValue({ ok: true })
+
+    await setSessionArchived('session-1', true, 'default')
+
+    expect(api).toHaveBeenCalledWith({
+      body: { archived: true, profile: 'default' },
+      method: 'PATCH',
+      path: '/api/sessions/session-1',
+      profile: 'default'
+    })
+  })
+
+  it('carries the owning profile in delete routing and the REST query', async () => {
+    api.mockResolvedValue({ ok: true })
+
+    await deleteSession('session-1', 'default')
+
+    expect(api).toHaveBeenCalledWith({
+      method: 'DELETE',
+      path: '/api/sessions/session-1?profile=default',
+      profile: 'default'
     })
   })
 

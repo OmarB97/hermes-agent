@@ -6608,7 +6608,59 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"verification": {"status": "unknown", "evidence": None}})
 
 
-def _lazy_resume_info(cwd: str, *, model: str = "", provider: str = "") -> dict:
+def _stored_session_usage(stored: dict | None) -> dict:
+    """Project persisted usage into the same shape as ``_get_usage``.
+
+    A normal desktop resume deliberately returns before its deferred agent has
+    finished building. The session row already contains the last real context
+    occupancy, so returning it here keeps the context meter truthful and
+    immediate between turns instead of hiding it until the next prompt forces
+    the agent to build.
+    """
+
+    def _counter(key: str) -> int:
+        try:
+            return max(0, int((stored or {}).get(key) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    input_tokens = _counter("input_tokens")
+    output_tokens = _counter("output_tokens")
+    cache_read_tokens = _counter("cache_read_tokens")
+    cache_write_tokens = _counter("cache_write_tokens")
+    prompt_tokens = input_tokens + cache_read_tokens + cache_write_tokens
+    persisted_total = _counter("total_tokens")
+    context_used = _counter("last_prompt_tokens")
+    context_max = _counter("context_length")
+    usage = {
+        "model": str((stored or {}).get("model") or ""),
+        "input": input_tokens,
+        "output": output_tokens,
+        "reasoning": _counter("reasoning_tokens"),
+        "prompt": prompt_tokens,
+        "completion": output_tokens,
+        "total": persisted_total or prompt_tokens + output_tokens,
+        "calls": _counter("api_call_count"),
+        "compressions": _counter("compression_count"),
+    }
+
+    if context_used > 0 and context_max > 0:
+        usage["context_used"] = context_used
+        usage["context_max"] = context_max
+        usage["context_percent"] = max(
+            0, min(100, round(context_used / context_max * 100))
+        )
+
+    return usage
+
+
+def _lazy_resume_info(
+    cwd: str,
+    *,
+    model: str = "",
+    provider: str = "",
+    stored_session: dict | None = None,
+) -> dict:
     """session.info for a not-yet-built session (the shape session.create
     returns). tools/skills land later when the deferred build emits session.info."""
     info = {
@@ -6621,6 +6673,7 @@ def _lazy_resume_info(cwd: str, *, model: str = "", provider: str = "") -> dict:
         "lazy": True,
         "desktop_contract": DESKTOP_BACKEND_CONTRACT,
         "profile_name": _current_profile_name(),
+        "usage": _stored_session_usage(stored_session),
     }
     if provider:
         info["provider"] = provider
@@ -6860,7 +6913,7 @@ def _(rid, params: dict) -> dict:
                 "resumed": target,
                 "message_count": len(messages),
                 "messages": messages,
-                "info": _lazy_resume_info(cwd),
+                "info": _lazy_resume_info(cwd, stored_session=found),
                 "inflight": None,
                 "running": child_running,
                 "session_key": target,
@@ -6950,6 +7003,7 @@ def _(rid, params: dict) -> dict:
                     cwd,
                     model=model_override.get("model") or "",
                     provider=overrides.get("provider_override") or "",
+                    stored_session=found,
                 ),
                 "inflight": None,
                 "running": False,

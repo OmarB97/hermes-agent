@@ -12,8 +12,12 @@ export type GatewayRequester = ReturnType<typeof useGatewayRequest>['requestGate
 export type SidebarActions = Pick<
   ComponentProps<typeof ChatSidebar>,
   | 'onArchiveSession'
+  | 'onArchiveAllSessions'
+  | 'onArchiveSessions'
   | 'onBranchSession'
   | 'onDeleteSession'
+  | 'onDeleteSessions'
+  | 'onHaltSessions'
   | 'onLoadMoreMessaging'
   | 'onLoadMoreProfileSessions'
   | 'onLoadMoreSessions'
@@ -21,7 +25,9 @@ export type SidebarActions = Pick<
   | 'onNavigate'
   | 'onNewSessionInWorkspace'
   | 'onNewSessionSplit'
+  | 'onPromptSessions'
   | 'onResumeSession'
+  | 'onSteerSessions'
   | 'onTriggerCronJob'
 >
 

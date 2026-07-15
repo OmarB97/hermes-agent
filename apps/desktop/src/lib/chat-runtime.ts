@@ -5,6 +5,7 @@ import type { ClientSessionState, CommandDispatchResponse } from '@/app/types'
 import { formatRefValue } from '@/components/assistant-ui/directive-text'
 import { type ChatMessage, type ChatMessagePart, chatMessageText, textPart } from '@/lib/chat-messages'
 import { normalize } from '@/lib/text'
+import { emptyUsageStats } from '@/lib/token-usage'
 import type { ComposerAttachment } from '@/store/composer'
 import type { ModelOptionsResponse, SessionInfo } from '@/types/hermes'
 
@@ -39,6 +40,7 @@ export function createClientSessionState(
   return {
     storedSessionId,
     messages,
+    usage: emptyUsageStats(),
     branch: '',
     cwd: '',
     model: '',
@@ -57,8 +59,7 @@ export function createClientSessionState(
     interrupted: false,
     interimBoundaryPending: false,
     needsInput: false,
-    turnStartedAt: null,
-    usage: null
+    turnStartedAt: null
   }
 }
 

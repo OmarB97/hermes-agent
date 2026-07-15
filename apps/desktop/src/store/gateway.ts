@@ -235,6 +235,49 @@ export async function ensureGatewayForProfile(profile: string): Promise<void> {
   setActive(key)
 }
 
+/** Send work to a profile without changing the profile currently displayed in
+ * the window. Bulk session operations use this so several selected sessions
+ * can be prompted or stopped across pooled backends in one action. */
+export async function requestGatewayForProfile<T>(
+  profile: string,
+  method: string,
+  params: Record<string, unknown> = {}
+): Promise<T> {
+  const key = normKey(profile)
+
+  if (key === primaryProfile) {
+    if (!isOpen(primaryGateway)) {
+      throw new Error(`Hermes gateway unavailable for profile ${key}`)
+    }
+
+    return primaryGateway!.request<T>(method, params)
+  }
+
+  let entry = secondaries.get(key)
+
+  if (!entry) {
+    entry = createSecondary(key)
+  }
+
+  entry.wantOpen = true
+
+  if (!isOpen(entry.gateway)) {
+    clearTimer(entry)
+
+    try {
+      await openSecondary(entry)
+    } catch {
+      scheduleReconnect(entry)
+    }
+  }
+
+  if (!isOpen(entry.gateway)) {
+    throw new Error(`Hermes gateway unavailable for profile ${key}`)
+  }
+
+  return entry.gateway.request<T>(method, params)
+}
+
 // Reconnect the active gateway after a transient request failure. Primary
 // reconnects are owned by use-gateway-boot, so we only drive secondaries here.
 export async function ensureActiveGatewayOpen(): Promise<HermesGateway | null> {

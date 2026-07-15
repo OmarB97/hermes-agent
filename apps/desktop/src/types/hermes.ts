@@ -365,7 +365,10 @@ export interface SessionCreateResponse {
 }
 
 export interface SessionInfo {
+  api_call_count?: number
   archived?: boolean
+  compression_count?: number
+  context_length?: number
   cwd?: null | string
   /** Git branch checked out in {@link cwd} when the session started/resumed.
    *  The sidebar groups main-checkout sessions by this so feature-branch work
@@ -383,12 +386,17 @@ export interface SessionInfo {
    *  continuation tip. Stable across compressions — used as the durable id for
    *  pins so a pinned conversation survives auto-compression. */
   _lineage_root_id?: null | string
+  /** Every persisted session id in the compression chain, root through live
+   *  tip. Lets old pinned/search/selection ids resolve to the displayed row. */
+  _lineage_ids?: string[]
   input_tokens: number
   is_active: boolean
   last_active: number
+  last_prompt_tokens?: number
   message_count: number
   model: null | string
   output_tokens: number
+  total_tokens?: number
   /** Parent conversation when this row is a /branch fork. */
   parent_session_id?: null | string
   preview: null | string
@@ -499,6 +507,7 @@ export interface SessionRuntimeInfo {
 
 export interface UsageStats {
   calls: number
+  compressions?: number
   context_max?: number
   context_percent?: number
   context_used?: number

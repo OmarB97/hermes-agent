@@ -16,6 +16,7 @@ import {
   setCurrentProvider,
   setCurrentReasoningEffort,
   setCurrentServiceTier,
+  setCurrentUsage,
   setTurnStartedAt,
   setYoloActive
 } from '@/store/session'
@@ -63,6 +64,7 @@ function syncRuntimeMetadataToView(state: ClientSessionState) {
   setCurrentFastMode(state.fast ?? false)
   setYoloActive(state.yolo ?? false)
   setCurrentPersonality(state.personality ?? '')
+  setCurrentUsage(state.usage)
 }
 
 export function useSessionStateCache({

@@ -153,6 +153,7 @@ function StoredIdRotationHarness({
     ensureSessionState: () => ({}) as ClientSessionState,
     getRouteToken: () => 'token',
     getRoutedStoredSessionId,
+    hydrateTurnOutcomeState: vi.fn(),
     navigate: navigate as never,
     requestGateway: async () => ({}) as never,
     resetViewSync: vi.fn(),
@@ -860,30 +861,7 @@ describe('resumeSession failure recovery', () => {
       current: new Map([
         [
           'runtime-stale',
-          {
-            awaitingResponse: false,
-            branch: '',
-            busy: false,
-            cwd: '',
-            fallbackPolicy: '',
-            fast: false,
-            interimBoundaryPending: false,
-            interrupted: false,
-            messages: [],
-            model: '',
-            needsInput: false,
-            pendingBranchGroup: null,
-            personality: '',
-            provider: '',
-            reasoningEffort: '',
-            sawAssistantPayload: false,
-            serviceTier: '',
-            storedSessionId: 'stored-1',
-            streamId: null,
-            turnStartedAt: null,
-            usage: null,
-            yolo: false
-          }
+          createClientSessionState('stored-1')
         ]
       ])
     } satisfies MutableRefObject<Map<string, ClientSessionState>>

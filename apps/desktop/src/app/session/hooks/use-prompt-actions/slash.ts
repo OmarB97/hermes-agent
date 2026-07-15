@@ -33,10 +33,12 @@ import type { BrowserManageResponse, SessionTitleResponse, SlashExecResponse } f
 
 import {
   type GatewayRequest,
+  isSessionBusyError,
   isSessionIdCandidate,
   renderCommandsCatalog,
   slashStatusText,
-  type SubmitTextOptions
+  type SubmitTextOptions,
+  withSessionBusyRetry
 } from './utils'
 
 /** Everything a slash handler needs about the invocation it's serving. */
@@ -185,6 +187,62 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           }
 
           await submitPromptText(message)
+        }
+
+        // Manual compaction mutates the persisted transcript, so the backend
+        // correctly refuses it while a turn owns that history. Make the
+        // desktop command atomic from the user's point of view: interrupt the
+        // live turn, wait through the gateway's short running->idle settle
+        // edge, then dispatch compaction once. This keeps the backend's data-
+        // loss guard intact without making users manually run /interrupt and
+        // retry /compress themselves.
+        if (name === 'compress' || name === 'compact') {
+          let interruptRequested = false
+
+          const interrupt = async () => {
+            if (interruptRequested) {
+              return
+            }
+
+            interruptRequested = true
+            await requestGateway('session.interrupt', { session_id: sessionId }).catch(() => undefined)
+          }
+
+          const dispatchCompression = () =>
+            requestGateway<unknown>('command.dispatch', { session_id: sessionId, name, arg })
+
+          try {
+            if (busyRef.current) {
+              await interrupt()
+            }
+
+            let result: unknown
+
+            try {
+              result = await dispatchCompression()
+            } catch (err) {
+              if (!isSessionBusyError(err)) {
+                throw err
+              }
+
+              await interrupt()
+              result = await withSessionBusyRetry(dispatchCompression)
+            }
+
+            const dispatch = parseCommandDispatch(result)
+
+            if (!dispatch) {
+              renderSlashOutput('error: invalid response: command.dispatch')
+
+              return
+            }
+
+            await handleDispatch(dispatch)
+          } catch (err) {
+            renderSlashOutput(`error: ${err instanceof Error ? err.message : String(err)}`)
+          }
+
+          return
         }
 
         try {

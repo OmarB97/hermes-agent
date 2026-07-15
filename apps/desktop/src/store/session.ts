@@ -227,6 +227,9 @@ export const $connection = atom<HermesConnection | null>(null)
 export const $gatewayState = atom<ConnectionState>('idle')
 export const $sessions = atom<SessionInfo[]>([])
 export const $sessionsTotal = atom<number>(0)
+export const $archivedSessions = atom<SessionInfo[]>([])
+export const $archivedSessionsTotal = atom<number>(0)
+export const $archivedSessionsLoading = atom(false)
 // Cron-job sessions (source === 'cron') are fetched as their own list so the
 // scheduler's always-newest sessions never crowd recents out of the page
 // budget. Powers the collapsed "Cron jobs" sidebar section.
@@ -339,6 +342,9 @@ export const setConnection = (next: Updater<HermesConnection | null>) => updateA
 export const setGatewayState = (next: Updater<ConnectionState>) => updateAtom($gatewayState, next)
 export const setSessions = (next: Updater<SessionInfo[]>) => updateAtom($sessions, next)
 export const setSessionsTotal = (next: Updater<number>) => updateAtom($sessionsTotal, next)
+export const setArchivedSessions = (next: Updater<SessionInfo[]>) => updateAtom($archivedSessions, next)
+export const setArchivedSessionsTotal = (next: Updater<number>) => updateAtom($archivedSessionsTotal, next)
+export const setArchivedSessionsLoading = (next: Updater<boolean>) => updateAtom($archivedSessionsLoading, next)
 export const setCronSessions = (next: Updater<SessionInfo[]>) => updateAtom($cronSessions, next)
 export const setMessagingSessions = (next: Updater<SessionInfo[]>) => updateAtom($messagingSessions, next)
 export const setMessagingPlatformTotals = (next: Updater<Record<string, number>>) =>
@@ -346,6 +352,26 @@ export const setMessagingPlatformTotals = (next: Updater<Record<string, number>>
 export const setMessagingTruncated = (next: Updater<boolean>) => updateAtom($messagingTruncated, next)
 export const setSessionProfileTotals = (next: Updater<Record<string, number>>) =>
   updateAtom($sessionProfileTotals, next)
+export const adjustSessionProfileTotal = (profileKey: string, delta: number) => {
+  const current = $sessionProfileTotals.get()
+
+  if (profileKey in current) {
+    $sessionProfileTotals.set({
+      ...current,
+      [profileKey]: Math.max(0, (current[profileKey] ?? 0) + delta)
+    })
+  }
+}
+export const adjustMessagingPlatformTotal = (sourceId: string, delta: number) => {
+  const current = $messagingPlatformTotals.get()
+
+  if (sourceId in current) {
+    $messagingPlatformTotals.set({
+      ...current,
+      [sourceId]: Math.max(0, (current[sourceId] ?? 0) + delta)
+    })
+  }
+}
 export const setSessionsLoading = (next: Updater<boolean>) => updateAtom($sessionsLoading, next)
 export const setActiveSessionId = (next: Updater<string | null>) => updateAtom($activeSessionId, next)
 export const setActiveSessionStoredIdRotation = (next: Updater<ActiveSessionStoredIdRotation | null>) =>

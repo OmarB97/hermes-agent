@@ -10708,12 +10708,58 @@ def _session_latest_descendant(session_id: str, db):
 # templated ``/api/sessions/{session_id}`` family that follows. FastAPI/
 # Starlette match routes in registration order, and the ``{session_id}``
 # pattern is unconstrained — it would otherwise swallow e.g.
-# ``DELETE /api/sessions/empty``, ``POST /api/sessions/bulk-delete``, or
+# ``DELETE /api/sessions/empty``, ``POST /api/sessions/bulk-delete``,
+# ``POST /api/sessions/bulk-archive``, or
 # ``GET /api/sessions/stats`` as "operate on the session with id
 # 'empty'" / "'bulk-delete'" / "'stats'", which would 404 (or worse,
 # succeed and delete the wrong row). Same story as the older
 # ``/api/sessions/search`` endpoint up at line ~1191. If you split or
 # reorder this block, move every route in it together.
+class BulkArchiveSessions(BaseModel):
+    preserve_ids: Optional[List[str]] = None
+    min_messages: Optional[int] = 1
+    active_grace_seconds: Optional[int] = None
+    profile: Optional[str] = None
+
+
+@app.post("/api/sessions/bulk-archive")
+async def bulk_archive_sessions_endpoint(body: BulkArchiveSessions):
+    """Archive surfaced conversations while preserving pins/live rows."""
+    preserve_ids = [
+        str(sid).strip()
+        for sid in (body.preserve_ids or [])
+        if str(sid).strip()
+    ]
+    if len(preserve_ids) > 5000:
+        raise HTTPException(
+            status_code=400,
+            detail="preserve_ids must contain at most 5000 entries",
+        )
+    cfg = load_config().get("sessions") or {}
+    grace = (
+        body.active_grace_seconds
+        if body.active_grace_seconds is not None
+        else cfg.get("auto_archive_active_grace_seconds", 300)
+    )
+
+    def _archive() -> int:
+        db = _open_session_db_for_profile(body.profile)
+        try:
+            return db.archive_surfaced_sessions(
+                preserve_ids=preserve_ids,
+                min_message_count=max(
+                    0,
+                    int(body.min_messages if body.min_messages is not None else 1),
+                ),
+                active_grace_seconds=max(0, int(grace or 0)),
+            )
+        finally:
+            db.close()
+
+    archived = await asyncio.to_thread(_archive)
+    return {"ok": True, "archived": archived}
+
+
 class BulkDeleteSessions(BaseModel):
     ids: List[str]
     profile: Optional[str] = None

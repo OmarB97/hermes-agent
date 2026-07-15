@@ -1338,6 +1338,15 @@ export interface Translations {
     showSessions: string
     groupTitleGrouped: string
     groupTitleUngrouped: string
+    archiveAllTitle: string
+    archiveAllAria: string
+    archiveAllDialogTitle: string
+    archiveAllDialogDesc: string
+    archiveAllConfirm: string
+    archiveAllSubmitting: string
+    archiveAllChecked: (count: number) => string
+    archiveAllSucceeded: (count: number) => string
+    archiveAllFailed: string
     allPinned: string
     shiftClickHint: string
     noWorkspace: string
@@ -1409,6 +1418,47 @@ export interface Translations {
     loading: string
     loadMore: string
     loadCount: (step: number) => string
+    bulk: {
+      selectedCount: (count: number) => string
+      pin: string
+      unpin: string
+      prompt: string
+      steer: string
+      halt: string
+      archive: string
+      restore: string
+      delete: string
+      promptCount: (count: number) => string
+      steerCount: (count: number) => string
+      haltCount: (count: number) => string
+      archiveCount: (count: number) => string
+      restoreCount: (count: number) => string
+      deleteCount: (count: number) => string
+      promptDialogTitle: (count: number) => string
+      promptDialogDesc: string
+      promptPlaceholder: string
+      promptSubmit: string
+      steerDialogTitle: (count: number) => string
+      steerDialogDesc: string
+      steerPlaceholder: string
+      steerSubmit: string
+      clearSelection: string
+      deleteDialogTitle: (count: number) => string
+      deleteDialogDesc: string
+      deleteConfirm: string
+      archivedToast: (count: number) => string
+      restoredToast: (count: number) => string
+      deletedToast: (count: number) => string
+      archiveFailed: (count: number) => string
+      restoreFailed: (count: number) => string
+      deleteFailed: (count: number) => string
+      promptedToast: (count: number) => string
+      steeredToast: (count: number) => string
+      haltedToast: (count: number) => string
+      promptFailed: (count: number) => string
+      steerFailed: (count: number) => string
+      haltFailed: (count: number) => string
+    }
     row: {
       pin: string
       unpin: string

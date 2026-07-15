@@ -337,7 +337,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     }
   }, [activeSessionIdRef, busyRef, selectedStoredSessionIdRef, updateSessionState])
 
-  const { handleGatewayEvent } = useMessageStream({
+  const { handleGatewayEvent, hydrateTurnOutcomeState } = useMessageStream({
     activeSessionIdRef,
     hydrateFromStoredSession,
     queryClient,
@@ -378,14 +378,20 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   }, [restartPreviewServer])
 
   const {
+    archiveAllSessions,
     archiveSession,
+    archiveSessionsBulk,
     branchCurrentSession,
     branchStoredSession,
     createBackendSessionForSend,
+    deleteSessionsBulk,
+    haltSessionsBulk,
     openNewSessionTile,
+    promptSessionsBulk,
     removeSession,
     resumeSession,
     selectSidebarItem,
+    steerSessionsBulk,
     startFreshSessionDraft
   } = useSessionActions({
     activeSessionId,
@@ -395,6 +401,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     ensureSessionState,
     getRouteToken,
     getRoutedStoredSessionId,
+    hydrateTurnOutcomeState,
     navigate,
     onFreshDraftRouteIntent: clearRoutedSessionIntent,
     requestGateway,
@@ -720,6 +727,10 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     onAddContextRef: composer.addContextRefAttachment,
     onAddUrl: url => composer.addContextRefAttachment(`@url:${formatRefValue(url)}`, url),
     onArchiveSession: sessionId => void archiveSession(sessionId),
+    onArchiveAllSessions: async () => {
+      await archiveAllSessions()
+    },
+    onArchiveSessions: sessionIds => archiveSessionsBulk(sessionIds),
     onAttachDroppedItems: composer.attachDroppedItems,
     onAttachImageBlob: composer.attachImageBlob,
     onBranchInNewChat: messageId => void branchInNewChat(messageId),
@@ -733,8 +744,10 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       }
     },
     onDeleteSession: sessionId => void removeSession(sessionId),
+    onDeleteSessions: sessionIds => deleteSessionsBulk(sessionIds),
     onDismissError: dismissError,
     onEdit: editMessage,
+    onHaltSessions: sessionIds => haltSessionsBulk(sessionIds),
     onLoadMoreMessaging: loadMoreMessagingForPlatform,
     onLoadMoreProfileSessions: loadMoreSessionsForProfile,
     onLoadMoreSessions: loadMoreSessions,
@@ -749,6 +762,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     onPickFiles: () => void composer.pickContextPaths('file'),
     onPickFolders: () => void composer.pickContextPaths('folder'),
     onPickImages: () => void composer.pickImages(),
+    onPromptSessions: (sessionIds, text) => promptSessionsBulk(sessionIds, text),
     onReload: reloadFromMessage,
     onRemoveAttachment: id => void composer.removeAttachment(id),
     onRestoreToMessage: restoreToMessage,
@@ -759,6 +773,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         navigate(sessionRoute(sessionId))
       }
     },
+    onSteerSessions: (sessionIds, text) => steerSessionsBulk(sessionIds, text),
     onRetryResume: sessionId => void resumeSession(sessionId, true),
     onSteer: steerPrompt,
     onSubmit: submitText,

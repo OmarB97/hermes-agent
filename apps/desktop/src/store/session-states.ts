@@ -107,6 +107,12 @@ function markSettled(storedId: string) {
   settledExpiry.set(storedId, Date.now() + SESSION_SETTLE_GRACE_MS)
 }
 
+export function shieldSessionFromMerge(storedId: string) {
+  if (storedId) {
+    markSettled(storedId)
+  }
+}
+
 function clearSettled(storedId: string) {
   settledExpiry.delete(storedId)
 }

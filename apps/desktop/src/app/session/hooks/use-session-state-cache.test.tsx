@@ -12,6 +12,7 @@ import {
   $currentProvider,
   $currentReasoningEffort,
   $currentServiceTier,
+  $currentUsage,
   $messages,
   $turnStartedAt,
   setActiveSessionId,
@@ -22,6 +23,7 @@ import {
   setCurrentProvider,
   setCurrentReasoningEffort,
   setCurrentServiceTier,
+  setCurrentUsage,
   setTurnStartedAt
 } from '@/store/session'
 
@@ -123,6 +125,7 @@ describe('useSessionStateCache — per-session turn timer', () => {
     setCurrentServiceTier('')
     setCurrentFastMode(false)
     setCurrentFallbackPolicy('')
+    setCurrentUsage({ calls: 0, input: 0, output: 0, total: 0 })
   })
 
   afterEach(() => {
@@ -135,6 +138,7 @@ describe('useSessionStateCache — per-session turn timer', () => {
     setCurrentServiceTier('')
     setCurrentFastMode(false)
     setCurrentFallbackPolicy('')
+    setCurrentUsage({ calls: 0, input: 0, output: 0, total: 0 })
   })
 
   it("keeps a background session's running turn clock and never mirrors it to the view", () => {
@@ -283,6 +287,63 @@ describe('useSessionStateCache — per-session turn timer', () => {
     expect($currentServiceTier.get()).toBe('')
     expect($currentFastMode.get()).toBe(false)
     expect($currentFallbackPolicy.get()).toBe('')
+  })
+
+  it('switches the context meter immediately to the newly focused cached session', () => {
+    let cache!: Cache
+
+    const { rerender } = render(
+      <Harness activeSessionId="session-a" onReady={c => (cache = c)} selectedStoredSessionId="stored-a" />
+    )
+
+    act(() => {
+      cache.updateSessionState(
+        'session-a',
+        state => ({
+          ...state,
+          usage: { ...state.usage, context_max: 100_000, context_percent: 72, context_used: 72_000 }
+        }),
+        'stored-a'
+      )
+      cache.updateSessionState(
+        'session-b',
+        state => ({
+          ...state,
+          usage: { ...state.usage, context_max: 100_000, context_percent: 18, context_used: 18_000 }
+        }),
+        'stored-b'
+      )
+    })
+
+    expect($currentUsage.get().context_percent).toBe(72)
+
+    rerender(<Harness activeSessionId="session-b" onReady={c => (cache = c)} selectedStoredSessionId="stored-b" />)
+    const sessionB = cache.sessionStateByRuntimeIdRef.current.get('session-b')
+
+    act(() => cache.syncSessionStateToView('session-b', sessionB!))
+
+    expect($currentUsage.get()).toMatchObject({ context_percent: 18, context_used: 18_000 })
+  })
+
+  it('keeps a background session usage update out of the focused context meter', () => {
+    let cache!: Cache
+    render(<Harness activeSessionId="session-a" onReady={c => (cache = c)} selectedStoredSessionId="stored-a" />)
+
+    act(() => {
+      cache.updateSessionState(
+        'session-a',
+        state => ({ ...state, usage: { ...state.usage, context_percent: 42, context_used: 42_000 } }),
+        'stored-a'
+      )
+      cache.updateSessionState(
+        'session-b',
+        state => ({ ...state, usage: { ...state.usage, context_percent: 91, context_used: 91_000 } }),
+        'stored-b'
+      )
+    })
+
+    expect(cache.sessionStateByRuntimeIdRef.current.get('session-b')?.usage.context_percent).toBe(91)
+    expect($currentUsage.get().context_percent).toBe(42)
   })
 })
 
