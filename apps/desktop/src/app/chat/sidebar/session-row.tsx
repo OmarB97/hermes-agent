@@ -108,29 +108,6 @@ export function SidebarSessionRow({
         // (`ref`/`style`) and the virtualizer's measured element (`...rest`).
         className={cn(dragging && 'relative z-10')}
         data-session-id={session.id}
-        draggable
-        onDragEnd={() => onSessionDragEnd?.()}
-        onDragStart={event => {
-          // Reorder drags belong to dnd-kit (the grab handle) — cancel the
-          // native drag so the two DnD systems don't fight. Everything else is a
-          // pin/unpin/reorder drag the Pinned and Sessions sections accept.
-          if ((event.target as HTMLElement).closest('[data-reorder-handle]')) {
-            event.preventDefault()
-
-            return
-          }
-
-          const payload: SessionDragPayload = {
-            id: session.id,
-            pinId: sessionPinId(session),
-            pinned: isPinned,
-            profile: session.profile || 'default',
-            title
-          }
-
-          writeSessionDrag(event.dataTransfer, payload)
-          onSessionDragStart?.(payload)
-        }}
         ref={ref}
         style={style}
         {...rest}
@@ -180,6 +157,8 @@ export function SidebarSessionRow({
             {isWorking && !needsInput && <span aria-hidden="true" className="arc-border" />}
             <SidebarRowBody
               className={cn('z-0 group-hover:pr-12', branchStem && 'pl-3.5')}
+              data-session-row-main
+              draggable
               onClick={event => {
                 if (event.shiftKey) {
                   event.preventDefault()
@@ -204,6 +183,27 @@ export function SidebarSessionRow({
                 }
 
                 onResume()
+              }}
+              onDragEnd={event => {
+                // The row button is the concrete native drag source. Keeping
+                // this lifecycle off the sortable wrapper avoids Electron's
+                // packaged-app failure to promote a nested button drag to its
+                // draggable ancestor.
+                event.stopPropagation()
+                onSessionDragEnd?.()
+              }}
+              onDragStart={event => {
+                const payload: SessionDragPayload = {
+                  id: session.id,
+                  pinId: sessionPinId(session),
+                  pinned: isPinned,
+                  profile: session.profile || 'default',
+                  title
+                }
+
+                writeSessionDrag(event.dataTransfer, payload)
+                event.stopPropagation()
+                onSessionDragStart?.(payload)
               }}
             >
               {reorderable ? (
