@@ -8,7 +8,7 @@ import {
   rectIntersection
 } from '@dnd-kit/core'
 import { arrayMove } from '@dnd-kit/sortable'
-import { useCallback, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import type { SessionInfo } from '@/hermes'
 import {
@@ -108,6 +108,27 @@ export function useSharedSessionDnd({
   const [drag, setDrag] = useState<null | SharedSessionDrag>(null)
   const dragRef = useRef<null | SharedSessionDrag>(null)
   const pointerYRef = useRef<null | number>(null)
+  const releasedRef = useRef(false)
+
+  useEffect(() => {
+    const markReleased = () => {
+      releasedRef.current = true
+    }
+
+    // Electron can cancel a dnd-kit drag after the physical release when the
+    // animated preview has moved the last collision target away. Remember the
+    // release in capture phase so that cancellation can still commit the exact
+    // list the user was visibly holding.
+    window.addEventListener('pointerup', markReleased, true)
+    window.addEventListener('mouseup', markReleased, true)
+    window.addEventListener('touchend', markReleased, true)
+
+    return () => {
+      window.removeEventListener('pointerup', markReleased, true)
+      window.removeEventListener('mouseup', markReleased, true)
+      window.removeEventListener('touchend', markReleased, true)
+    }
+  }, [])
 
   const commitDrag = useCallback((next: null | SharedSessionDrag) => {
     dragRef.current = next
@@ -203,6 +224,7 @@ export function useSharedSessionDnd({
         return
       }
 
+      releasedRef.current = false
       commitDrag({ activeId, from, pinned: [...basePinnedIds], sessions: [...baseSessionIds] })
     },
     [basePinnedIds, baseSessionIds, commitDrag, containerForId, enabled]
@@ -237,69 +259,76 @@ export function useSharedSessionDnd({
     [commitDrag, containerForId]
   )
 
-  const onDragCancel = useCallback(() => commitDrag(null), [commitDrag])
+  const commitSettledDrag = useCallback(() => {
+    const settled = dragRef.current
 
-  const onDragEnd = useCallback(
-    () => {
-      const settled = dragRef.current
+    commitDrag(null)
 
-      commitDrag(null)
+    if (!settled) {
+      return
+    }
 
-      if (!settled) {
-        return
-      }
+    // The rendered working lists are the authoritative drop preview. At
+    // release dnd-kit can report `over: null` because the animated preview
+    // moved the row out from under the pointer. Requiring a final `over`
+    // recreates the historical snap-back bug, so persist what the user was
+    // visibly holding instead of recomputing from the release frame.
+    // Translate visible live ids back to durable lineage-root ids while
+    // preserving unloaded pins in their original slots.
+    const reorderedVisiblePins = settled.pinned.map(id => {
+      const session = sessionForId(id)
 
-      // The rendered working lists are the authoritative drop preview. At
-      // release dnd-kit can report `over: null` because the animated preview
-      // moved the row out from under the pointer. Requiring a final `over`
-      // recreates the historical snap-back bug, so persist what the user was
-      // visibly holding instead of recomputing from the release frame.
-      // Translate visible live ids back to durable lineage-root ids while
-      // preserving unloaded pins in their original slots.
-      const reorderedVisiblePins = settled.pinned.map(id => {
-        const session = sessionForId(id)
+      return session ? sessionPinId(session) : id
+    })
 
-        return session ? sessionPinId(session) : id
-      })
+    const baseVisiblePins = new Set(pinnedSessions.map(sessionPinId))
+    const nextPinnedIds: string[] = []
+    let visibleIndex = 0
 
-      const baseVisiblePins = new Set(pinnedSessions.map(sessionPinId))
-      const nextPinnedIds: string[] = []
-      let visibleIndex = 0
+    for (const pinId of pinnedSessionIds) {
+      if (baseVisiblePins.has(pinId)) {
+        const replacement = reorderedVisiblePins[visibleIndex]
 
-      for (const pinId of pinnedSessionIds) {
-        if (baseVisiblePins.has(pinId)) {
-          const replacement = reorderedVisiblePins[visibleIndex]
-
-          if (replacement) {
-            nextPinnedIds.push(replacement)
-            visibleIndex += 1
-          }
-        } else {
-          nextPinnedIds.push(pinId)
+        if (replacement) {
+          nextPinnedIds.push(replacement)
+          visibleIndex += 1
         }
+      } else {
+        nextPinnedIds.push(pinId)
       }
+    }
 
-      nextPinnedIds.push(...reorderedVisiblePins.slice(visibleIndex))
+    nextPinnedIds.push(...reorderedVisiblePins.slice(visibleIndex))
 
-      const dedupedPinnedIds = nextPinnedIds.filter((id, index, all) => all.indexOf(id) === index)
+    const dedupedPinnedIds = nextPinnedIds.filter((id, index, all) => all.indexOf(id) === index)
 
-      if (!sameIds(dedupedPinnedIds, pinnedSessionIds)) {
-        $pinnedSessionIds.set(dedupedPinnedIds)
-      }
+    if (!sameIds(dedupedPinnedIds, pinnedSessionIds)) {
+      $pinnedSessionIds.set(dedupedPinnedIds)
+    }
 
-      if (!sameIds(settled.sessions, baseSessionIds)) {
-        setSidebarSessionOrderManual(true)
-        setSidebarSessionOrderIds(settled.sessions)
-      }
+    if (!sameIds(settled.sessions, baseSessionIds)) {
+      setSidebarSessionOrderManual(true)
+      setSidebarSessionOrderIds(settled.sessions)
+    }
 
-      if (settled.pinned.includes(settled.activeId)) {
-        setSidebarPinsOpen(true)
-      } else if (settled.sessions.includes(settled.activeId)) {
-        setSidebarRecentsOpen(true)
-      }
-    },
-    [baseSessionIds, commitDrag, pinnedSessionIds, pinnedSessions, sessionForId]
-  )
+    if (settled.pinned.includes(settled.activeId)) {
+      setSidebarPinsOpen(true)
+    } else if (settled.sessions.includes(settled.activeId)) {
+      setSidebarRecentsOpen(true)
+    }
+  }, [baseSessionIds, commitDrag, pinnedSessionIds, pinnedSessions, sessionForId])
+
+  const onDragCancel = useCallback(() => {
+    if (releasedRef.current) {
+      commitSettledDrag()
+
+      return
+    }
+
+    commitDrag(null)
+  }, [commitDrag, commitSettledDrag])
+
+  const onDragEnd = useCallback(() => commitSettledDrag(), [commitSettledDrag])
 
   return {
     activeId: drag?.activeId ?? null,
