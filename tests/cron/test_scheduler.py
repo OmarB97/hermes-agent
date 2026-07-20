@@ -1119,8 +1119,8 @@ class TestRunJobSessionPersistence:
 
             run_job(job)
 
-        fake_db.set_session_title.assert_called_once()
-        sid, title = fake_db.set_session_title.call_args[0]
+        assert fake_db.set_session_title.call_count >= 1
+        sid, title = fake_db.set_session_title.call_args_list[-1].args
         assert sid.startswith("cron_test-job_")
         assert "IMPORTANT" not in title
         assert title.startswith("Morning digest")

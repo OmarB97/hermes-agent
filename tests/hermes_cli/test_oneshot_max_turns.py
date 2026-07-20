@@ -119,7 +119,9 @@ class TestRunAgentPassesMaxIterationsToAgent:
             },
         )
         monkeypatch.setattr(tc_mod, "_get_platform_tools", lambda *a, **k: set())
-        monkeypatch.setattr(oneshot_mod, "get_fallback_chain", lambda *a, **k: [])
+        monkeypatch.setattr(
+            oneshot_mod, "get_configured_fallback_chain", lambda *a, **k: []
+        )
         monkeypatch.setattr(
             oneshot_mod, "_create_session_db_for_oneshot", lambda: None
         )
