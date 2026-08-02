@@ -7,6 +7,8 @@ kills during long prefill phases.
 """
 
 import os
+import textwrap
+
 import pytest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -677,17 +679,40 @@ class TestLocalDflashStaleTimeout:
     @pytest.mark.parametrize(
         ("estimated_tokens", "expected_timeout"),
         [
-            (10_000, 180.0),
-            (10_001, 180.0),
-            (25_000, 180.0),
-            (25_001, 180.0),
-            (50_000, 180.0),
-            (50_001, 240.0),
-            (100_000, 240.0),
-            (100_001, 300.0),
+            # These numbers are 180s (the family base) + 4s per 1k prompt
+            # tokens, rounded — NOT a re-freeze of a step function.
+            #
+            # They replace the old ladder (180/180/180/180/180/240/240/300 at
+            # these same token counts), which this test used to pin exactly.
+            # That ladder was the production defect: a local DFlash lane serving
+            # ~95k tokens got its 240s bucket and had three healthy prefills
+            # killed mid-flight (agent.log 2026-08-02: 240s @ 94,829 tokens,
+            # 240s @ 88,614, 180s @ 32,854). Its 300s cap also meant a 200k
+            # turn on a 262k-window model was budgeted the same as a 100k one.
+            #
+            # Why THIS number is right rather than a wider one: 4s/1k is the
+            # measured uncached prefill rate for this family, so the budget now
+            # tracks the one thing that actually scales with a bigger prompt.
+            # The cold-start allowance is deliberately absent here — that is a
+            # measurement of one specific llama-swap deployment and stays gated
+            # to the managed W2 route (see
+            # test_managed_local_w2_timeout_floor_is_route_and_model_specific).
+            # So every value below is strictly wider than the ladder's, and
+            # never wider than base + real prefill cost.
+            (10_000, 220.0),
+            (10_001, 220.0),
+            (25_000, 280.0),
+            (25_001, 280.0),
+            (50_000, 380.0),
+            (50_001, 380.0),
+            (100_000, 580.0),
+            (100_001, 580.0),
+            # Above the old 300s cap the budget keeps growing instead of
+            # flat-lining. This row is the cap's headstone.
+            (200_000, 980.0),
         ],
     )
-    def test_default_dflash_stale_timeout_threshold_boundaries(
+    def test_default_dflash_stale_timeout_scales_continuously_with_context(
         self,
         monkeypatch,
         estimated_tokens,
@@ -695,6 +720,8 @@ class TestLocalDflashStaleTimeout:
     ):
         monkeypatch.delenv("HERMES_DFLASH_STALE_TIMEOUT", raising=False)
         monkeypatch.delenv("HERMES_DFLASH_STREAM_STALE_TIMEOUT", raising=False)
+        monkeypatch.delenv("HERMES_DFLASH_PREFILL_SECONDS_PER_1K", raising=False)
+        monkeypatch.delenv("HERMES_DFLASH_FIRST_CHUNK_CEILING", raising=False)
 
         timeout = _dflash_local_stale_timeout(
             self._payload_for_estimated_tokens(estimated_tokens),
@@ -702,6 +729,55 @@ class TestLocalDflashStaleTimeout:
         )
 
         assert timeout == expected_timeout
+
+    def test_default_dflash_stale_timeout_has_no_cliffs(self, monkeypatch):
+        """The old ladder jumped 60s across a single token at 50k and 100k."""
+        monkeypatch.delenv("HERMES_DFLASH_STALE_TIMEOUT", raising=False)
+        monkeypatch.delenv("HERMES_DFLASH_STREAM_STALE_TIMEOUT", raising=False)
+        monkeypatch.delenv("HERMES_DFLASH_PREFILL_SECONDS_PER_1K", raising=False)
+
+        def budget(tokens):
+            return _dflash_local_stale_timeout(
+                self._payload_for_estimated_tokens(tokens),
+                "deepseek-v4-flash-iq3xxs",
+            )
+
+        for cliff in (10_000, 25_000, 50_000, 100_000):
+            assert budget(cliff + 1) - budget(cliff) < 1.0, (
+                f"budget still has a cliff at {cliff:,} tokens"
+            )
+
+        sizes = [0, 1_000, 10_000, 50_000, 94_829, 131_072, 200_000]
+        budgets = [budget(n) for n in sizes]
+        assert budgets == sorted(budgets), f"budget is not monotonic: {budgets}"
+
+    def test_dflash_stale_timeout_is_bounded_by_the_ceiling(self, monkeypatch):
+        """Context scaling must not turn the watchdog off for a huge prompt."""
+        monkeypatch.delenv("HERMES_DFLASH_STALE_TIMEOUT", raising=False)
+        monkeypatch.delenv("HERMES_DFLASH_STREAM_STALE_TIMEOUT", raising=False)
+        monkeypatch.delenv("HERMES_DFLASH_PREFILL_SECONDS_PER_1K", raising=False)
+        monkeypatch.setenv("HERMES_DFLASH_FIRST_CHUNK_CEILING", "600")
+
+        assert _dflash_local_stale_timeout(
+            self._payload_for_estimated_tokens(1_000_000),
+            "deepseek-v4-flash-iq3xxs",
+        ) == 600.0
+
+    def test_legacy_dflash_stale_env_is_widened_never_narrowed(self, monkeypatch):
+        """A pinned legacy value is the FLOOR, matching the old ladder's max()."""
+        monkeypatch.setenv("HERMES_DFLASH_STALE_TIMEOUT", "900")
+        monkeypatch.delenv("HERMES_DFLASH_STREAM_STALE_TIMEOUT", raising=False)
+        monkeypatch.delenv("HERMES_DFLASH_PREFILL_SECONDS_PER_1K", raising=False)
+        monkeypatch.delenv("HERMES_DFLASH_FIRST_CHUNK_CEILING", raising=False)
+
+        assert _dflash_local_stale_timeout(
+            self._payload_for_estimated_tokens(0),
+            "deepseek-v4-flash-iq3xxs",
+        ) == 900.0
+        assert _dflash_local_stale_timeout(
+            self._payload_for_estimated_tokens(100_000),
+            "deepseek-v4-flash-iq3xxs",
+        ) == 1300.0
 
     def test_non_positive_dflash_stale_timeout_disables_watchdog(self, monkeypatch):
         monkeypatch.setenv("HERMES_DFLASH_STALE_TIMEOUT", "0")
@@ -1107,4 +1183,178 @@ class TestRuntimeFirstChunkBudgetIsReachable:
                 self._Agent(), self._kwargs(90_700)
             )
             == 45.0
+        )
+
+
+class TestFirstChunkBudgetThroughRealProviderResolution:
+    """Resolve the provider the way runtime does, instead of stubbing it.
+
+    ``TestRuntimeFirstChunkBudgetIsReachable`` above sets ``provider =
+    "ai-router"`` straight onto a fake agent. Runtime never looks like that:
+    ``resolve_runtime_provider(requested="ai-router")`` returns the bare
+    billing class ``"custom"`` for EVERY user-declared endpoint, so
+    ``agent.provider`` is ``"custom"`` in production. Stubbing the provider is
+    what let this bug hide — with the real value, ``_is_managed_local_w2_route``
+    is False even on the lane its allowlist was written for, so the managed-W2
+    branch (and the context-scaled budget behind it) never ran in production
+    and every real local DFlash turn fell through to the step ladder.
+
+    These tests build through the real resolver so that gap cannot reopen.
+    """
+
+    @staticmethod
+    def _agent(monkeypatch, tmp_path, *, requested, model, config_body):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / ".env").write_text("", encoding="utf-8")
+        (tmp_path / "config.yaml").write_text(
+            textwrap.dedent(config_body), encoding="utf-8"
+        )
+        for var in (
+            "HERMES_STREAM_STALE_TIMEOUT",
+            "HERMES_DFLASH_STALE_TIMEOUT",
+            "HERMES_DFLASH_STREAM_STALE_TIMEOUT",
+            "HERMES_DFLASH_FIRST_CHUNK_TIMEOUT",
+            "HERMES_DFLASH_TTFB_TIMEOUT",
+            "HERMES_DFLASH_PREFILL_SECONDS_PER_1K",
+            "HERMES_DFLASH_COLD_START_ALLOWANCE",
+            "HERMES_DFLASH_FIRST_CHUNK_CEILING",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        from run_agent import AIAgent
+
+        resolved = resolve_runtime_provider(requested=requested)
+        with patch(
+            "agent.context_compressor.get_model_context_length",
+            return_value=262_144,
+        ):
+            return AIAgent(
+                api_key=resolved.get("api_key") or "sk-dummy",
+                base_url=resolved["base_url"],
+                provider=resolved["provider"],
+                api_mode=resolved.get("api_mode"),
+                model=model,
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                platform="cli",
+            )
+
+    @staticmethod
+    def _payload(model: str, tokens: int) -> dict:
+        return {
+            "model": model,
+            "messages": [{"role": "user", "content": "x" * (tokens * 4)}],
+        }
+
+    def test_declared_endpoint_resolves_to_the_bare_custom_billing_class(
+        self, monkeypatch, tmp_path
+    ):
+        """The premise the stubbed tests got wrong, pinned as a fact."""
+        agent = self._agent(
+            monkeypatch,
+            tmp_path,
+            requested="ai-router",
+            model="deepseek-v4-flash-w2",
+            config_body="""\
+            providers:
+              ai-router:
+                api: "http://10.10.20.199:9081/v1"
+            """,
+        )
+
+        assert agent.provider == "custom"
+        assert _is_managed_local_w2_route(agent, "deepseek-v4-flash-w2") is False
+
+    def test_real_resolution_still_gets_a_context_scaled_first_chunk_budget(
+        self, monkeypatch, tmp_path
+    ):
+        """The managed-W2 floor is unreachable here; the budget must not be.
+
+        With the real provider value the 360s floor and the cold-start
+        allowance do not apply (they stay gated to the W2 route by design).
+        What must apply is the context-scaled prefill term — otherwise this
+        lane gets a flat 240s for a 90.7k-token prompt, which is the bug.
+        """
+        agent = self._agent(
+            monkeypatch,
+            tmp_path,
+            requested="ai-router",
+            model="deepseek-v4-flash-w2",
+            config_body="""\
+            providers:
+              ai-router:
+                api: "http://10.10.20.199:9081/v1"
+            """,
+        )
+        payload = self._payload("deepseek-v4-flash-w2", 90_700)
+
+        # 180s base + 4s/1k * 90.7k = 542.8s, rounded. The old ladder gave 240.
+        assert resolve_dflash_local_first_chunk_timeout(agent, payload) == 543.0
+        assert resolve_stream_stale_timeout(agent, payload) == 543.0
+
+    def test_production_repro_ds4_lane_at_94829_tokens(self, monkeypatch, tmp_path):
+        """The exact turn from agent.log 2026-08-02 09:43:11.
+
+        ``Local dflash stream produced no first chunk for 240s (threshold 240s).
+        model=deepseek-v4-flash-0731-ds4 context=~94,829 tokens. Killing
+        connection.`` — a healthy prefill on a ~240 tok/s lane needs ~8 minutes
+        at that size, so 240s killed it three times over. The budget must now
+        comfortably clear a real 8-minute prefill.
+        """
+        agent = self._agent(
+            monkeypatch,
+            tmp_path,
+            requested="ds4",
+            model="deepseek-v4-flash-0731-ds4",
+            config_body="""\
+            providers:
+              ds4:
+                api: "http://10.10.20.211:8080/v1"
+            """,
+        )
+        payload = self._payload("deepseek-v4-flash-0731-ds4", 94_829)
+
+        budget = resolve_dflash_local_first_chunk_timeout(agent, payload)
+        assert budget > 480.0, (
+            f"first-chunk budget is {budget}s — an 8-minute healthy prefill at "
+            "94,829 tokens would still be killed"
+        )
+        assert budget == 559.0
+
+    def test_declared_first_chunk_timeout_wins_over_everything(
+        self, monkeypatch, tmp_path
+    ):
+        """The dedicated knob outranks stale_timeout_seconds and the env hatch.
+
+        Per-model beats per-provider, and both beat
+        ``HERMES_DFLASH_FIRST_CHUNK_TIMEOUT``. The two phases stay independent:
+        stale_timeout_seconds still governs the gap BETWEEN chunks.
+        """
+        agent = self._agent(
+            monkeypatch,
+            tmp_path,
+            requested="ds4",
+            model="deepseek-v4-flash-0731-ds4",
+            config_body="""\
+            providers:
+              ds4:
+                api: "http://10.10.20.211:8080/v1"
+                stale_timeout_seconds: 300
+                first_chunk_timeout_seconds: 1200
+                models:
+                  deepseek-v4-flash-0731-ds4:
+                    first_chunk_timeout_seconds: 1500
+            """,
+        )
+        monkeypatch.setenv("HERMES_DFLASH_FIRST_CHUNK_TIMEOUT", "45")
+        payload = self._payload("deepseek-v4-flash-0731-ds4", 94_829)
+
+        assert resolve_dflash_local_first_chunk_timeout(agent, payload) == 1500.0
+        assert resolve_stream_stale_timeout(agent, payload) == 300.0
+
+        other_model = self._payload("deepseek-v4-flash-iq3xxs", 94_829)
+        assert (
+            resolve_dflash_local_first_chunk_timeout(agent, other_model) == 1200.0
         )

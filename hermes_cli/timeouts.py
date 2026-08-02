@@ -11,8 +11,18 @@ def _coerce_timeout(raw: object) -> float | None:
     return timeout
 
 
+def _normalize_url(value: object) -> str:
+    """Normalize an endpoint URL for comparison.
+
+    Same rule as ``runtime_provider._normalize_base_url_for_match`` so the fast
+    path and the general helper can never disagree about whether two URLs are
+    the same endpoint.
+    """
+    return str(value or "").strip().rstrip("/").lower()
+
+
 def _recover_custom_provider_key(
-    provider_id: str, base_url: str | None
+    provider_id: str, base_url: str | None, providers: dict | None = None
 ) -> str | None:
     """Map a bare-``custom`` runtime provider back to its ``providers:`` key.
 
@@ -47,6 +57,32 @@ def _recover_custom_provider_key(
     if normalized.startswith("custom:"):
         name = normalized.split(":", 1)[1].strip()
         return name or None
+
+    # Fast path: match the endpoint against the providers dict the caller has
+    # already loaded. `find_custom_provider_identity` below is the general
+    # helper, but it calls `load_config()`, which deepcopies the whole config —
+    # and load_config's own docstring names `get_provider_request_timeout` as
+    # the per-API-turn hot spot that must not pay that. A timeout can only be
+    # read from a `providers:` entry anyway, so when one owns this URL there is
+    # nothing left for the general helper to find.
+    if base_url and isinstance(providers, dict):
+        target = _normalize_url(base_url)
+        if target:
+            owners = [
+                name
+                for name, entry in providers.items()
+                if isinstance(entry, dict)
+                and _normalize_url(
+                    entry.get("api") or entry.get("url") or entry.get("base_url") or ""
+                ) == target
+            ]
+            # Exactly one owner, matching the rule #330 established: rows with
+            # distinct credentials can share an endpoint, and none of them can
+            # claim it alone.
+            if len(owners) == 1:
+                return owners[0]
+            if len(owners) > 1:
+                return None
 
     try:
         if base_url:
@@ -92,7 +128,7 @@ def _provider_config(
     # Only pay the reverse lookup when the direct key missed AND the runtime
     # provider is the bare custom billing class. Named and built-in providers
     # keep their existing single-dict-lookup cost on every API turn.
-    recovered = _recover_custom_provider_key(provider_id, base_url)
+    recovered = _recover_custom_provider_key(provider_id, base_url, providers)
     if recovered:
         recovered_config = providers.get(recovered)
         if isinstance(recovered_config, dict):

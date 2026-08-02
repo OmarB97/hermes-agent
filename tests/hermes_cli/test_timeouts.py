@@ -3,6 +3,7 @@ from __future__ import annotations
 import textwrap
 
 from hermes_cli.timeouts import (
+    get_provider_first_chunk_timeout,
     get_provider_request_timeout,
     get_provider_stale_timeout,
 )
@@ -128,6 +129,123 @@ def test_invalid_stale_timeout_values_return_none(monkeypatch, tmp_path):
 
     assert get_provider_stale_timeout("openai-codex", "gpt-5.4") is None
     assert get_provider_stale_timeout("openai-codex", "gpt-5.5") is None
+
+
+def test_model_first_chunk_timeout_override_wins(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(
+        tmp_path,
+        """\
+        providers:
+          ds4:
+            first_chunk_timeout_seconds: 1200
+            models:
+              deepseek-v4-flash-0731-ds4:
+                first_chunk_timeout_seconds: 1800
+        """,
+    )
+
+    assert get_provider_first_chunk_timeout(
+        "ds4", "deepseek-v4-flash-0731-ds4"
+    ) == 1800.0
+
+
+def test_provider_first_chunk_timeout_used_when_no_model_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(
+        tmp_path,
+        """\
+        providers:
+          ds4:
+            first_chunk_timeout_seconds: 1200
+            models:
+              deepseek-v4-flash-0731-ds4:
+                stale_timeout_seconds: 300
+        """,
+    )
+
+    assert get_provider_first_chunk_timeout(
+        "ds4", "deepseek-v4-flash-0731-ds4"
+    ) == 1200.0
+    assert get_provider_first_chunk_timeout("ds4", "some-other-model") == 1200.0
+
+
+def test_first_chunk_timeout_is_independent_of_stale_timeout(monkeypatch, tmp_path):
+    """Two phases, two knobs. Declaring one must not imply the other.
+
+    ``stale_timeout_seconds`` measures the gap BETWEEN chunks;
+    ``first_chunk_timeout_seconds`` measures queue admission + model load +
+    prefill of the whole prompt before any chunk exists. A lane can want
+    minutes for one and seconds for the other.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(
+        tmp_path,
+        """\
+        providers:
+          ds4:
+            stale_timeout_seconds: 300
+        """,
+    )
+
+    assert get_provider_stale_timeout("ds4") == 300.0
+    assert get_provider_first_chunk_timeout("ds4") is None
+
+
+def test_missing_and_invalid_first_chunk_timeouts_return_none(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(
+        tmp_path,
+        """\
+        providers:
+          ds4:
+            first_chunk_timeout_seconds: "soon"
+            models:
+              deepseek-v4-flash-0731-ds4:
+                first_chunk_timeout_seconds: -5
+          taro: {}
+        """,
+    )
+
+    assert get_provider_first_chunk_timeout("ds4", "deepseek-v4-flash-0731-ds4") is None
+    assert get_provider_first_chunk_timeout("taro") is None
+    assert get_provider_first_chunk_timeout("missing-provider") is None
+
+
+def test_bare_custom_first_chunk_timeout_resolves_via_base_url_attribution(monkeypatch, tmp_path):
+    """The new knob inherits the bare-"custom" attribution fix for free.
+
+    ``resolve_runtime_provider()`` reports every user-declared endpoint as the
+    bare billing class ``"custom"``, so a getter that only did
+    ``providers["custom"]`` would silently report "nothing configured" on
+    exactly the local lanes this knob exists for.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(
+        tmp_path,
+        """\
+        providers:
+          ds4:
+            api: "http://10.55.0.3:8000/v1"
+            first_chunk_timeout_seconds: 1200
+            models:
+              deepseek-v4-flash-0731-ds4:
+                first_chunk_timeout_seconds: 1800
+        """,
+    )
+
+    assert get_provider_first_chunk_timeout(
+        "custom", base_url="http://10.55.0.3:8000/v1"
+    ) == 1200.0
+    assert get_provider_first_chunk_timeout(
+        "custom", "deepseek-v4-flash-0731-ds4", base_url="http://10.55.0.3:8000/v1"
+    ) == 1800.0
+    # "custom:<name>" already carries the entry name — no base_url needed.
+    assert get_provider_first_chunk_timeout("custom:ds4") == 1200.0
+    # An endpoint no configured entry owns stays unattributed.
+    assert get_provider_first_chunk_timeout(
+        "custom", base_url="http://10.99.99.99:9999/v1"
+    ) is None
 
 
 def test_bare_custom_provider_resolves_entry_timeouts_via_base_url_regression(monkeypatch, tmp_path):
