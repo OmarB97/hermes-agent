@@ -518,36 +518,65 @@ def _meta_key(session_id: str) -> str:
     return f"goal:{session_id}"
 
 
+# Resolved state.db path -> SessionDB. Keyed by path, not by home, because
+# _get_session_db resolves the path itself (see its docstring).
 _DB_CACHE: Dict[str, Any] = {}
 
 
 def _get_session_db() -> Optional[Any]:
-    """Return a SessionDB instance for the current HERMES_HOME.
+    """Return the SessionDB holding goal rows — always the PROCESS home's DB.
 
-    SessionDB has no built-in singleton, but opening a new connection per
-    /goal call would thrash the file. We cache one instance per
-    ``hermes_home`` path so profile switches still pick up the right DB.
-    Defensive against import/instantiation failures so tests and
-    non-standard launchers can still use the GoalManager.
+    Goal state is deliberately process-global. ``goal:<session_id>`` rows land
+    in the state.db of the home this process was **launched** under, and do NOT
+    follow the per-turn ``HERMES_HOME`` override the gateways bind around a
+    turn (``set_hermes_home_override``). Hence ``get_process_hermes_home``,
+    which resolves the process env var and ignores that context-local override.
+
+    That is a requirement, not an oversight: a goal's writers and its reader sit
+    on opposite sides of the binding. In ``tui_gateway/server.py`` the desktop
+    gateway writes goals from ``session.create`` (``spawn --goal``, which
+    computes ``profile_home`` but never binds it) and from ``command.dispatch``
+    (``/goal``, which binds no profile home either, and which ``/goal`` reaches
+    deliberately rather than the slash-worker subprocess — see
+    ``_PENDING_INPUT_COMMANDS``). It reads them back in the post-turn
+    continuation hook, which DOES run inside
+    ``set_hermes_home_override(profile_home)``. If this store followed the
+    active home, writers and reader would resolve different databases and the
+    goal loop would silently stop continuing for any session running under a
+    non-launch profile — the same stranded-loop failure mode as #319, arrived at
+    from the other direction. Goals cannot collide across profiles regardless,
+    because ``session_id`` (the session key) is globally unique.
+
+    Resolving the path explicitly also removes a hidden import-order
+    dependency: ``SessionDB()`` with no argument falls back to
+    ``hermes_state.DEFAULT_DB_PATH``, a module-level constant frozen the first
+    time ``hermes_state`` is imported, so the DB followed *when* that import
+    happened rather than the process's home.
+
+    SessionDB has no built-in singleton and opening a new connection per /goal
+    call would thrash the file, so we cache one instance per resolved path.
+    Defensive against import/instantiation failures so tests and non-standard
+    launchers can still use the GoalManager.
     """
     try:
-        from hermes_constants import get_hermes_home
+        from hermes_constants import get_process_hermes_home
         from hermes_state import SessionDB
 
-        home = str(get_hermes_home())
+        db_path = get_process_hermes_home() / "state.db"
     except Exception as exc:  # pragma: no cover
         logger.debug("GoalManager: SessionDB bootstrap failed (%s)", exc)
         return None
 
-    cached = _DB_CACHE.get(home)
+    key = str(db_path)
+    cached = _DB_CACHE.get(key)
     if cached is not None:
         return cached
     try:
-        db = SessionDB()
+        db = SessionDB(db_path=db_path)
     except Exception as exc:  # pragma: no cover
         logger.debug("GoalManager: SessionDB() raised (%s)", exc)
         return None
-    _DB_CACHE[home] = db
+    _DB_CACHE[key] = db
     return db
 
 
