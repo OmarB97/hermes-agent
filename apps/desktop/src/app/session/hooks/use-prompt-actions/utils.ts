@@ -6,6 +6,8 @@ import { type CommandsCatalogLike, filterDesktopCommandsCatalog } from '@/lib/de
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import type { ComposerAttachment } from '@/store/composer'
 
+import type { SessionCreateOverrides } from '../../session-overrides'
+
 export type GatewayRequest = <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<T>
 
 export function delay(ms: number): Promise<void> {
@@ -233,4 +235,8 @@ export interface SubmitTextOptions {
   /** Stable stored session id for optimistic/cache updates and stale-runtime
    *  recovery. Distinct from the runtime session id minted by the gateway. */
   storedSessionId?: string | null
+  /** Model/provider/profile for a session this submit has to CREATE. Ignored
+   *  when submitting into an existing session. Lets a programmatic spawn name
+   *  a model without moving (and persisting) the user's composer selection. */
+  sessionOverrides?: SessionCreateOverrides
 }

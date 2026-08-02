@@ -54,12 +54,12 @@ import {
   setYoloActive
 } from '@/store/session'
 import {
+  $workingSessionIds,
   closeSessionTile,
   dropSessionState,
   openSessionTile,
   patchSessionTile,
   publishSessionState,
-  $workingSessionIds,
   type TileDock
 } from '@/store/session-states'
 import { broadcastSessionsChanged } from '@/store/session-sync'
@@ -76,6 +76,7 @@ import { NEW_CHAT_ROUTE, sessionRoute, SETTINGS_ROUTE } from '../../../routes'
 import type { ClientSessionState, SidebarNavItem } from '../../../types'
 import { archiveStoredSessions, deleteStoredSessions } from '../../session-bulk-actions'
 import { haltStoredSessions, promptStoredSessions, steerStoredSessions } from '../../session-bulk-runtime-actions'
+import type { SessionCreateOverrides } from '../../session-overrides'
 
 import {
   appendLiveSessionProjection,
@@ -180,7 +181,10 @@ function reconcileAuthoritativeMessages(
 // A no-op for single-profile/local-pooled users (a backend resolves its own launch
 // profile to None). The sticky UI model/effort/fast ride as per-session overrides,
 // never the profile default (that lives in Settings → Model).
-async function desktopSessionCreateParams(cwd: string): Promise<Record<string, unknown>> {
+async function desktopSessionCreateParams(
+  cwd: string,
+  overrides?: SessionCreateOverrides
+): Promise<Record<string, unknown>> {
   // Treat Send as the linearization point for the visible selector state. The
   // profile handshake below can yield long enough for background config/model
   // refreshes to finish; reading atoms afterward would silently create the
@@ -192,7 +196,16 @@ async function desktopSessionCreateParams(cwd: string): Promise<Record<string, u
     provider: $currentProvider.get().trim()
   }
 
-  const profile = $newChatProfile.get() ?? normalizeProfileKey($activeGatewayProfile.get())
+  // An explicit override wins over the live selection, but only for the fields
+  // it names — a spawn that only sets `model` still inherits everything else.
+  if (overrides?.model) {
+    selection.model = overrides.model.trim()
+    selection.provider = (overrides.provider ?? '').trim()
+  } else if (overrides?.provider) {
+    selection.provider = overrides.provider.trim()
+  }
+
+  const profile = overrides?.profile?.trim() || ($newChatProfile.get() ?? normalizeProfileKey($activeGatewayProfile.get()))
   await ensureGatewayProfile(profile)
 
   return {
@@ -341,7 +354,7 @@ export function useSessionActions({
   )
 
   const createBackendSessionForSend = useCallback(
-    async (preview: string | null = null): Promise<string | null> => {
+    async (preview: string | null = null, overrides?: SessionCreateOverrides): Promise<string | null> => {
       const startingActiveSessionId = activeSessionIdRef.current
       const startingStoredSessionId = selectedStoredSessionIdRef.current
       const startingRouteToken = getRouteToken()
@@ -361,7 +374,7 @@ export function useSessionActions({
               ? workspaceTarget.trim()
               : $currentCwd.get().trim() || resolveNewSessionCwd()
 
-        const params = await desktopSessionCreateParams(cwd)
+        const params = await desktopSessionCreateParams(cwd, overrides)
         const created = await requestGateway<SessionCreateResponse>('session.create', params)
         const stored = created.stored_session_id ?? null
 
@@ -1339,6 +1352,7 @@ export function useSessionActions({
           sessionStateByRuntimeIdRef.current.delete(tiledRuntimeId)
           dropSessionState(tiledRuntimeId)
         }
+
         notify({ durationMs: 2_000, kind: 'success', message: copy.archived })
       } catch (err) {
         if (archived) {
