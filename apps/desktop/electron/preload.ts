@@ -209,6 +209,15 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
 
     return () => ipcRenderer.removeListener('hermes:backend-exit', listener)
   },
+  // A session store on disk changed in a way this window did not cause — most
+  // often a headless `hermes -z …` run or a CLI session in another terminal
+  // writing its transcript. The renderer re-pulls the sidebar list.
+  onSessionsStoreChanged: callback => {
+    const listener = () => callback()
+    ipcRenderer.on('hermes:sessions-store-changed', listener)
+
+    return () => ipcRenderer.removeListener('hermes:sessions-store-changed', listener)
+  },
   // Soft gateway-mode apply finished tearing down the primary backend. Renderer
   // should wipe session lists + re-dial without a window reload.
   onConnectionApplied: callback => {

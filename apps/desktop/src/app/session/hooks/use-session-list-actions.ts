@@ -15,6 +15,7 @@ import {
   $messagingSessions,
   $selectedStoredSessionId,
   $sessions,
+  $sessionsLoading,
   CRON_SECTION_LIMIT,
   mergeSessionPage,
   MESSAGING_SECTION_LIMIT,
@@ -74,6 +75,10 @@ interface UseSessionListActionsArgs {
  *  wires into the sidebar and refresh effects. */
 export function useSessionListActions({ profileScope }: UseSessionListActionsArgs) {
   const refreshSessionsRequestRef = useRef(0)
+  // How many refreshes are in flight right now. Drives the loading-flag reset
+  // (see the `finally` in refreshSessions) so overlapping refreshes cannot
+  // strand the sidebar in its skeleton state.
+  const refreshSessionsInFlightRef = useRef(0)
 
   // Messaging-platform sessions as their own slice, fetched separately from
   // local recents so each platform renders a self-managed section and never
@@ -150,6 +155,8 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
       setSessionsLoading(true)
     }
 
+    refreshSessionsInFlightRef.current += 1
+
     try {
       const limit = $sessionsLimit.get()
 
@@ -176,6 +183,14 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
         messagingLimit: MESSAGING_SECTION_LIMIT,
         messagingExclude: MESSAGING_EXCLUDED_SOURCES
       })
+
+      // The backend answered, so the skeletons are done regardless of whether
+      // THIS request is still the newest — a superseded one is already being
+      // replaced by a live request, and an empty result should render the empty
+      // state, not a spinner. Clearing here (not only in `finally`) means even
+      // permanently overlapping refreshes cannot strand the sidebar loading.
+      // No-ops when the flag is already false, so this adds no store churn.
+      setSessionsLoading(false)
 
       if (refreshSessionsRequestRef.current === requestId) {
         const recents = result.recents
@@ -213,7 +228,17 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
         setMessagingTruncated(result.messaging.sessions.length >= MESSAGING_SECTION_LIMIT)
       }
     } finally {
-      if (showLoading && refreshSessionsRequestRef.current === requestId) {
+      refreshSessionsInFlightRef.current -= 1
+
+      // Clear when the LAST in-flight refresh settles, not only when the NEWEST
+      // one does. Gating solely on `requestId === current` wedged the sidebar on
+      // 2026-06-21: an app/backend skew made every `hermes:api` call hang to its
+      // 45s timeout while a 30s interval poll kept firing, so each refresh was
+      // superseded before it settled, no `finally` ever matched the newest id,
+      // and $sessionsLoading stayed true forever — permanent skeletons from a
+      // recoverable stall. A counter cannot get stuck: when nothing is in
+      // flight there is nothing left to turn the flag off.
+      if (refreshSessionsInFlightRef.current === 0 && $sessionsLoading.get()) {
         setSessionsLoading(false)
       }
     }

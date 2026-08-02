@@ -109,6 +109,7 @@ import { ensureMainWindow } from './main-window-lifecycle'
 import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
 import { createKeepAwake } from './power-save'
 import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRouteProfile } from './profile-delete-routing'
+import { createSessionStoreWatcher } from './session-store-watch'
 import {
   buildSessionWindowUrl,
   chatWindowWebPreferences,
@@ -4747,6 +4748,65 @@ function registerPowerResumeListeners() {
     // powerMonitor is unavailable before app 'ready' on some platforms; the
     // caller registers after 'ready', so this should not normally throw.
   }
+}
+
+// Sessions created OUTSIDE this app — a headless `hermes -z …` run, a cron job,
+// a `hermes` CLI session in another terminal — write into the same profile
+// stores the sidebar lists, but nothing told the renderer to look. Before this,
+// the list only moved on boot and on the app's OWN `message.complete` events, so
+// an external session needed a manual View > Reload to appear.
+//
+// Fan out to every window rather than just mainWindow: a session pop-out keeps
+// its own store, and the renderer already gates on isSecondaryWindow() to decide
+// whether it owns a sidebar.
+function sendSessionsStoreChanged() {
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (window.isDestroyed()) {
+      continue
+    }
+
+    const { webContents } = window
+
+    if (!webContents || webContents.isDestroyed()) {
+      continue
+    }
+
+    webContents.send('hermes:sessions-store-changed')
+  }
+}
+
+let sessionStoreWatcher = null
+
+function registerSessionStoreWatcher() {
+  if (sessionStoreWatcher) {
+    return
+  }
+
+  try {
+    sessionStoreWatcher = createSessionStoreWatcher({
+      hermesHome: HERMES_HOME,
+      notify: sendSessionsStoreChanged,
+      onLog: rememberLog
+    })
+  } catch (error) {
+    // Losing live refresh is a degraded sidebar, never a failed boot — the
+    // renderer's focused poll still covers it.
+    rememberLog(`[session-store-watch] disabled: ${error?.message ?? error}`)
+  }
+}
+
+function stopSessionStoreWatcher() {
+  if (!sessionStoreWatcher) {
+    return
+  }
+
+  try {
+    sessionStoreWatcher.close()
+  } catch {
+    void 0
+  }
+
+  sessionStoreWatcher = null
 }
 
 function getAppIconPath() {
@@ -9844,6 +9904,7 @@ app.whenReady().then(() => {
   ensureWslWindowsFonts()
   configureSpellChecker()
   registerPowerResumeListeners()
+  registerSessionStoreWatcher()
   keepAwake.set(readPersistedKeepAwake())
   createWindow()
 
@@ -9905,6 +9966,8 @@ app.on('before-quit', () => {
   // The always-on-top overlay isn't a "real" app window; close it so a stray
   // pet can't keep the process alive or float over a quit app.
   closePetOverlay()
+
+  stopSessionStoreWatcher()
 
   // Quitting mid-install should stop the installer, not orphan it.
   if (bootstrapAbortController) {

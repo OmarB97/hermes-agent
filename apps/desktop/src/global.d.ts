@@ -198,6 +198,10 @@ declare global {
       onNotificationAction?: (callback: (payload: { actionId: string; sessionId?: string }) => void) => () => void
       onPreviewFileChanged: (callback: (payload: HermesPreviewFileChanged) => void) => () => void
       onBackendExit: (callback: (payload: BackendExit) => void) => () => void
+      // A profile's session store changed on disk without this app causing it
+      // (headless `hermes -z …`, cron, a CLI session elsewhere). Re-pull the
+      // sidebar list. Optional: an older preload won't expose it.
+      onSessionsStoreChanged?: (callback: () => void) => () => void
       // Soft gateway-mode apply: primary backend was torn down without a window
       // reload. Wipe session lists (skeletons) and re-dial.
       onConnectionApplied?: (callback: () => void) => () => void
