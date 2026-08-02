@@ -339,6 +339,89 @@ def test_gui_is_known_builtin_for_plugin_gating(argv):
         assert cli_main._plugin_cli_discovery_needed() is False
 
 
+# ── `hermes desktop spawn` nested-verb wiring ─────────────────────────
+
+
+def test_desktop_spawn_parser_dispatches_to_spawn_handler_not_gui():
+    """Nested `spawn` subparser must route to cmd_desktop_spawn, not cmd_gui.
+
+    Regression guard: argparse resolves a nested subparser's set_defaults(
+    func=...) after the parent's own, so it wins — but that ordering is easy
+    to break by accident (e.g. moving cmd_gui's set_defaults below the
+    subparsers block). This proves both dispatch targets and that bare
+    `hermes desktop` (and its existing flags) are completely unaffected by
+    the new subparsers.
+    """
+    from hermes_cli.subcommands.gui import build_gui_parser
+
+    parser = argparse.ArgumentParser(prog="hermes")
+    subparsers = parser.add_subparsers(dest="command")
+    build_gui_parser(
+        subparsers, cmd_gui=cli_main.cmd_gui, cmd_desktop_spawn=cli_main.cmd_desktop_spawn
+    )
+
+    bare = parser.parse_args(["desktop", "--build-only"])
+    assert bare.func is cli_main.cmd_gui
+    assert bare.build_only is True
+
+    spawn = parser.parse_args(["desktop", "spawn", "hi there"])
+    assert spawn.func is cli_main.cmd_desktop_spawn
+    assert spawn.prompt == "hi there"
+    assert spawn.model is None
+    assert spawn.provider is None
+    assert spawn.profile is None
+    assert spawn.toolsets is None
+
+    full = parser.parse_args(
+        [
+            "desktop", "spawn", "hi",
+            "-m", "deepseek-v4-flash-0731-ds4",
+            "--provider", "ai-router",
+            "--profile", "work",
+            "--toolsets", "a,b",
+        ]
+    )
+    assert full.func is cli_main.cmd_desktop_spawn
+    assert full.model == "deepseek-v4-flash-0731-ds4"
+    assert full.provider == "ai-router"
+    assert full.profile == "work"
+    assert full.toolsets == "a,b"
+
+    # The `gui` alias must carry the nested verb too.
+    via_alias = parser.parse_args(["gui", "spawn", "via alias"])
+    assert via_alias.func is cli_main.cmd_desktop_spawn
+    assert via_alias.prompt == "via alias"
+
+
+def test_desktop_spawn_requires_prompt_argument():
+    from hermes_cli.subcommands.gui import build_gui_parser
+
+    parser = argparse.ArgumentParser(prog="hermes")
+    subparsers = parser.add_subparsers(dest="command")
+    build_gui_parser(
+        subparsers, cmd_gui=cli_main.cmd_gui, cmd_desktop_spawn=cli_main.cmd_desktop_spawn
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["desktop", "spawn"])
+    assert exc.value.code == 2
+
+
+def test_desktop_spawn_example_model_appears_only_in_help_text():
+    """The deepseek-v4-flash-0731-ds4 / ai-router pairing is documentation-only
+    — it must never be sent as an actual default when --model is omitted."""
+    from hermes_cli.subcommands.gui import build_gui_parser
+
+    parser = argparse.ArgumentParser(prog="hermes")
+    subparsers = parser.add_subparsers(dest="command")
+    build_gui_parser(
+        subparsers, cmd_gui=cli_main.cmd_gui, cmd_desktop_spawn=cli_main.cmd_desktop_spawn
+    )
+
+    args = parser.parse_args(["desktop", "spawn", "hi"])
+    assert args.model is None
+
+
 # ── Content-hash stamp tests ──────────────────────────────────────────
 
 

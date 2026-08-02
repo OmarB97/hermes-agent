@@ -9,7 +9,9 @@ from __future__ import annotations
 from typing import Callable
 
 
-def build_gui_parser(subparsers, *, cmd_gui: Callable) -> None:
+def build_gui_parser(
+    subparsers, *, cmd_gui: Callable, cmd_desktop_spawn: Callable
+) -> None:
     """Attach the ``gui`` subcommand to ``subparsers``."""
     # =========================================================================
     gui_parser = subparsers.add_parser(
@@ -61,3 +63,51 @@ def build_gui_parser(subparsers, *, cmd_gui: Callable) -> None:
         help="Force a full rebuild even if the content stamp matches",
     )
     gui_parser.set_defaults(func=cmd_gui)
+
+    # `hermes desktop spawn "<prompt>"` — ask an already-running desktop app
+    # to start a new chat session, via its loopback control server. Nested
+    # subparser so bare `hermes desktop` (and its --build-only / --force-build
+    # / etc. flags) keeps building/launching as before (set_defaults(func=
+    # cmd_gui) above remains the default).
+    desktop_subparsers = gui_parser.add_subparsers(dest="desktop_subcommand")
+    spawn_parser = desktop_subparsers.add_parser(
+        "spawn",
+        help="Ask the running desktop app to start a new chat session",
+        description=(
+            "Send a prompt to the already-running Hermes desktop app over its "
+            "local control channel. The app starts a new chat exactly as if "
+            "the prompt had been typed in — streaming, transcript, and sidebar "
+            "all go through the normal typed-chat path. Requires the desktop "
+            "app to already be running (`hermes desktop`)."
+        ),
+    )
+    spawn_parser.add_argument("prompt", help="Prompt to run in a new desktop chat session")
+    spawn_parser.add_argument(
+        "-m",
+        "--model",
+        default=None,
+        help=(
+            "Model for the new session, e.g. deepseek-v4-flash-0731-ds4 (used "
+            "together with --provider ai-router). Omit to use whatever model "
+            "the desktop app currently has selected."
+        ),
+    )
+    spawn_parser.add_argument(
+        "--provider",
+        default=None,
+        help="Provider for --model, e.g. ai-router. Omit to use the app's current provider.",
+    )
+    spawn_parser.add_argument(
+        "--profile",
+        default=None,
+        help="Hermes profile to run the session under. Omit to use the app's active profile.",
+    )
+    spawn_parser.add_argument(
+        "--toolsets",
+        default=None,
+        help=(
+            "Comma-separated toolset names to enable for this session. Omit "
+            "to use the app's current toolsets."
+        ),
+    )
+    spawn_parser.set_defaults(func=cmd_desktop_spawn)
