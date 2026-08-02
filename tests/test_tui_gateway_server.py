@@ -1787,6 +1787,57 @@ def test_session_cwd_set_profile_session_updates_profile_db(monkeypatch, tmp_pat
     assert "launch_update" not in captured
 
 
+def test_finalize_session_profile_session_ends_in_profile_db(monkeypatch, tmp_path):
+    """Closing a profile-scoped session ends it in THAT profile's state.db.
+
+    Same contract as the resume/cwd paths above: the launch profile's cached
+    ``_get_db()`` handle must not be read or written. It was, here — so the end
+    write was a 0-row UPDATE against the wrong database and the #60609
+    gateway-owned lookup read a missing row.
+    """
+    target = "stored-profile-session"
+    profile_home = tmp_path / "profiles" / "worker"
+    profile_home.mkdir(parents=True)
+    captured = {}
+
+    class ProfileDB:
+        def get_session(self, session_id):
+            captured["profile_lookup"] = session_id
+            return {"id": session_id, "source": "desktop"}
+
+        def end_session(self, session_id, end_reason):
+            captured["profile_end"] = (session_id, end_reason)
+
+        def close(self):
+            captured["profile_closed"] = True
+
+    class LaunchDB:
+        def get_session(self, _session_id):
+            captured["launch_lookup"] = True
+            return {"id": target, "source": "desktop"}
+
+        def end_session(self, *_args):
+            captured["launch_end"] = True
+
+    monkeypatch.setattr("hermes_state.SessionDB", lambda db_path=None: ProfileDB())
+    monkeypatch.setattr(server, "_get_db", lambda: LaunchDB())
+
+    session = {
+        "session_key": target,
+        "profile_home": str(profile_home),
+        "agent": types.SimpleNamespace(session_id=target),
+        "history": [],
+        "history_lock": None,
+    }
+    server._finalize_session(session, end_reason="tui_close")
+
+    assert captured["profile_lookup"] == target
+    assert captured["profile_end"] == (target, "tui_close")
+    assert captured["profile_closed"] is True
+    assert "launch_lookup" not in captured
+    assert "launch_end" not in captured
+
+
 def test_stored_session_runtime_overrides_skips_bare_billing_provider():
     """A bare billing bucket ("custom"/"auto"/"openrouter") must not be restored as the
     provider identity on resume. A custom endpoint that never used `/model` persists only
