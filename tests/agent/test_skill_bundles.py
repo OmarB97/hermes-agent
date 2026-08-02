@@ -381,3 +381,89 @@ class TestListBundles:
         info_list = list_bundles()
         slugs = [b["slug"] for b in info_list]
         assert slugs == sorted(slugs)
+
+
+class TestCacheIsKeyedOnTheBundlesDir:
+    """The snapshot must not survive a change of bundles directory.
+
+    The freshness check was mtime-only. mtime does not identify a profile, so a
+    backend serving several profiles — where ``_bundles_dir()`` resolves to a
+    different home per request — hit the cache and served one profile's bundles
+    to another whenever the two homes' newest bundle files shared an mtime.
+    Equal mtimes are not exotic: bundles are commonly seeded by the same
+    install, copy, or checkout.
+    """
+
+    STAMP = 1_700_000_000
+
+    @pytest.fixture
+    def two_homes(self, tmp_path, monkeypatch):
+        """Two profile homes whose bundle dirs have byte-identical mtimes."""
+        import agent.skill_bundles as mod
+
+        # _bundles_dir() prefers HERMES_BUNDLES_DIR; clear it so the profile
+        # home drives resolution, as it does in production.
+        monkeypatch.delenv("HERMES_BUNDLES_DIR", raising=False)
+
+        homes = {}
+        for tag in ("launch", "profile"):
+            home = tmp_path / tag
+            bundles = home / "skill-bundles"
+            bundles.mkdir(parents=True)
+            _make_bundle_yaml(bundles, f"{tag}-bundle", ["s1"])
+            homes[tag] = home
+
+        # Force identical mtimes across both homes — dirs and files alike,
+        # since _max_mtime() watches both.
+        for home in homes.values():
+            bundles = home / "skill-bundles"
+            for p in list(bundles.glob("*")) + [bundles]:
+                os.utime(p, (self.STAMP, self.STAMP))
+
+        mod._bundles_cache = {}
+        mod._bundles_cache_mtime = None
+        mod._bundles_cache_dir = None
+        return homes
+
+    def test_switching_home_does_not_serve_the_previous_profiles_bundles(
+        self, two_homes, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(two_homes["launch"]))
+        assert "/launch-bundle" in get_skill_bundles()
+
+        monkeypatch.setenv("HERMES_HOME", str(two_homes["profile"]))
+        after = get_skill_bundles()
+
+        assert "/profile-bundle" in after
+        assert "/launch-bundle" not in after
+
+    def test_switching_back_reresolves_too(self, two_homes, monkeypatch):
+        """Not a one-way flush — alternating requests each get their own."""
+        monkeypatch.setenv("HERMES_HOME", str(two_homes["profile"]))
+        assert "/profile-bundle" in get_skill_bundles()
+
+        monkeypatch.setenv("HERMES_HOME", str(two_homes["launch"]))
+        assert "/launch-bundle" in get_skill_bundles()
+
+        monkeypatch.setenv("HERMES_HOME", str(two_homes["profile"]))
+        assert "/profile-bundle" in get_skill_bundles()
+
+    def test_same_dir_unchanged_still_hits_the_cache(self, two_homes, monkeypatch):
+        """The fix must not defeat caching for the ordinary single-home case."""
+        import agent.skill_bundles as mod
+
+        monkeypatch.setenv("HERMES_HOME", str(two_homes["launch"]))
+        get_skill_bundles()
+
+        calls = {"n": 0}
+        real_scan = mod.scan_bundles
+
+        def counting_scan():
+            calls["n"] += 1
+            return real_scan()
+
+        monkeypatch.setattr(mod, "scan_bundles", counting_scan)
+        mod.get_skill_bundles()
+        mod.get_skill_bundles()
+
+        assert calls["n"] == 0
