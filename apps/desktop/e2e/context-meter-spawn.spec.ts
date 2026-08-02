@@ -27,7 +27,10 @@ import path from 'node:path'
 
 import { expect, test } from '@playwright/test'
 
+import { compactNumber } from '../src/lib/format'
+
 import { type MockBackendFixture, setupMockBackend, waitForAppReady } from './fixtures'
+import { probeRoundPromptCount, resetProbeRoundPromptCount } from './mock-server'
 
 /**
  * Long enough that one turn spans several polls below, and longer than the
@@ -196,5 +199,49 @@ test.describe('statusbar context meter', () => {
 
     expect(readings.length).toBeGreaterThanOrEqual(2)
     expectNeverDips(readings)
+  })
+
+  /**
+   * The round the whole change is about.
+   *
+   * Every round above calls a tool, so sampling occupancy per completed TOOL
+   * and sampling it per API RESPONSE produce the same series — those tests
+   * cannot tell the two apart. Here one mid-turn round names a tool that does
+   * not exist: the agent rejects the name before the executor, so the round
+   * finishes a real API call, reports real usage, and completes no tool.
+   *
+   * Sampling on tool completion has nothing to report for it, and the meter
+   * skips that value entirely. Sampling on the response reports it.
+   */
+  test('reports a round that finished an API call but completed no tool', async () => {
+    resetProbeRoundPromptCount()
+    process.env.MOCK_TOOL_FREE_ROUND = '1'
+
+    try {
+      expect(await postSpawn('Use your tools and then report back.', { delegated: true })).toBe(202)
+
+      const readings = gaugeReadings(await meterSeries('tool-free', 25))
+      const probeTokens = probeRoundPromptCount()
+
+      console.log('TOOL-FREE readings:', readings, '| probe round served:', probeTokens)
+
+      // Guards the test itself: if the mock never reached the probe round there
+      // is nothing to assert about, and a bare `toContain` would just fail with
+      // a confusing message about the wrong thing.
+      expect(probeTokens, 'the mock never served the tool-free round').not.toBeNull()
+      expectNeverDips(readings)
+
+      // Formatted through the status bar's own formatter rather than compared
+      // as a number: the gauge is what the user reads, and a literal here would
+      // drift the moment the prompt or tool list changes size.
+      const expectedLabel = `${compactNumber(probeTokens)}/`
+
+      expect(
+        readings.some(reading => reading.startsWith(expectedLabel)),
+        `the tool-free round never reached the meter — wanted ${expectedLabel} in ${readings.join(' -> ')}`
+      ).toBe(true)
+    } finally {
+      delete process.env.MOCK_TOOL_FREE_ROUND
+    }
   })
 })

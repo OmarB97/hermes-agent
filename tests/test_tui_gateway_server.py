@@ -17,6 +17,14 @@ from hermes_cli.active_sessions import active_session_registry_snapshot
 from hermes_cli.browser_connect import ChromeDebugLaunch
 from tui_gateway import server
 
+# Four tests here (``session.resume``, ``session.create`` ×2, ``_init_session``)
+# start a real notification poller and then drop the session without closing
+# it, so the thread outlives them and competes for the process-wide completion
+# queue that the ``requeues_*`` tests below monkeypatch. Reap them per test —
+# same class of leak as ``_neuter_agent_prewarm_timer``, one test's background
+# thread landing in the next test's assertions.
+pytestmark = pytest.mark.usefixtures("reap_notification_pollers")
+
 
 @pytest.fixture(autouse=True)
 def _neuter_agent_prewarm_timer(request, monkeypatch):
@@ -3310,6 +3318,27 @@ class _RecordingAgent:
         return {"final_response": "", "messages": []}
 
 
+def test_a_started_notification_poller_does_not_outlive_its_test():
+    """Deliberately leak a poller the way ``session.create`` / ``_init_session``
+    do, so the reaper's own machinery is exercised on every run.
+
+    ``reap_notification_pollers`` (module ``pytestmark``) asserts in teardown
+    that every poller it started has actually exited. If reaping regresses,
+    this test fails there — loudly and by name — instead of the failure landing
+    later as a load-dependent flake in the requeue tests below, where a leaked
+    poller competes for the process-wide ``completion_queue`` they monkeypatch.
+    """
+    session = _session(session_key="reaper-guard")
+    server._sessions["reaper-guard-sid"] = session
+    try:
+        stop = server._start_notification_poller("reaper-guard-sid", session)
+    finally:
+        # Exactly the leak shape: dropped from the registry without going
+        # through _teardown_session, so nothing sets _finalized or fires stop.
+        server._sessions.pop("reaper-guard-sid", None)
+    assert not stop.is_set()
+
+
 @pytest.mark.parametrize("exit_code", [0, 7])
 def test_run_prompt_submit_requeues_foreign_completion(
     monkeypatch, tmp_path, exit_code
@@ -3392,8 +3421,9 @@ def test_run_prompt_submit_delivers_completion_observed_by_poll(monkeypatch, tmp
         process_registry._poll_observed.discard(event["session_id"])
 
 
+@pytest.mark.parametrize("rotation", [0, 1, 2])
 def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_threading(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, rotation
 ):
     import queue as _queue_mod
 
@@ -3407,6 +3437,7 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
     nested_started = threading.Event()
     release_nested = threading.Event()
     turns = []
+    dispatched = []
 
     def _recording_thread(*args, **kwargs):
         thread = real_thread_class(*args, **kwargs)
@@ -3418,9 +3449,26 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
             self, prompt, conversation_history=None, stream_callback=None
         ):
             turns.append(prompt)
-            if "proc_batch_1" in prompt:
+            # Hold whichever notification the batch dispatches FIRST, rather
+            # than a fixed session_id. Which event heads the batch is not a
+            # contract, and pinning the hold to batch_1 made the whole test
+            # depend on it: with batch_1 anywhere but first, a *non-blocking*
+            # notification got dispatched instead, that turn finished, its own
+            # post-turn drain dispatched the next, and the cascade consumed all
+            # three — leaving nothing queued for the assertion below. That is
+            # the shape #335's leaked pollers produced by rotating this queue.
+            batch_id = next(
+                (e["session_id"] for e in events if e["session_id"] in prompt), ""
+            )
+            if batch_id and not dispatched:
+                dispatched.append(batch_id)
                 nested_started.set()
-                if not release_nested.wait(timeout=5):
+                # Outlast the assertion window below by a wide margin: if this
+                # hold expired mid-assert, the turn would end and its own
+                # post-turn drain would consume the very events being asserted
+                # on. The `finally` releases it, so this bound is only reached
+                # when the test is already failing.
+                if not release_nested.wait(timeout=60):
                     raise TimeoutError("notification turn was not released")
             return {"final_response": "", "messages": []}
 
@@ -3442,7 +3490,11 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
         for index in range(1, 4)
     ]
     isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
-    for event in events:
+    # Run every starting order. The contract below holds for all three, and
+    # #335 showed what happens when the test only ever sees one: a rotated
+    # queue was reachable in practice, and the assumption that batch_1 heads
+    # the batch went unexercised until a leaked poller rotated it under load.
+    for event in events[rotation:] + events[:rotation]:
         isolated_queue.put(event)
     monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
     server._sessions["sid_a"] = session
@@ -3450,29 +3502,38 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
     try:
         server._run_prompt_submit("rid-a", "sid_a", session, "session-a-turn")
 
-        assert nested_started.wait(timeout=5)
-        threads[0].join(timeout=5)
+        assert nested_started.wait(timeout=10)
+        threads[0].join(timeout=10)
         assert not threads[0].is_alive()
-        # Membership, not order: the completion_queue is process-global, and
-        # notification pollers leaked by earlier session.init tests in this
-        # file legitimately steal-and-requeue foreign-session events (see
-        # _notification_poller_loop's belongs-elsewhere branch), rotating the
-        # queue. The requeue contract is that batch_2 and batch_3 both remain
-        # queued (never consumed) while batch_1's turn is in flight — so drain
-        # with a deadline (an event may be transiently held by a poller
-        # mid-cycle) and assert exactly {batch_2, batch_3} come back.
+        # Membership, not order, and relative to whichever notification the
+        # batch actually started: the requeue contract is that every event the
+        # batch did NOT start stays queued (never consumed) while the started
+        # one's turn is in flight, and drain_notifications re-queues them in
+        # one pass after the drain loop, so their order relative to each other
+        # is not part of the contract either. Drain with a deadline because
+        # that requeue happens on the turn thread, not this one.
+        #
+        # This used to also have to tolerate notification pollers leaked by
+        # earlier tests in this file steal-and-requeueing these events — that
+        # leak is gone (see the reap_notification_pollers pytestmark at the top
+        # of the module), so anything competing for this queue now is a bug and
+        # still fails the exact-set assertion below.
+        expected = {event["session_id"] for event in events} - set(dispatched)
         queued: dict = {}
         deadline = time.time() + 5.0
-        while time.time() < deadline and set(queued) != {
-            "proc_batch_2",
-            "proc_batch_3",
-        }:
+        while time.time() < deadline and set(queued) != expected:
             try:
                 evt = isolated_queue.get(timeout=0.1)
             except _queue_mod.Empty:
                 continue
             queued[evt["session_id"]] = evt
-        assert set(queued) == {"proc_batch_2", "proc_batch_3"}
+        assert set(queued) == expected
+        # ...and that the requeued pair is genuinely unstarted, not merely
+        # re-queued after the fact: only one notification turn may reach the
+        # agent while the held turn owns the session. A cascade shows up here
+        # as 2-3 notification prompts.
+        started = [t for t in turns if any(e["session_id"] in t for e in events)]
+        assert len(started) == 1
     finally:
         release_nested.set()
         for thread in threads:

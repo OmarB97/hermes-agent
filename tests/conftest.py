@@ -431,6 +431,89 @@ def _isolate_hermes_home(_hermetic_environment):
 
 
 @pytest.fixture()
+def notification_poller_reaper(monkeypatch):
+    """Track and stop the TUI notification pollers started during one test.
+
+    Yields ``track(server_module)``: from that call on, every poller started
+    through ``_start_notification_poller`` is recorded, then stopped and joined
+    when the test ends.
+
+    Prefer :func:`reap_notification_pollers` below — it wires this up for a
+    whole module in one line. Reach for this one only when the module imports
+    ``tui_gateway.server`` itself and must be the first importer in the process
+    (``tests/tui_gateway/test_review_summary_callback.py`` imports it under a
+    patched ``sys.modules``), so a fixture that imported it at setup would
+    change what those tests exercise. Such a module calls ``track(mod)`` right
+    after its own import instead.
+
+    Patches through the shared ``monkeypatch`` so a test that patches the same
+    attribute unwinds in the right order and can't leave the wrapper installed.
+    """
+    import threading
+
+    started: list = []
+
+    def track(server):
+        real_start = server._start_notification_poller
+
+        def _tracked(sid, session):
+            before = {t.ident for t in threading.enumerate()}
+            stop = real_start(sid, session)
+            started.append(
+                (stop, session, [t for t in threading.enumerate() if t.ident not in before])
+            )
+            return stop
+
+        monkeypatch.setattr(server, "_start_notification_poller", _tracked)
+
+    try:
+        yield track
+    finally:
+        for stop, session, threads in started:
+            # The loop breaks on either brake — set both, then wait for it to
+            # actually leave the ``queue.get(timeout=0.5)`` it is parked in.
+            # Setting the event alone still leaves a window where it can take
+            # one more event off the next test's queue.
+            session["_finalized"] = True
+            stop.set()
+            for thread in threads:
+                thread.join(timeout=5)
+        alive = [t.name for _s, _sess, ts in started for t in ts if t.is_alive()]
+        assert not alive, f"notification poller thread(s) still running: {alive}"
+
+
+@pytest.fixture()
+def reap_notification_pollers(notification_poller_reaper):
+    """Stop every TUI notification poller a test starts before the next one runs.
+
+    Opt in per module with::
+
+        pytestmark = pytest.mark.usefixtures("reap_notification_pollers")
+
+    ``server._start_notification_poller`` spawns a daemon thread that loops
+    until its session is finalized. A test that starts one and then drops the
+    session — popping it straight out of ``server._sessions``, or clearing the
+    registry wholesale — instead of closing it through ``_teardown_session``
+    never sets ``_finalized`` and never fires ``_notif_stop``, so the thread
+    outlives the test and keeps polling for the rest of the pytest process.
+    (Production has no such path: every ``_pop_session_by_id`` is paired with
+    ``_teardown_popped_session``.)
+
+    That matters because ``process_registry.completion_queue`` is process-wide
+    and the loop re-reads the attribute on every iteration. When a later test
+    monkeypatches an isolated ``Queue`` in, the leaked pollers see it too and
+    compete for its events: one is dropped as unowned, or bounced out and
+    re-queued 0.1s later, or held past the test's deadline. Those are the
+    load-dependent failures in ``test_run_prompt_submit_requeues_*`` and
+    ``test_notification_poller_live_loop_*``.
+    """
+    from tui_gateway import server
+
+    notification_poller_reaper(server)
+    yield
+
+
+@pytest.fixture()
 def tmp_dir(tmp_path):
     """Provide a temporary directory that is cleaned up automatically."""
     return tmp_path

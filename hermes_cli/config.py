@@ -1169,10 +1169,15 @@ DEFAULT_CONFIG = {
         # gate and restore pre-fix behaviour (always inject).
         "gateway_auto_continue_freshness": 3600,
         # Stale-stream ceiling for local providers (Ollama, oMLX, llama-cpp) in
-        # seconds. When the base stale timeout is at its default (180s) and a
-        # local endpoint is detected, this finite ceiling replaces the former
-        # infinite disable so a wedged local server eventually trips the
-        # detector instead of hanging forever. The env var
+        # seconds. Applies when a local endpoint is detected and nothing more
+        # specific is set — a provider/model ``stale_timeout_seconds`` or
+        # ``HERMES_STREAM_STALE_TIMEOUT`` wins outright, and the local DeepSeek
+        # Flash family has its own tighter budget. This finite ceiling replaces
+        # the former infinite disable so a wedged local server eventually trips
+        # the detector instead of hanging forever. It is widened (never
+        # narrowed) by the request's context-scaled prefill cost, so a large
+        # prompt on a slow local model is not killed mid-prefill. Set 0 to
+        # disable the watchdog entirely. The env var
         # ``HERMES_LOCAL_STREAM_STALE_TIMEOUT`` overrides for escape-hatch use.
         "local_stream_stale_timeout": 900,
         # How user-attached images are presented to the main model on each turn.
@@ -1629,6 +1634,37 @@ DEFAULT_CONFIG = {
         # not a meaningful recovery, so an unretried blip silently loses the
         # call.
         "transient_retries": 2,
+        # ── Global auxiliary lane (off by default) ────────────────────────
+        # One endpoint for ALL short auxiliary work — smart approval, goal
+        # judge, title generation, compression, web_extract, ... — so those
+        # calls stop landing on the endpoint serving your main conversation.
+        # On a single-slot local server a 2-6K-token aux call evicts the KV
+        # slot holding a 95K-token conversation, and the next main turn
+        # re-reads the whole prefix instead of hitting the prompt cache.
+        #
+        # Precedence: auxiliary.<task>.*  >  auxiliary.route.*  >  "auto".
+        # "auto" means the route when one is set; ``provider: main`` on a task
+        # is the one-line opt-out back to the main model.
+        #
+        # Empty = off. Nothing here is written to config.yaml by a migration,
+        # and with every field blank resolution is identical to having no
+        # route at all. Vision is never routed here (an image payload needs a
+        # multimodal model — use auxiliary.vision instead).
+        #
+        # NOTE: with fallback_policy "any" (the default) an unreachable route
+        # silently re-routes back to the main lane, so cache protection is
+        # best-effort by design — that fallback is what keeps an unattended
+        # run from stalling on a dud lane.
+        "route": {
+            "provider": "",        # providers: entry name, or any provider id
+            "model": "",           # empty = the provider/entry default
+            "base_url": "",        # direct OpenAI-compatible endpoint
+            "api_key": "",         # inline key for base_url
+            "key_env": "",         # env var holding the key (preferred)
+            "api_mode": "",        # chat_completions | codex_responses | ...
+            "timeout": 0,          # seconds; 0 = use the per-task timeout
+            "transient_retries": 0,  # routed lanes don't retry by default
+        },
         "vision": {
             "provider": "auto",    # auto | openrouter | nous | codex | custom
             "model": "",           # e.g. "google/gemini-2.5-flash", "gpt-4o"

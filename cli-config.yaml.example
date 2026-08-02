@@ -516,6 +516,28 @@ prompt_caching:
 # Other providers pick a sensible default automatically.
 #
 # auxiliary:
+#   # One lane for EVERY task that pins nothing of its own — smart approval,
+#   # goal judge, title generation, compression, web_extract, ... Empty = off,
+#   # which is the default: those tasks resolve to "auto" = your main model.
+#   #
+#   # Why: auxiliary calls are short, your conversation is not. On a
+#   # single-slot local server a 2-6K-token approval check evicts the KV slot
+#   # holding a 95K-token conversation and the next real turn re-reads the
+#   # whole prefix instead of hitting the prompt cache.
+#   #
+#   # Precedence: auxiliary.<task>.*  >  auxiliary.route.*  >  "auto".
+#   # Put one task back on the main model with `provider: "main"` on that task.
+#   # Vision is never routed here (image payloads need a multimodal model).
+#   route:
+#     provider: ""           # provider id, or a providers:/custom_providers: entry name
+#     model: ""              # empty = provider / entry default
+#     base_url: ""           # direct OpenAI-compatible endpoint instead of a provider
+#     api_key: ""            # inline key for base_url
+#     key_env: ""            # env var holding the key (preferred over api_key)
+#     api_mode: ""           # chat_completions | codex_responses | anthropic_messages
+#     timeout: 0             # seconds; 0 = use each task's own timeout
+#     transient_retries: 0   # routed lanes do not retry by default
+#
 #   # Image analysis: vision_analyze tool + browser screenshots
 #   vision:
 #     provider: "auto"
@@ -731,6 +753,16 @@ agent:
   # cleans up, and exits. Set a positive value only if you want a grace
   # window on /restart, and keep it well under systemd's TimeoutStopSec.
   # restart_drain_timeout: 0
+
+  # Stale-stream ceiling for local endpoints (Ollama, oMLX, llama.cpp), in
+  # seconds. Local providers skip the 180s cloud default because prefill can
+  # legitimately run for minutes, but the wait is still bounded so a crashed or
+  # deadlocked local server eventually trips the detector and lets reconnect /
+  # fallback run instead of parking the session. Widened (never narrowed) by the
+  # request's context-scaled prefill cost, so a large prompt gets more room.
+  # Set 0 for an unbounded wait. A providers.<id>.stale_timeout_seconds or
+  # HERMES_STREAM_STALE_TIMEOUT value wins over this.
+  # local_stream_stale_timeout: 900
 
   # Max app-level retry attempts for API errors (connection drops, provider
   # timeouts, 5xx, etc.) before the agent surfaces the failure. Lower this

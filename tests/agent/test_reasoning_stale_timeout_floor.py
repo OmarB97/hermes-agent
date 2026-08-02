@@ -301,11 +301,17 @@ def _resolve_stream_stale_timeout(
     est_tokens: int,
     stale_base: float = 180.0,
 ) -> float:
-    """Mirror of the stale-stream resolution in agent/chat_completion_helpers.py.
+    """Mirror of the REMOTE half of ``resolve_stream_stale_timeout``.
 
-    Kept in lockstep with the production code at lines 2539-2575 of
-    agent/chat_completion_helpers.py.  When that block changes, this
-    mirror must change too — the failing-test signal is the divergence.
+    Kept in lockstep with the context tiers + reasoning floor in
+    agent/chat_completion_helpers.py.  When that block changes, this mirror
+    must change too — the failing-test signal is the divergence.
+
+    Local endpoints are deliberately NOT mirrored: their resolution (the
+    ``agent.local_stream_stale_timeout`` ceiling, its env override, and the
+    context scaling on top) belongs to the real function and is covered
+    against it in tests/agent/test_local_stream_timeout.py.  A second copy
+    here is how a mirror ends up asserting behavior production stopped having.
     """
     from agent.model_metadata import is_local_endpoint
     from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
@@ -314,8 +320,12 @@ def _resolve_stream_stale_timeout(
     if stale_base != 180.0:
         pass  # In production this is sourced from config; here we parameterize.
 
-    if stale_base == 180.0 and base_url and is_local_endpoint(base_url):
-        return float("inf")
+    if base_url and is_local_endpoint(base_url):
+        raise AssertionError(
+            "local endpoints are not mirrored here — call the real "
+            "resolve_stream_stale_timeout (see "
+            "tests/agent/test_local_stream_timeout.py)"
+        )
 
     if est_tokens > 100_000:
         timeout = max(stale_base, 300.0)

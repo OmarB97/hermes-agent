@@ -25,7 +25,12 @@ from agent.model_metadata import is_local_endpoint
 def _resolve_stale_timeout(base_url, est_tokens, stale_base=180.0):
     """Mirror of the stale-stream detector resolution."""
     if stale_base == 180.0 and base_url and is_local_endpoint(base_url):
-        return float("inf")  # detector disabled for local providers
+        # Bounded by the generic local ceiling (``agent.local_stream_stale_timeout``,
+        # default 900s), NOT disabled.  The real resolution — env/config
+        # precedence and context scaling — lives in
+        # ``resolve_stream_stale_timeout`` and is covered by
+        # tests/agent/test_local_stream_timeout.py.
+        return 900.0
     if est_tokens > 100_000:
         return max(stale_base, 300.0)
     if est_tokens > 50_000:
@@ -100,11 +105,17 @@ class TestLocalUnaffected:
             yield
 
     def test_local_still_raised_to_base(self):
-        """Local providers keep their existing behavior (raise to base timeout)."""
+        """Local providers keep their existing behavior (raise to base timeout).
+
+        The local stale timeout is now finite (the 900s ceiling), so this also
+        pins that the local read-timeout branch still wins outright — the read
+        timeout is raised to the base timeout rather than being pulled down to
+        the detector's value.
+        """
         stale = _resolve_stale_timeout("http://localhost:11434", est_tokens=0)
-        assert stale == float("inf")  # detector disabled for local
+        assert stale == 900.0  # bounded by the local ceiling, not disabled
         read = _resolve_read_timeout("http://localhost:11434", stale)
-        assert read == 1800.0  # not clamped by inf
+        assert read == 1800.0  # never clamped down to the stale value
 
     def test_stale_none_falls_back_to_default(self):
         """If the stale value is unresolved, the read timeout keeps its default."""

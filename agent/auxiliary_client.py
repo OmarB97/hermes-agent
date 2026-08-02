@@ -3204,12 +3204,14 @@ def _is_transient_transport_error(exc: Exception) -> bool:
 
 
 _DEFAULT_TRANSIENT_RETRIES = 2
+# A routed auxiliary lane does not retry by default — see _transient_retry_count.
+_DEFAULT_ROUTE_TRANSIENT_RETRIES = 0
 # Base for exponential backoff between transient retries (seconds). Overridable
 # so tests can zero it out and not sleep real wall-clock time.
 _TRANSIENT_RETRY_BACKOFF_BASE = 1.0
 
 
-def _transient_retry_count() -> int:
+def _transient_retry_count(*, route_derived: bool = False) -> int:
     """Number of same-provider retries for a transient transport blip.
 
     Read from ``auxiliary.transient_retries`` in config.yaml (default 2 →
@@ -3218,7 +3220,21 @@ def _transient_retry_count() -> int:
     advisor) has no meaningful provider fallback, so a couple of retries with
     backoff is the difference between recovering and silently losing the call.
     Best-effort: any config-read failure falls back to the default.
+
+    Route-derived calls read ``auxiliary.route.transient_retries`` instead
+    and default to **0**. Retrying a routed lane is not a meaningful recovery
+    — the main lane is right there and always can serve — and the retries are
+    what push a routed approval past the human approval deadline.
     """
+    if route_derived:
+        route = _get_auxiliary_route_config()
+        raw = route.get("transient_retries") if isinstance(route, dict) else None
+        if raw is None:
+            return _DEFAULT_ROUTE_TRANSIENT_RETRIES
+        try:
+            return max(0, min(int(raw), 6))
+        except (TypeError, ValueError):
+            return _DEFAULT_ROUTE_TRANSIENT_RETRIES
     try:
         from hermes_cli.config import cfg_get, load_config
 
@@ -6022,7 +6038,11 @@ def _client_cache_key(
     # model its own client, so concurrent fan-out calls never cross-close.
     model_key = model or runtime.get("model", "")
     api_key_key = _runtime_cache_discriminator("api_key", api_key or "")
-    return (provider, async_mode, base_url or "", api_key_key, api_mode or "", runtime_key, is_vision, task_key, pool_hint, model_key)
+    # A live ``auxiliary.route`` edit must rebuild rather than serve a client
+    # built for the previous lane. Empty string when no route is configured,
+    # so the key is unchanged for everyone who never sets one.
+    route_key = _auxiliary_route_cache_token()
+    return (provider, async_mode, base_url or "", api_key_key, api_mode or "", runtime_key, is_vision, task_key, pool_hint, model_key, route_key)
 
 
 def _store_cached_client(cache_key: tuple, client: Any, default_model: Optional[str], *, bound_loop: Any = None) -> None:
@@ -6339,6 +6359,350 @@ _AUX_DIRECT_API_BASE_URLS: Dict[str, str] = {
 }
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Global auxiliary route (``auxiliary.route``)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# WHY THIS EXISTS — prompt-cache / KV-slot protection.
+#
+# Every auxiliary task defaults to ``provider: auto``, and ``_resolve_auto``
+# priority 1 is "main provider + main model".  On a single-slot inference
+# server that means a ~2-6K-token approval or title call evicts the KV slot
+# holding the user's 95K-token conversation: the next main turn re-reads the
+# whole prefix from scratch.  ``auxiliary.route`` gives every short aux call
+# ONE alternative lane so the main conversation's slot is never disturbed.
+#
+# PRECEDENCE:  auxiliary.<task>.*   >   auxiliary.route.*   >   "auto" (main)
+#
+# The default is EMPTY.  With nothing configured every helper below returns
+# "no route" after a single (already-cached) config read and resolution is
+# byte-identical to the pre-route behaviour.
+#
+# Deliberately NOT routed:
+#   * ``vision``            — an image payload needs a multimodal model.  The
+#     vision path has its own capability-aware auto chain
+#     (``_VISION_AUTO_PROVIDER_ORDER`` + ``_main_model_supports_vision``) that
+#     a generic text route knows nothing about; sending a screenshot down a
+#     text lane is a hard capability mismatch, not a cache optimisation.
+#     Users who want a dedicated vision lane already have
+#     ``auxiliary.vision.*`` — the per-task pin.
+#   * ``moa_reference`` / ``moa_aggregator`` — a MoA slot IS a per-slot model
+#     pin (``moa.presets.<name>.reference_models[]``), and the ensemble's whole
+#     value is model diversity. ``agent/moa_loop.py`` always passes an explicit
+#     provider, so the route would not fire anyway; naming them here means a
+#     slot with a blank provider can never collapse the ensemble onto one lane.
+#   * ``background_review`` / ``curator`` — both resolve their own runtime
+#     from raw config (``agent/background_review.py::_resolve_review_runtime``,
+#     ``agent/curator.py::_resolve_review_runtime``) and never call through
+#     this function.  They are main-model-first ON PURPOSE: they replay the
+#     transcript that is already warm in the main prompt cache.
+#   * calls with no ``task`` (``agent/plugin_llm.py``,
+#     ``trajectory_compressor.py``) — they stay on ``auto``.
+_AUX_ROUTE_EXCLUDED_TASKS = frozenset({"vision", "moa_reference", "moa_aggregator"})
+
+# A routed lane that is unreachable is quarantined for this long so a dead
+# endpoint costs its penalty once per TTL instead of once per auxiliary call.
+#
+# This is a SEPARATE cache from ``_aux_unhealthy_until`` on purpose.  That one
+# is keyed by provider *chain label* and is consulted by
+# ``_try_main_agent_model_fallback`` (:4090), which bails out when the main
+# provider is marked unhealthy.  A route pointing at a label that normalises
+# onto the main provider's label would therefore disable the very fallback
+# that keeps unattended turns moving.  The route quarantine only ever
+# suppresses the route.
+_AUX_ROUTE_UNHEALTHY_TTL_SECONDS = 600
+_aux_route_unhealthy_until: Dict[str, float] = {}
+
+
+def _get_auxiliary_route_config() -> Dict[str, Any]:
+    """Return the raw ``auxiliary.route`` mapping, or ``{}`` when unset."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        config = load_config_readonly()
+    except Exception:
+        return {}
+    aux = config.get("auxiliary", {}) if isinstance(config, dict) else {}
+    route = aux.get("route", {}) if isinstance(aux, dict) else {}
+    return route if isinstance(route, dict) else {}
+
+
+def _auxiliary_route_target(
+    route: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Optional[str]]]:
+    """Resolve ``auxiliary.route`` into a concrete lane, or ``None`` when off.
+
+    A route is "on" as soon as it names a ``provider`` (anything other than
+    the ``auto`` sentinel) or a ``base_url``.  A bare ``base_url`` is
+    normalised to ``provider: custom`` so the caller's later
+    ``cfg_provider``-driven returns carry the endpoint instead of silently
+    dropping it.
+    """
+    if route is None:
+        route = _get_auxiliary_route_config()
+    if not route:
+        return None
+    provider = str(route.get("provider", "") or "").strip() or None
+    base_url = str(route.get("base_url", "") or "").strip() or None
+    if provider and provider.lower() == "auto":
+        provider = None
+    if not provider and not base_url:
+        return None
+    named_provider = provider
+    if not provider:
+        provider = "custom"
+    api_key = str(route.get("api_key", "") or "").strip() or None
+    if not api_key:
+        key_env = str(
+            route.get("key_env") or route.get("api_key_env") or ""
+        ).strip()
+        if key_env:
+            api_key = os.getenv(key_env, "").strip() or None
+    model = str(route.get("model", "") or "").strip() or None
+    if model and model.lower() == "auto":
+        # Same sentinel handling as auxiliary.<task>.model — "auto" is not a
+        # model id, and sending it on the wire yields a 200 with an error body.
+        model = None
+    if not model and named_provider:
+        # A ``providers:``/``custom_providers:`` entry declares its own default
+        # model. Leave it blank and the shared resolver
+        # (resolve_provider_client, "if not model and provider != auto") fills
+        # it from ``_read_main_model()`` — i.e. it sends the MAIN model's id to
+        # the auxiliary endpoint, which is the one thing this lane must not do.
+        try:
+            from hermes_cli.runtime_provider import _get_named_custom_provider
+
+            entry = _get_named_custom_provider(named_provider)
+        except Exception:
+            entry = None
+        if entry:
+            model = str(entry.get("model") or "").strip() or None
+    api_mode = str(route.get("api_mode", "") or "").strip() or None
+    return {
+        "provider": provider,
+        "model": model,
+        "base_url": base_url,
+        "api_key": api_key,
+        "api_mode": api_mode,
+    }
+
+
+def auxiliary_route_is_configured() -> bool:
+    """True when the user has configured a global ``auxiliary.route`` lane.
+
+    Public because agent startup only pays for route-specific wiring
+    (preflight, the operator warning sink) when a route actually exists.
+    """
+    return _auxiliary_route_target() is not None
+
+
+def _route_identity(target: Optional[Dict[str, Optional[str]]]) -> str:
+    """Stable, secret-free identity for a resolved route lane."""
+    if not target:
+        return ""
+    return "|".join(
+        str(target.get(field) or "")
+        for field in ("provider", "model", "base_url", "api_mode")
+    )
+
+
+def _mark_route_unhealthy(reason: str, ttl: Optional[float] = None) -> None:
+    """Quarantine the current auxiliary route so the next calls skip it."""
+    identity = _route_identity(_auxiliary_route_target())
+    if not identity:
+        return
+    seconds = ttl if ttl is not None else _AUX_ROUTE_UNHEALTHY_TTL_SECONDS
+    _aux_route_unhealthy_until[identity] = time.time() + seconds
+    logger.warning(
+        "Auxiliary route %s is unreachable (%s) — auxiliary tasks fall back to "
+        "the main lane for the next %ds.",
+        identity.split("|", 1)[0] or "route", reason, int(seconds),
+    )
+
+
+def _route_is_quarantined(
+    target: Optional[Dict[str, Optional[str]]] = None,
+) -> bool:
+    """True while the resolved route is inside its unreachable-lane TTL."""
+    identity = _route_identity(target if target is not None else _auxiliary_route_target())
+    if not identity:
+        return False
+    expires_at = _aux_route_unhealthy_until.get(identity)
+    if expires_at is None:
+        return False
+    if time.time() >= expires_at:
+        _aux_route_unhealthy_until.pop(identity, None)
+        return False
+    return True
+
+
+def _task_config_pins_lane(task_config: Optional[Dict[str, Any]]) -> bool:
+    """True when ``auxiliary.<task>`` names its own lane, so the route defers.
+
+    ``provider``, ``base_url`` AND ``model`` all count as a per-task pin.
+    ``model`` is included deliberately: model ids are lane-specific, so
+    carrying a model that was pinned for the main lane onto a different
+    endpoint is how you get a 404 instead of an answer.  A task that pins a
+    model keeps today's behaviour; opt it into the route by naming the route's
+    provider on the task itself.
+    """
+    if not isinstance(task_config, dict):
+        return False
+    provider = str(task_config.get("provider", "") or "").strip().lower()
+    if provider and provider != "auto":
+        return True
+    if str(task_config.get("base_url", "") or "").strip():
+        return True
+    model = str(task_config.get("model", "") or "").strip().lower()
+    return bool(model) and model != "auto"
+
+
+def _route_is_active_for_task(task: Optional[str]) -> bool:
+    """True when ``auxiliary.route`` owns resolution for *task*.
+
+    Pure config + quarantine state — no client construction, no network.  This
+    is what ``call_llm`` / ``async_call_llm`` consult to learn that a concrete
+    ``resolved_provider`` came from the global route rather than from a user's
+    explicit per-task pin, WITHOUT changing ``_resolve_task_provider_model``'s
+    5-tuple contract (roughly twenty tests patch that function and would
+    silently stop asserting anything if the call moved off it).
+    """
+    if not task or task in _AUX_ROUTE_EXCLUDED_TASKS:
+        return False
+    target = _auxiliary_route_target()
+    if target is None or _route_is_quarantined(target):
+        return False
+    return not _task_config_pins_lane(_get_auxiliary_task_config(task))
+
+
+def _call_is_route_derived(
+    task: Optional[str],
+    provider: Optional[str],
+    base_url: Optional[str],
+) -> bool:
+    """True when this call's provider was supplied by the global route.
+
+    An explicit ``provider=``/``base_url=`` argument always beats the route,
+    so those calls are never route-derived.
+    """
+    if provider or base_url:
+        return False
+    return _route_is_active_for_task(task)
+
+
+def _auxiliary_route_cache_token() -> str:
+    """Cache-key component identifying the active route (``""`` when off).
+
+    Keeps a live ``auxiliary.route`` edit from being served a stale client that
+    was built for the previous lane.  Empty when no route is configured, so the
+    cache key is unchanged for every user who never sets one.
+    """
+    target = _auxiliary_route_target()
+    if target is None:
+        return ""
+    api_key = target.get("api_key") or ""
+    digest = (
+        hashlib.blake2b(api_key.encode("utf-8"), digest_size=8).hexdigest()
+        if api_key else ""
+    )
+    return f"{_route_identity(target)}|{digest}"
+
+
+# ── Operator-visible routed-lane failures ───────────────────────────────────
+#
+# A routed lane that fails is invisible today: ``tools/approval.py`` swallows
+# the exception and quietly escalates to a human prompt. The agent already has
+# a chat-visible channel for degraded side paths
+# (``AIAgent._emit_auxiliary_failure``, wired for title generation and
+# background review), but module-level helpers like ``_smart_approve`` hold no
+# agent handle. The live agent registers its bound method here — ONLY when a
+# route is configured — so the operator gets one attributed warning in chat
+# instead of nothing. Inert (and unregistered) by default.
+_auxiliary_failure_notifier: Optional[Any] = None
+_AUX_FAILURE_NOTIFY_INTERVAL_SECONDS = 60.0
+_aux_failure_notified_at: Dict[str, float] = {}
+
+
+def set_auxiliary_failure_notifier(callback: Optional[Any]) -> None:
+    """Register (or clear with ``None``) the chat sink for aux failures.
+
+    Last writer wins. Concurrent agents share one sink; this is a best-effort
+    visibility channel, not a delivery guarantee, and a failure to notify must
+    never affect the call it is reporting on.
+    """
+    global _auxiliary_failure_notifier
+    _auxiliary_failure_notifier = callback
+
+
+def _notify_auxiliary_failure(task: Optional[str], exc: BaseException) -> None:
+    """Surface a routed-lane failure to the operator, at most once a minute."""
+    callback = _auxiliary_failure_notifier
+    if callback is None:
+        return
+    key = task or "call"
+    now = time.time()
+    if now - _aux_failure_notified_at.get(key, 0.0) < _AUX_FAILURE_NOTIFY_INTERVAL_SECONDS:
+        return
+    _aux_failure_notified_at[key] = now
+    try:
+        callback(f"{key} on the auxiliary route", exc)
+    except Exception:
+        logger.debug("auxiliary failure notifier raised", exc_info=True)
+
+
+def preflight_auxiliary_route() -> Optional[str]:
+    """Resolve ``auxiliary.route`` once and return a warning, or ``None``.
+
+    Mirrors :func:`agent.conversation_compression.check_compression_model_feasibility`
+    — catch a misconfigured lane at session start instead of discovering it as
+    a silent 401 mid-turn.  Returns ``None`` immediately when no route is
+    configured, so the default path builds no client and touches no network.
+
+    The ``no-key-required`` case is called out explicitly: ``resolve_provider_client``
+    substitutes that literal string when a named provider has no resolvable
+    key and sends the request anyway, which 401s on any auth-required
+    endpoint.
+    """
+    target = _auxiliary_route_target()
+    if target is None:
+        return None
+    label = target["provider"] or target["base_url"] or "route"
+    try:
+        client, model = resolve_provider_client(
+            target["provider"],
+            model=target["model"],
+            explicit_base_url=target["base_url"],
+            explicit_api_key=target["api_key"],
+            api_mode=target["api_mode"],
+        )
+    except Exception as exc:
+        return (
+            f"⚠ auxiliary.route '{label}' could not be resolved ({exc.__class__.__name__}: "
+            f"{exc}). Auxiliary tasks will fall back to your main model."
+        )
+    if client is None:
+        return (
+            f"⚠ auxiliary.route '{label}' resolved to no client — check the "
+            "provider name, base_url and credentials in config.yaml. "
+            "Auxiliary tasks will fall back to your main model."
+        )
+    raw_key = getattr(client, "api_key", "")
+    resolved_key = (
+        "" if (callable(raw_key) and not isinstance(raw_key, str)) else str(raw_key or "")
+    )
+    if resolved_key == "no-key-required":
+        return (
+            f"⚠ auxiliary.route '{label}' has no resolvable API key — requests "
+            "will be sent with the 'no-key-required' placeholder and will 401 "
+            "on any endpoint that needs auth. Set auxiliary.route.api_key, "
+            "auxiliary.route.key_env, or the provider entry's key_env."
+        )
+    logger.info(
+        "Auxiliary route: %s (%s) resolved for auxiliary tasks",
+        label, model or "provider default",
+    )
+    return None
+
+
 def _resolve_task_provider_model(
     task: str = None,
     provider: str = None,
@@ -6379,6 +6743,40 @@ def _resolve_task_provider_model(
             if cfg_key_env:
                 cfg_api_key = os.getenv(cfg_key_env, "").strip() or None
         cfg_api_mode = str(task_config.get("api_mode", "")).strip() or None
+
+        # ── Global auxiliary route ────────────────────────────────────────
+        # The task named no lane of its own, so ``auxiliary.route`` fills in
+        # before "auto" (= the main model's endpoint) would. This is the ONE
+        # insertion point: every auxiliary entry point (call_llm,
+        # async_call_llm, get_text_auxiliary_client,
+        # get_async_text_auxiliary_client, resolve_vision_provider_client)
+        # funnels through this function.
+        #
+        # NOT hooked in _resolve_auto: agent/agent_init.py builds the MAIN
+        # agent's client with resolve_provider_client(agent.provider or
+        # "auto", ...), so a hook there would hijack the main lane.
+        # NOT hooked in _get_auxiliary_task_config, and the route is never
+        # materialised as auxiliary.vision: agent/image_routing.py and
+        # tools/computer_use/vision_routing.py read RAW config to choose
+        # native-vs-aux image handling and would flip.
+        #
+        # An explicit ``provider=``/``base_url=`` argument beats the route, and
+        # skipping the substitution for those calls keeps this branch exactly
+        # equivalent to ``_call_is_route_derived`` — which is what lets
+        # call_llm trust that predicate about the provider it just resolved.
+        if (
+            not provider
+            and not base_url
+            and task not in _AUX_ROUTE_EXCLUDED_TASKS
+            and not _task_config_pins_lane(task_config)
+        ):
+            _route_target = _auxiliary_route_target()
+            if _route_target is not None and not _route_is_quarantined(_route_target):
+                cfg_provider = _route_target["provider"] or cfg_provider
+                cfg_model = _route_target["model"] or cfg_model
+                cfg_base_url = _route_target["base_url"] or cfg_base_url
+                cfg_api_key = _route_target["api_key"] or cfg_api_key
+                cfg_api_mode = _route_target["api_mode"] or cfg_api_mode
 
     # 'auto' is a sentinel meaning "inherit from main runtime / auto-detect", not
     # a literal model id. Without this, a config of `auxiliary.<task>.model: auto`
@@ -6484,6 +6882,12 @@ _DEFAULT_AUX_TIMEOUT = 30.0
 # is kept unchanged.
 _COMPRESSION_TIMEOUT_FLOOR_SECONDS = 300.0
 
+# A routed ``approval`` call gets at most this fraction of ``approvals.timeout``
+# (never less than the floor), so the aux lane always answers — or falls back —
+# before the human approval prompt would give up. See G3 in the route notes.
+_ROUTED_APPROVAL_TIMEOUT_FRACTION = 0.4
+_ROUTED_APPROVAL_TIMEOUT_FLOOR = 5.0
+
 
 def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
     """Return the config dict for auxiliary.<task>, or {} when unavailable.
@@ -6543,7 +6947,43 @@ def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float
     return default
 
 
-def _effective_aux_timeout(task: str, timeout: Optional[float]) -> float:
+def _human_approval_timeout_seconds() -> float:
+    """Read ``approvals.timeout`` — the deadline a human prompt waits on.
+
+    Mirrors ``tools.approval._get_approval_timeout`` (same key, same 60 s
+    default) without importing the approval module from the LLM layer.
+    """
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        return float(cfg_get(load_config_readonly(), "approvals", "timeout", default=60))
+    except Exception:
+        return 60.0
+
+
+def _routed_approval_timeout_ceiling() -> float:
+    """Hard ceiling for a routed ``approval`` call, below the human deadline.
+
+    A routed smart-approval that out-waits ``approvals.timeout`` is the exact
+    shape of the trap this feature has to avoid: the aux lane is still hanging
+    when the human prompt gives up, so every flagged command in an unattended
+    run costs a full approval timeout and then a hard BLOCKED / halting
+    ``pending_approval``. Keeping the routed budget a fraction of the human
+    deadline means the aux answer (or its fallback to the main lane) always
+    lands first.
+    """
+    return max(
+        _ROUTED_APPROVAL_TIMEOUT_FLOOR,
+        _human_approval_timeout_seconds() * _ROUTED_APPROVAL_TIMEOUT_FRACTION,
+    )
+
+
+def _effective_aux_timeout(
+    task: str,
+    timeout: Optional[float],
+    *,
+    route_derived: bool = False,
+) -> float:
     """Resolve the effective timeout for an auxiliary LLM call.
 
     Uses the caller-provided ``timeout`` when given; otherwise reads
@@ -6553,11 +6993,59 @@ def _effective_aux_timeout(task: str, timeout: Optional[float]) -> float:
     (#54915).  The floor is intentionally skipped when the caller passes an
     explicit ``timeout=`` — explicit per-call deadlines are always honoured —
     and it is a minimum (``max``), so a config value already above it is kept.
+
+    Route-derived calls may set their own budget via
+    ``auxiliary.route.timeout``; and a routed ``approval`` is additionally
+    capped below ``approvals.timeout`` (see
+    :func:`_routed_approval_timeout_ceiling`).  The approval cap applies even
+    to an explicit ``timeout=`` because out-waiting the human deadline is a
+    correctness failure, not a preference.
     """
     effective = timeout if timeout is not None else _get_task_timeout(task)
+    if timeout is None and route_derived:
+        route_timeout = _route_timeout_override()
+        if route_timeout is not None:
+            effective = route_timeout
     if timeout is None and task == "compression":
         effective = max(effective, _COMPRESSION_TIMEOUT_FLOOR_SECONDS)
+    if route_derived and task == "approval":
+        effective = min(effective, _routed_approval_timeout_ceiling())
     return effective
+
+
+def _route_timeout_override() -> Optional[float]:
+    """Read ``auxiliary.route.timeout``; ``None`` when unset or non-positive."""
+    route = _get_auxiliary_route_config()
+    raw = route.get("timeout") if isinstance(route, dict) else None
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _aux_call_budget_seconds(
+    task: Optional[str],
+    *,
+    route_derived: bool = False,
+    timeout: Optional[float] = None,
+) -> float:
+    """Worst-case wall-clock an auxiliary call can spend before falling back.
+
+    ``effective_timeout`` per attempt, plus the exponential backoff between
+    the same-provider transient retries.  Exposed so callers (and tests) can
+    prove a routed lane's budget stays under a deadline that matters — e.g.
+    ``approvals.timeout``.
+    """
+    effective = _effective_aux_timeout(task, timeout, route_derived=route_derived)
+    retries = _transient_retry_count(route_derived=route_derived)
+    backoff = sum(
+        min(_TRANSIENT_RETRY_BACKOFF_BASE * (2.0 ** (attempt - 1)), 8.0)
+        for attempt in range(1, retries + 1)
+    )
+    return effective * (retries + 1) + backoff
 
 
 def _get_task_extra_body(task: str) -> Dict[str, Any]:
@@ -7085,6 +7573,11 @@ def call_llm(
     main_runtime = _normalize_main_runtime(main_runtime)
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
+    # Did that concrete provider come from ``auxiliary.route`` rather than
+    # from a user's explicit per-task pin? Consulted as pure config (see
+    # _route_is_active_for_task) instead of widening the 5-tuple above, which
+    # ~20 tests patch by arity.
+    route_derived = _call_is_route_derived(task, provider, base_url)
     if api_mode:
         resolved_api_mode = api_mode
     effective_extra_body = _get_task_extra_body(task)
@@ -7159,7 +7652,7 @@ def call_llm(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 
-    effective_timeout = _effective_aux_timeout(task, timeout)
+    effective_timeout = _effective_aux_timeout(task, timeout, route_derived=route_derived)
 
     # Log what we're about to do — makes auxiliary operations visible
     _base_info = str(getattr(client, "base_url", resolved_base_url) or "")
@@ -7238,7 +7731,7 @@ def call_llm(
                     transient_err,
                 )
                 raise
-            _max_transient_retries = _transient_retry_count()
+            _max_transient_retries = _transient_retry_count(route_derived=route_derived)
             _last_transient = transient_err
             for _attempt in range(1, _max_transient_retries + 1):
                 _backoff = min(_TRANSIENT_RETRY_BACKOFF_BASE * (2.0 ** (_attempt - 1)), 8.0)
@@ -7543,7 +8036,15 @@ def call_llm(
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
-        if should_fallback and (is_auto or is_capacity_error):
+        # A provider that came from ``auxiliary.route`` is a routing DEFAULT,
+        # not the explicit per-task pin ``is_auto`` exists to respect. Without
+        # this, an aux endpoint that is UP but returns 401 skips the whole
+        # fallback block (auth is not a capacity error), the exception reaches
+        # tools/approval.py::_smart_approve, and EVERY smart auto-approval
+        # silently becomes a human prompt — a 60 s stall per flagged command
+        # in an unattended run. With it, the same dud costs one warning and
+        # the main lane answers.
+        if should_fallback and (is_auto or is_capacity_error or route_derived):
             if _is_auth_error(first_err):
                 reason = "auth error"
             elif _is_payment_error(first_err):
@@ -7563,6 +8064,17 @@ def call_llm(
                 reason = "invalid provider response"
             else:
                 reason = "connection error"
+            if route_derived and _is_connection_error(first_err):
+                # A dead routed lane pays its penalty once per TTL instead of
+                # once per auxiliary call.
+                _mark_route_unhealthy(reason)
+            if route_derived:
+                logger.warning(
+                    "Auxiliary %s: %s on the configured auxiliary.route (%s) — "
+                    "falling back to the main lane: %s",
+                    task or "call", reason, resolved_provider, first_err,
+                )
+                _notify_auxiliary_failure(task, first_err)
             logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
                         task or "call", reason, resolved_provider, first_err)
 
@@ -7716,6 +8228,9 @@ async def async_call_llm(
     main_runtime = _normalize_main_runtime(main_runtime)
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
+    # See call_llm(): route-derived providers are a routing default, not the
+    # user's explicit per-task pin.
+    route_derived = _call_is_route_derived(task, provider, base_url)
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
 
@@ -7781,7 +8296,7 @@ async def async_call_llm(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 
-    effective_timeout = _effective_aux_timeout(task, timeout)
+    effective_timeout = _effective_aux_timeout(task, timeout, route_derived=route_derived)
 
     # Pass the client's actual base_url (not just resolved_base_url) so
     # endpoint-specific temperature overrides can distinguish
@@ -8065,7 +8580,9 @@ async def async_call_llm(
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
-        if should_fallback and (is_auto or is_capacity_error):
+        # See call_llm(): a route-derived provider is a routing default, so an
+        # auth (or any) failure on it still falls back to the main lane.
+        if should_fallback and (is_auto or is_capacity_error or route_derived):
             if _is_auth_error(first_err):
                 reason = "auth error"
             elif _is_payment_error(first_err):
@@ -8081,6 +8598,15 @@ async def async_call_llm(
                 reason = "invalid provider response"
             else:
                 reason = "connection error"
+            if route_derived and _is_connection_error(first_err):
+                _mark_route_unhealthy(reason)
+            if route_derived:
+                logger.warning(
+                    "Auxiliary %s (async): %s on the configured auxiliary.route "
+                    "(%s) — falling back to the main lane: %s",
+                    task or "call", reason, resolved_provider, first_err,
+                )
+                _notify_auxiliary_failure(task, first_err)
             logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",
                         task or "call", reason, resolved_provider, first_err)
 

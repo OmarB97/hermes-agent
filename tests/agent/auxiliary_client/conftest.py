@@ -33,9 +33,12 @@ def _clean_env(monkeypatch):
     import agent.auxiliary_client as _aux_mod
     _aux_mod._aux_unhealthy_until.clear()
     _aux_mod._aux_unhealthy_logged_at.clear()
+    # Same hazard for the auxiliary.route quarantine (10-min TTL).
+    _aux_mod._aux_route_unhealthy_until.clear()
     yield
     _aux_mod._aux_unhealthy_until.clear()
     _aux_mod._aux_unhealthy_logged_at.clear()
+    _aux_mod._aux_route_unhealthy_until.clear()
 
 
 @pytest.fixture

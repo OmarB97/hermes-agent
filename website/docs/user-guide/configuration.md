@@ -863,20 +863,20 @@ Hermes has separate timeout layers for streaming, plus a stale detector for non-
 | Timeout | Default | Local providers | Config / env |
 |---------|---------|----------------|--------------|
 | Socket read timeout | 120s | Auto-raised to 1800s | `HERMES_STREAM_READ_TIMEOUT` |
-| Stale stream detection | 180s | Auto-disabled | `HERMES_STREAM_STALE_TIMEOUT` |
+| Stale stream detection | 180s | Auto-raised to a 900s ceiling | `agent.local_stream_stale_timeout` / `HERMES_STREAM_STALE_TIMEOUT` |
 | Stale non-stream detection | 300s | Auto-disabled when left implicit | `providers.<id>.stale_timeout_seconds` or `HERMES_API_CALL_STALE_TIMEOUT` |
 | Pre-first-chunk (local DFlash) | Scales with context | Scales with context | `providers.<id>.first_chunk_timeout_seconds` |
 | API call (non-streaming) | 1800s | Unchanged | `providers.<id>.request_timeout_seconds` / `timeout_seconds` or `HERMES_API_TIMEOUT` |
 
 The **socket read timeout** controls how long httpx waits for the next chunk of data from the provider. Local LLMs can take minutes for prefill on large contexts before producing the first token, so Hermes raises this to 30 minutes when it detects a local endpoint. If you explicitly set `HERMES_STREAM_READ_TIMEOUT`, that value is always used regardless of endpoint detection.
 
-The **stale stream detection** kills connections that receive SSE keep-alive pings but no actual content. This is disabled entirely for local providers since they don't send keep-alive pings during prefill.
+The **stale stream detection** kills connections that receive SSE keep-alive pings but no actual content. Local providers get a far more generous ceiling instead of the 180s default — `agent.local_stream_stale_timeout` (900s), widened further by the request's context-scaled prefill cost so a large prompt on slow hardware is not killed mid-prefill. It stays finite on purpose: a crashed or deadlocked local server has to eventually trip the detector so reconnect and fallback can run, rather than parking the session forever. Set it to `0` if you want the old unbounded wait back, or set `HERMES_STREAM_STALE_TIMEOUT` / `providers.<id>.stale_timeout_seconds` to pin one value everywhere.
 
 The **stale non-stream detection** kills non-streaming calls that produce no response for too long. By default Hermes disables this on local endpoints to avoid false positives during long prefills. If you explicitly set `providers.<id>.stale_timeout_seconds`, `providers.<id>.models.<model>.stale_timeout_seconds`, or `HERMES_API_CALL_STALE_TIMEOUT`, that explicit value is honored even on local endpoints.
 
 The **pre-first-chunk timeout** is how long Hermes waits for the *first* streamed token on a local DeepSeek-V4 Flash endpoint. That window covers queue admission, model load, and prefill of the entire prompt, so it grows with the conversation: a 95K-token turn is budgeted far longer than a 20K one. Set `providers.<id>.first_chunk_timeout_seconds` (or `providers.<id>.models.<model>.first_chunk_timeout_seconds`) to pin it yourself — it outranks `stale_timeout_seconds`, because waiting for the first token and waiting between tokens measure different things, and a slow-prefill lane can reasonably want minutes for one and seconds for the other.
 
-Declare these under the **named** provider entry (`providers.ai-router`), not under `custom`. Every user-declared endpoint resolves to the billing class `custom` at runtime; Hermes maps it back to the entry that owns the endpoint URL.
+Declare these under the **named** provider entry (`providers.my-local-lane`), not under `custom`. Every user-declared endpoint resolves to the billing class `custom` at runtime; Hermes maps it back to the entry that owns the endpoint URL.
 
 ## Context Pressure Warnings
 
@@ -1023,11 +1023,115 @@ Available providers for auxiliary tasks: `auto`, `main`, plus any provider in th
 The `"main"` provider option means "use whatever provider my main agent uses" — it's only valid inside `auxiliary:`, `compression:`, and primary fallback entries (`fallback_providers:` or legacy `fallback_model:`). It is **not** a valid value for your top-level `model.provider` setting. If you use a custom OpenAI-compatible endpoint, set `provider: custom` in your `model:` section. See [AI Providers](/integrations/providers) for all main model provider options.
 :::
 
+### One lane for every auxiliary task (`auxiliary.route`)
+
+Setting each task individually gets repetitive when the answer is the same for
+all of them: *"send the short side calls somewhere that isn't my main model."*
+`auxiliary.route` is that single setting.
+
+```yaml
+auxiliary:
+  route:
+    provider: "openrouter"
+    model: "google/gemini-3-flash-preview"
+```
+
+Every auxiliary task that pins nothing of its own — smart approval, goal judge,
+title generation, compression, web extraction, MCP reasoning, and the rest —
+now runs there instead of on your main chat model.
+
+**Why you would want this.** Cost is the obvious reason, but the bigger one is
+**prompt-cache protection**. Auxiliary calls are short; your conversation is
+not. On a single-slot local inference server a 2–6K-token approval check
+evicts the KV slot holding a 95K-token conversation, and your next real turn
+re-reads the entire prefix from scratch instead of hitting the cache. Moving
+the short calls off that endpoint keeps the conversation's slot warm. The same
+logic applies to hosted providers with per-conversation prompt caching, just
+with a smaller cliff.
+
+**Precedence** — most specific wins:
+
+```
+auxiliary.<task>.*     →  auxiliary.route.*     →  "auto" (your main model)
+```
+
+So `auxiliary.route` changes what `"auto"` resolves to. A task that names its
+own `provider`, `base_url`, or `model` keeps that, untouched.
+
+**Opting one task back onto the main model** is one line — `"main"` is an
+explicit per-task pin, so it beats the route:
+
+```yaml
+auxiliary:
+  route:
+    provider: "openrouter"
+    model: "google/gemini-3-flash-preview"
+  compression:
+    provider: "main"          # summarise on the main model after all
+```
+
+**Every field**, all optional and all empty by default:
+
+| Key | What it does |
+|-----|-------------|
+| `provider` | Provider id, or the name of a `providers:` / `custom_providers:` entry |
+| `model` | Model to request; empty uses the provider's (or the entry's) default |
+| `base_url` | Direct OpenAI-compatible endpoint instead of a provider |
+| `api_key` | Inline key for `base_url` |
+| `key_env` | Name of the env var holding the key (preferred over `api_key`) |
+| `api_mode` | `chat_completions`, `codex_responses`, `anthropic_messages` |
+| `timeout` | Seconds per routed call; `0` keeps each task's own timeout |
+| `transient_retries` | Same-lane retries on a transport blip; **default `0`** |
+
+Set `model` explicitly when you route to a bare `base_url` — there is no
+provider entry to read a default from, and a model id from one endpoint rarely
+exists on another.
+
+:::note Vision and MoA are not routed
+Image payloads need a multimodal model, and the vision path has its own
+capability-aware provider chain. `auxiliary.route` is a text lane; use
+`auxiliary.vision` to give screenshots and image analysis their own backend.
+Mixture-of-Agents slots are skipped too — a MoA slot is already a per-slot
+model pin, and the ensemble's value is model diversity.
+:::
+
+:::note Background review and the curator stay on your main model
+Both replay the conversation transcript, which is *already warm* in your main
+model's prompt cache — running them elsewhere would pay a full cold write for
+no cache benefit. They read `auxiliary.background_review` /`auxiliary.curator`
+directly and ignore the route. Set those blocks explicitly if you want them
+moved.
+:::
+
+:::warning Cache protection is best-effort by design
+With the default `fallback_policy: "any"`, an auxiliary lane that is
+unreachable — or that answers with a 401 — silently falls back to your main
+model rather than failing the task. That is deliberate: smart approvals fail
+*closed* to a human prompt, so a routed lane that simply errored out would turn
+every flagged command in an unattended run into a stalled approval. You get a
+warning in chat and in `errors.log`, the main model answers, and an unreachable
+lane is skipped for ten minutes instead of being retried on every call. If a
+route is configured but you keep seeing auxiliary traffic on your main model,
+check `hermes logs --level warning`.
+:::
+
 ### Full auxiliary config reference
 
 ```yaml
 auxiliary:
-  # Image analysis (vision_analyze tool + browser screenshots)
+  # Optional single lane for every task that pins nothing of its own.
+  # Empty = off (the default): tasks resolve to "auto" = your main model.
+  route:
+    provider: ""               # provider id, or a providers:/custom_providers: entry name
+    model: ""                  # empty = provider / entry default
+    base_url: ""               # direct OpenAI-compatible endpoint instead of a provider
+    api_key: ""                # inline key for base_url
+    key_env: ""                # env var holding the key (preferred)
+    api_mode: ""               # chat_completions | codex_responses | anthropic_messages
+    timeout: 0                 # seconds; 0 = use each task's own timeout
+    transient_retries: 0       # routed lanes do not retry by default
+
+  # Image analysis (vision_analyze tool + browser screenshots) — never routed
   vision:
     provider: "auto"           # "auto", "openrouter", "nous", "codex", "main", etc.
     model: ""                  # e.g. "openai/gpt-4o", "google/gemini-2.5-flash"
