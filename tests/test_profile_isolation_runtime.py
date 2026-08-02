@@ -211,14 +211,22 @@ class TestThreadContextPropagation:
 # M3 — RPC handlers that resolve HERMES_HOME before the per-turn binding
 # ---------------------------------------------------------------------------
 
+# A port nothing listens on. Provider validation may try to reach the endpoint;
+# it must fail as "unreachable" (a warning) rather than resolve to a real
+# service, and it must never make the test depend on the network.
+_DEAD_ENDPOINT = "http://127.0.0.1:9/v1"
+
+
 @pytest.fixture
 def gateway_two_profiles(tmp_path, monkeypatch):
     """A real profile root: launch profile "launcher" + foreign profile "worker".
 
-    Their ``config.yaml`` files name DIFFERENT default models, so any value that
-    leaks from the launch profile is visible in the assertion rather than
-    coincidentally equal (the reason the field-reported rows were ambiguous —
-    both real profiles happened to name the same default).
+    Their ``config.yaml`` files name DIFFERENT default models AND different
+    ``providers:`` entries, so any value that leaks from the launch profile is
+    visible in the assertion rather than coincidentally equal (the reason the
+    field-reported rows were ambiguous — both real profiles happened to name the
+    same default). Provider names are the sharper signal: they are per-profile
+    vocabulary, so a leaked one is not merely wrong, it is unresolvable.
 
     Yields ``(server, launcher_home, worker_home)`` with the gateway module
     posed as a backend launched under "launcher": ``HERMES_HOME`` is what the
@@ -228,10 +236,23 @@ def gateway_two_profiles(tmp_path, monkeypatch):
     root = tmp_path / "hermes-root"
     launcher = root / "profiles" / "launcher"
     worker = root / "profiles" / "worker"
-    for home, model in ((launcher, "launcher/model-A"), (worker, "worker/model-B")):
+    for home, model, provider in (
+        (launcher, "launcher/model-A", "launch-router"),
+        (worker, "worker/model-B", "worker-local"),
+    ):
         home.mkdir(parents=True)
         (home / "config.yaml").write_text(
-            f'model:\n  default: "{model}"\n', encoding="utf-8"
+            f"model:\n"
+            f"  provider: {provider}\n"
+            f'  default: "{model}"\n'
+            f'  base_url: "{_DEAD_ENDPOINT}"\n'
+            f"providers:\n"
+            f"  {provider}:\n"
+            f'    api: "{_DEAD_ENDPOINT}"\n'
+            f'    api_key: "sk-test"\n'
+            # Keep the picker offline: no catalog fetch, no pricing round-trip.
+            f"model_catalog:\n  enabled: false\n",
+            encoding="utf-8",
         )
 
     monkeypatch.setenv("HERMES_HOME", str(launcher))
@@ -372,3 +393,204 @@ class TestSessionProfileNameDoesNotFlip:
 
         assert info["profile_name"] == "worker"
         assert info["model"] == "worker/model-B"
+
+
+class TestComposerProviderPickUsesTargetProfile:
+    """The composer's provider pick — the catalog it picks FROM, and applying
+    the pick — must resolve under the session's profile.
+
+    ``providers:`` / ``custom_providers:`` are per-profile vocabulary, so a name
+    resolved against the launch profile is not merely a different choice: it is
+    a name the target profile cannot resolve, and the turn dies in agent init on
+    "Unknown provider '<name>'" (the husk-leaving failure #321 fixed for
+    ``hermes desktop spawn --provider``; this is the desktop composer's path to
+    the same dead end).
+    """
+
+    def _worker_session(self, server, worker):
+        session = {
+            "session_key": "s1",
+            "profile_home": str(worker),
+            "agent": None,
+            "cwd": str(worker),
+        }
+        server._sessions["S"] = session
+        return session
+
+    def test_model_options_offers_the_sessions_own_providers(
+        self, gateway_two_profiles
+    ):
+        server, _launcher, worker = gateway_two_profiles
+        self._worker_session(server, worker)
+        try:
+            resp = server.handle_request(
+                {
+                    "id": "1",
+                    "method": "model.options",
+                    "params": {"session_id": "S", "explicit_only": True},
+                }
+            )
+        finally:
+            server._sessions.pop("S", None)
+
+        result = resp["result"]
+        slugs = {p.get("slug", "") for p in (result.get("providers") or [])}
+        # Asserted as membership, not an exact list: the payload also carries
+        # whatever the host has credentials for, which is not this test's
+        # business. What matters is which profile's vocabulary is present.
+        assert "worker-local" in slugs
+        assert "launch-router" not in slugs, "launch profile's provider leaked"
+        assert result.get("provider") == "worker-local"
+        assert result.get("model") == "worker/model-B"
+
+    def test_applying_the_pick_resolves_the_sessions_own_provider(
+        self, gateway_two_profiles
+    ):
+        """The mirror failure, and the sharper one: before the fix a session
+        could not even switch to its OWN profile's provider — the launch
+        profile's config was consulted, so the valid name was rejected."""
+        server, _launcher, worker = gateway_two_profiles
+        self._worker_session(server, worker)
+        try:
+            resp = server.handle_request(
+                {
+                    "id": "1",
+                    "method": "config.set",
+                    "params": {
+                        "session_id": "S",
+                        "key": "model",
+                        "value": "worker/model-B --provider worker-local --session",
+                    },
+                }
+            )
+        finally:
+            server._sessions.pop("S", None)
+
+        assert "error" not in resp, resp.get("error")
+        assert resp["result"]["value"] == "worker/model-B"
+        assert resp["result"]["scope"] == "session"
+
+    def test_applying_a_foreign_providers_pick_is_still_rejected(
+        self, gateway_two_profiles
+    ):
+        """Binding the target profile is not the same as accepting anything: a
+        name only the LAUNCH profile defines must still fail, and now it fails
+        at the switch (reported to the client) instead of silently at turn
+        start."""
+        server, _launcher, worker = gateway_two_profiles
+        self._worker_session(server, worker)
+        try:
+            resp = server.handle_request(
+                {
+                    "id": "1",
+                    "method": "config.set",
+                    "params": {
+                        "session_id": "S",
+                        "key": "model",
+                        "value": "launcher/model-A --provider launch-router --session",
+                    },
+                }
+            )
+        finally:
+            server._sessions.pop("S", None)
+
+        assert "error" in resp
+        assert "launch-router" in resp["error"]["message"]
+
+    def test_launch_profile_session_is_unaffected(self, gateway_two_profiles):
+        """Control: a session with no profile_home takes the unbound path it
+        always did."""
+        server, _launcher, _worker = gateway_two_profiles
+        server._sessions["S"] = {"session_key": "s1", "agent": None}
+        try:
+            resp = server.handle_request(
+                {
+                    "id": "1",
+                    "method": "model.options",
+                    "params": {"session_id": "S", "explicit_only": True},
+                }
+            )
+        finally:
+            server._sessions.pop("S", None)
+
+        slugs = {p.get("slug", "") for p in (resp["result"].get("providers") or [])}
+        assert "launch-router" in slugs
+        assert "worker-local" not in slugs
+
+    def test_save_key_authenticates_the_sessions_own_profile(
+        self, gateway_two_profiles, monkeypatch
+    ):
+        """The picker's "connect" action writes to the profile whose providers
+        it is showing. ``.env`` is per-profile, so saving to the launcher would
+        leave the row the user just connected still unauthenticated."""
+        server, launcher, worker = gateway_two_profiles
+        monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+        self._worker_session(server, worker)
+        try:
+            resp = server.handle_request(
+                {
+                    "id": "1",
+                    "method": "model.save_key",
+                    "params": {
+                        "session_id": "S",
+                        "slug": "deepseek",
+                        "api_key": "sk-worker-test-key",
+                    },
+                }
+            )
+        finally:
+            server._sessions.pop("S", None)
+
+        assert "error" not in resp, resp.get("error")
+        assert "sk-worker-test-key" in (worker / ".env").read_text(encoding="utf-8")
+        assert not (launcher / ".env").exists(), "key landed in the launch profile"
+
+    def test_profile_param_scopes_the_picker_with_no_session(
+        self, gateway_two_profiles
+    ):
+        """The composer's other opening: the picker for a chat that does not
+        exist yet. There is no session to derive a profile from, so the client
+        names it — the same scoping the REST twin /api/model/options has always
+        had, which is why the two surfaces used to disagree."""
+        server, _launcher, _worker = gateway_two_profiles
+
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "model.options",
+                "params": {"profile": "worker", "explicit_only": True},
+            }
+        )
+
+        result = resp["result"]
+        slugs = {p.get("slug", "") for p in (result.get("providers") or [])}
+        assert "worker-local" in slugs
+        assert "launch-router" not in slugs
+        assert result.get("model") == "worker/model-B"
+
+    def test_live_sessions_own_home_beats_the_profile_param(
+        self, gateway_two_profiles
+    ):
+        """When both arrive and disagree, the session wins: its home is where
+        its turn will actually run, so that is the vocabulary that has to
+        resolve."""
+        server, _launcher, worker = gateway_two_profiles
+        self._worker_session(server, worker)
+        try:
+            resp = server.handle_request(
+                {
+                    "id": "1",
+                    "method": "model.options",
+                    "params": {
+                        "session_id": "S",
+                        "profile": "launcher",
+                        "explicit_only": True,
+                    },
+                }
+            )
+        finally:
+            server._sessions.pop("S", None)
+
+        slugs = {p.get("slug", "") for p in (resp["result"].get("providers") or [])}
+        assert "worker-local" in slugs
+        assert "launch-router" not in slugs

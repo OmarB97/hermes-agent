@@ -12393,73 +12393,94 @@ def _(rid, params: dict) -> dict:
 # ── Methods: config ──────────────────────────────────────────────────
 
 
+def _config_set_model(rid, params: dict, value, session: dict | None) -> dict:
+    """``config.set key=model`` — the composer's model/provider switch.
+
+    Extracted from the handler unchanged so its caller can bind the session's
+    profile home around the whole thing; every config and provider read below
+    resolves from HERMES_HOME.
+    """
+    try:
+        if not value:
+            return _err(rid, 4002, "model value required")
+        if session:
+            # Reject during an in-flight turn.  agent.switch_model()
+            # mutates self.model / self.provider / self.base_url /
+            # self.client in place; the worker thread running
+            # agent.run_conversation is reading those on every
+            # iteration.  A mid-turn swap can send an HTTP request
+            # with the new base_url but old model (or vice versa),
+            # producing 400/404s the user never asked for.  Parity
+            # with the gateway's running-agent /model guard.
+            if session.get("running"):
+                return _err(
+                    rid,
+                    4009,
+                    "session busy — /interrupt the current turn before switching models",
+                )
+            from hermes_cli.model_switch import parse_model_flags_detailed
+
+            parsed_flags = parse_model_flags_detailed(value)
+            explicit_provider = parsed_flags.explicit_provider
+            if session.get("agent") is None and not explicit_provider.strip():
+                session_id = params.get("session_id", "")
+                _start_agent_build(session_id, session)
+                init_err = _wait_agent(session, rid)
+                if init_err:
+                    return init_err
+                if session.get("agent") is None:
+                    return _err(rid, 5032, "agent initialization failed")
+            result = _apply_model_switch(
+                params.get("session_id", ""),
+                session,
+                value,
+                confirm_expensive_model=bool(
+                    params.get("confirm_expensive_model", False)
+                ),
+                parsed_flags=parsed_flags,
+            )
+        else:
+            result = _apply_model_switch(
+                "",
+                {"agent": None},
+                value,
+                confirm_expensive_model=bool(
+                    params.get("confirm_expensive_model", False)
+                ),
+            )
+        return _ok(
+            rid,
+            {
+                "key": "model",
+                "value": result["value"],
+                "warning": result["warning"],
+                "confirm_required": result.get("confirm_required", False),
+                "confirm_message": result.get("confirm_message", ""),
+                "scope": result.get("scope", "session"),
+            },
+        )
+    except Exception as e:
+        return _err(rid, 5001, str(e))
+
+
 @method("config.set")
 def _(rid, params: dict) -> dict:
     key, value = params.get("key", ""), params.get("value", "")
     session = _sessions.get(params.get("session_id", ""))
 
     if key == "model":
-        try:
-            if not value:
-                return _err(rid, 4002, "model value required")
-            if session:
-                # Reject during an in-flight turn.  agent.switch_model()
-                # mutates self.model / self.provider / self.base_url /
-                # self.client in place; the worker thread running
-                # agent.run_conversation is reading those on every
-                # iteration.  A mid-turn swap can send an HTTP request
-                # with the new base_url but old model (or vice versa),
-                # producing 400/404s the user never asked for.  Parity
-                # with the gateway's running-agent /model guard.
-                if session.get("running"):
-                    return _err(
-                        rid,
-                        4009,
-                        "session busy — /interrupt the current turn before switching models",
-                    )
-                from hermes_cli.model_switch import parse_model_flags_detailed
-
-                parsed_flags = parse_model_flags_detailed(value)
-                explicit_provider = parsed_flags.explicit_provider
-                if session.get("agent") is None and not explicit_provider.strip():
-                    session_id = params.get("session_id", "")
-                    _start_agent_build(session_id, session)
-                    init_err = _wait_agent(session, rid)
-                    if init_err:
-                        return init_err
-                    if session.get("agent") is None:
-                        return _err(rid, 5032, "agent initialization failed")
-                result = _apply_model_switch(
-                    params.get("session_id", ""),
-                    session,
-                    value,
-                    confirm_expensive_model=bool(
-                        params.get("confirm_expensive_model", False)
-                    ),
-                    parsed_flags=parsed_flags,
-                )
-            else:
-                result = _apply_model_switch(
-                    "",
-                    {"agent": None},
-                    value,
-                    confirm_expensive_model=bool(
-                        params.get("confirm_expensive_model", False)
-                    ),
-                )
-            return _ok(
-                rid,
-                {
-                    "key": key,
-                    "value": result["value"],
-                    "warning": result["warning"],
-                    "confirm_required": result.get("confirm_required", False),
-                    "confirm_message": result.get("confirm_message", ""),
-                    "scope": result.get("scope", "session"),
-                },
-            )
-        except Exception as e:
-            return _err(rid, 5001, str(e))
+        # Applying the pick has to resolve under the same profile the picker
+        # offered it from (see model.options). `_apply_model_switch` reads
+        # `providers:` / `custom_providers:` through `load_config()` and asks
+        # `resolve_runtime_provider` to name the target — all HERMES_HOME reads,
+        # all unbound on this thread. Measured: a session under profile "worker"
+        # switching to worker's OWN provider was rejected with "Unknown provider
+        # 'worker-local'", because the launch profile's config was consulted.
+        # `switch_model` persists through `save_config()`, which resolves the
+        # same home, so a `--global` write from here lands in the right
+        # config.yaml too rather than the launcher's.
+        with _profile_home_bound((session or {}).get("profile_home")):
+            return _config_set_model(rid, params, value, session)
 
     if key == "fast":
         raw = str(value or "").strip().lower()
@@ -15140,37 +15161,55 @@ def _(rid, params: dict) -> dict:
 
         session = _sessions.get(params.get("session_id", ""))
         agent = session.get("agent") if session else None
-        # Layer agent-session state on top of disk config — once an agent
-        # is spawned, IT owns the live provider/model/base_url. Empty
-        # agent attributes must NOT clobber disk config (with_overrides
-        # is truthy-only).
-        ctx = load_picker_context().with_overrides(
-            current_provider=getattr(agent, "provider", "") if agent else "",
-            current_model=(
-                (getattr(agent, "model", "") if agent else "") or _resolve_model()
-            ),
-            current_base_url=getattr(agent, "base_url", "") if agent else "",
+        # Build the picker under the profile it is FOR. Provider names are
+        # per-profile vocabulary — `providers:` / `custom_providers:` live in
+        # each profile's config.yaml — and this handler runs on the RPC thread
+        # with nothing bound, so it offered the LAUNCH profile's providers for a
+        # session belonging to another one. The composer could then only pick a
+        # name the session's profile does not define, and the turn died in agent
+        # init on "Unknown provider '<name>'".
+        #
+        # A live session is resolved by its OWN home, which is where its turn
+        # will actually run; `profile` covers the composer's other opening —
+        # the picker for a chat that does not exist yet, which has no session to
+        # ask. This is the same scoping the REST twin `/api/model/options` has
+        # always documented ("``profile`` scopes the picker context"), so the
+        # two surfaces finally answer alike.
+        picker_home = (session or {}).get("profile_home") or _profile_home(
+            params.get("profile")
         )
-        # picker_hints + canonical_order produce the TUI/desktop picker shape:
-        # `authenticated`/`auth_type`/`key_env`/`warning` per row, in
-        # CANONICAL_PROVIDERS declaration order. Desktop pickers default to the
-        # configured subset; callers that need setup affordances can pass
-        # include_unconfigured=true explicitly.
-        # Curated model lists are preserved — list_authenticated_providers
-        # populates `models` from the curated catalog, not provider_model_ids
-        # (which would pull non-agentic models like TTS/embeddings/etc.).
-        payload = build_models_payload(
-            ctx,
-            explicit_only=bool(params.get("explicit_only")),
-            include_unconfigured=bool(params.get("include_unconfigured")),
-            picker_hints=True,
-            canonical_order=True,
-            pricing=True,
-            capabilities=True,
-            refresh=bool(params.get("refresh")),
-            probe_custom_providers=bool(params.get("refresh")),
-            probe_current_custom_provider=not bool(params.get("refresh")),
-        )
+        with _profile_home_bound(picker_home):
+            # Layer agent-session state on top of disk config — once an agent
+            # is spawned, IT owns the live provider/model/base_url. Empty
+            # agent attributes must NOT clobber disk config (with_overrides
+            # is truthy-only).
+            ctx = load_picker_context().with_overrides(
+                current_provider=getattr(agent, "provider", "") if agent else "",
+                current_model=(
+                    (getattr(agent, "model", "") if agent else "") or _resolve_model()
+                ),
+                current_base_url=getattr(agent, "base_url", "") if agent else "",
+            )
+            # picker_hints + canonical_order produce the TUI/desktop picker shape:
+            # `authenticated`/`auth_type`/`key_env`/`warning` per row, in
+            # CANONICAL_PROVIDERS declaration order. Desktop pickers default to the
+            # configured subset; callers that need setup affordances can pass
+            # include_unconfigured=true explicitly.
+            # Curated model lists are preserved — list_authenticated_providers
+            # populates `models` from the curated catalog, not provider_model_ids
+            # (which would pull non-agentic models like TTS/embeddings/etc.).
+            payload = build_models_payload(
+                ctx,
+                explicit_only=bool(params.get("explicit_only")),
+                include_unconfigured=bool(params.get("include_unconfigured")),
+                picker_hints=True,
+                canonical_order=True,
+                pricing=True,
+                capabilities=True,
+                refresh=bool(params.get("refresh")),
+                probe_custom_providers=bool(params.get("refresh")),
+                probe_current_custom_provider=not bool(params.get("refresh")),
+            )
         return _ok(rid, payload)
     except Exception as e:
         return _err(rid, 5033, str(e))
@@ -15197,50 +15236,62 @@ def _(rid, params: dict) -> dict:
         if not slug or not api_key:
             return _err(rid, 4001, "slug and api_key are required")
 
-        if is_managed():
-            return _err(rid, 4006, "managed install — credentials are read-only")
-
-        pconfig = PROVIDER_REGISTRY.get(slug)
-        if not pconfig:
-            return _err(rid, 4002, f"unknown provider: {slug}")
-        if pconfig.auth_type != "api_key":
-            return _err(
-                rid,
-                4003,
-                f"{pconfig.name} uses {pconfig.auth_type} auth — "
-                f"run `hermes model` to configure",
-            )
-        if not pconfig.api_key_env_vars:
-            return _err(rid, 4004, f"no env var defined for {pconfig.name}")
-
-        # Save the key to ~/.hermes/.env via the unified credential lifecycle
-        # so any stale config.yaml mirror of the previous key (model.api_key,
-        # custom_providers[*].api_key) is rotated in the same action (#62269).
-        env_var = pconfig.api_key_env_vars[0]
-        from hermes_cli.credential_lifecycle import save_provider_env_credential
-
-        save_provider_env_credential(env_var, api_key)
-        # Also set in current process so the refreshed inventory sees it.
-        import os
-
-        os.environ[env_var] = api_key
-
-        # Refresh provider data via the shared inventory builder so this
-        # surface stays in lock-step with model.options + dashboard
-        # /api/model/options. picker_hints=True ensures the returned row
-        # carries `authenticated` for the TUI frontend.
+        # Resolved before the write, not after it: `.env` is per-profile
+        # (`get_env_path()` resolves HERMES_HOME), so the key has to land in the
+        # profile whose picker asked for it. Now that model.options lists the
+        # session's own providers, saving to the launch profile would leave the
+        # row the user just connected still showing unauthenticated. Same
+        # session-then-`profile` resolution as model.options, so the connect
+        # action targets whatever that picker was showing.
         session = _sessions.get(params.get("session_id", ""))
-        agent = session.get("agent") if session else None
-        ctx = load_picker_context().with_overrides(
-            current_provider=getattr(agent, "provider", "") if agent else "",
-            current_model=(
-                (getattr(agent, "model", "") if agent else "") or _resolve_model()
-            ),
-            current_base_url=getattr(agent, "base_url", "") if agent else "",
+        save_home = (session or {}).get("profile_home") or _profile_home(
+            params.get("profile")
         )
-        payload = build_models_payload(
-            ctx, picker_hints=True, max_models=50,
-        )
+        with _profile_home_bound(save_home):
+            if is_managed():
+                return _err(rid, 4006, "managed install — credentials are read-only")
+
+            pconfig = PROVIDER_REGISTRY.get(slug)
+            if not pconfig:
+                return _err(rid, 4002, f"unknown provider: {slug}")
+            if pconfig.auth_type != "api_key":
+                return _err(
+                    rid,
+                    4003,
+                    f"{pconfig.name} uses {pconfig.auth_type} auth — "
+                    f"run `hermes model` to configure",
+                )
+            if not pconfig.api_key_env_vars:
+                return _err(rid, 4004, f"no env var defined for {pconfig.name}")
+
+            # Save the key to the profile's .env via the unified credential
+            # lifecycle so any stale config.yaml mirror of the previous key
+            # (model.api_key, custom_providers[*].api_key) is rotated in the
+            # same action (#62269).
+            env_var = pconfig.api_key_env_vars[0]
+            from hermes_cli.credential_lifecycle import save_provider_env_credential
+
+            save_provider_env_credential(env_var, api_key)
+            # Also set in current process so the refreshed inventory sees it.
+            import os
+
+            os.environ[env_var] = api_key
+
+            # Refresh provider data via the shared inventory builder so this
+            # surface stays in lock-step with model.options + dashboard
+            # /api/model/options. picker_hints=True ensures the returned row
+            # carries `authenticated` for the TUI frontend.
+            agent = session.get("agent") if session else None
+            ctx = load_picker_context().with_overrides(
+                current_provider=getattr(agent, "provider", "") if agent else "",
+                current_model=(
+                    (getattr(agent, "model", "") if agent else "") or _resolve_model()
+                ),
+                current_base_url=getattr(agent, "base_url", "") if agent else "",
+            )
+            payload = build_models_payload(
+                ctx, picker_hints=True, max_models=50,
+            )
         provider_data = next(
             (p for p in payload["providers"] if p["slug"] == slug), None
         )

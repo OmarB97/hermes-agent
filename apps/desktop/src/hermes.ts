@@ -234,6 +234,15 @@ function profileScoped(): { profile?: string } {
   return _apiProfile ? { profile: _apiProfile } : {}
 }
 
+/** The profile REST calls are scoped to, for callers that must scope a
+ *  *gateway* call the same way. The model picker needs it: with no session yet
+ *  there is nothing for the backend to derive a profile from, so an unscoped
+ *  `model.options` lists the launch profile's providers while the window is on
+ *  another one. Null → primary. */
+export function apiRequestProfile(): null | string {
+  return _apiProfile
+}
+
 /** Options for a plugin REST call — mirrors the app's own `hermesDesktop.api`
  *  shape, minus the path (which is namespace-derived). */
 export interface PluginRestOptions {
