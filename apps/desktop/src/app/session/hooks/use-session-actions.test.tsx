@@ -1251,6 +1251,8 @@ describe('createBackendSessionForSend per-session overrides', () => {
     $currentCwd.set('')
     $currentModel.set('')
     $currentProvider.set('')
+    $currentReasoningEffort.set('')
+    $currentFastMode.set(false)
     vi.restoreAllMocks()
   })
 
@@ -1463,5 +1465,58 @@ describe('createBackendSessionForSend per-session overrides', () => {
     expect(createCalls).toHaveLength(2)
     expect(createCalls[0]).toMatchObject({ model: 'deepseek-v4-flash-0731-ds4', provider: 'ai-router' })
     expect(createCalls[1]).toMatchObject({ model: 'anthropic/claude-sonnet-4.6', provider: 'anthropic' })
+  })
+
+  // Same guarantee as above, for the other two sticky composer fields (#318
+  // fixed only model/provider): a session's reported effort/fast must not
+  // become the pick for the NEXT new chat either.
+  it('starts the NEXT chat on the picked effort/fast after a session reported different runtime values', async () => {
+    const createCalls: Record<string, unknown>[] = []
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.create') {
+        createCalls.push(params ?? {})
+
+        // The backend can report a different EFFECTIVE effort/fast than what
+        // was requested (same info echo path as model/provider above).
+        // Stubbing a divergent value is what exercises the leak:
+        // applyRuntimeInfo must paint the mirror, never the composer's pick.
+        return {
+          info: {
+            fast: false,
+            reasoning_effort: 'low'
+          },
+          session_id: `${RUNTIME_SESSION_ID}-${createCalls.length}`,
+          stored_session_id: null
+        } as never
+      }
+
+      return {} as never
+    })
+
+    setCurrentCwd('')
+    setNewChatWorkspaceTarget(undefined)
+    setCurrentReasoningEffort('high')
+    setCurrentFastMode(true)
+
+    let handle: HarnessHandle | null = null
+    render(<Harness onReady={h => (handle = h)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.createBackendSessionForSend(null)
+    })
+
+    // The user hits Cmd+N and sends — a new draft, no override.
+    await act(async () => {
+      handle!.startFreshSessionDraft()
+    })
+    await act(async () => {
+      await handle!.createBackendSessionForSend(null)
+    })
+
+    expect(createCalls).toHaveLength(2)
+    expect(createCalls[0]).toMatchObject({ fast: true, reasoning_effort: 'high' })
+    expect(createCalls[1]).toMatchObject({ fast: true, reasoning_effort: 'high' })
   })
 })

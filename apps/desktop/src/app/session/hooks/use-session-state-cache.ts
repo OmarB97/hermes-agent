@@ -9,12 +9,12 @@ import { setMutableRef } from '@/lib/mutable-ref'
 import {
   $busy,
   $messages,
+  setActiveSessionFastMode,
   setActiveSessionModel,
   setActiveSessionProvider,
+  setActiveSessionReasoningEffort,
   setCurrentFallbackPolicy,
-  setCurrentFastMode,
   setCurrentPersonality,
-  setCurrentReasoningEffort,
   setCurrentServiceTier,
   setCurrentUsage,
   setTurnStartedAt,
@@ -61,13 +61,14 @@ function syncRuntimeMetadataToView(state: ClientSessionState) {
   // rewrote the user's sticky pick on every heartbeat of a spawned session —
   // the durable half of the #298 leak. gateway-event.ts refuses to call
   // setCurrentModel on the direct path for exactly this reason; routing the
-  // same value through here was walking around its own guard.
+  // same value through here was walking around its own guard. Same story for
+  // reasoning effort and fast mode (#318 fixed model/provider only).
   setActiveSessionModel(state.model ?? '')
   setActiveSessionProvider(state.provider ?? '')
   setCurrentFallbackPolicy(state.fallbackPolicy ?? '')
-  setCurrentReasoningEffort(state.reasoningEffort ?? '')
+  setActiveSessionReasoningEffort(state.reasoningEffort ?? '')
   setCurrentServiceTier(state.serviceTier ?? '')
-  setCurrentFastMode(state.fast ?? false)
+  setActiveSessionFastMode(state.fast ?? false)
   setYoloActive(state.yolo ?? false)
   setCurrentPersonality(state.personality ?? '')
   setCurrentUsage(state.usage)

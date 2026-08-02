@@ -5,7 +5,7 @@ import { invalidateProfileScopedQueries } from '@/lib/query-client'
 import { resetSessionsLimit } from '@/store/layout'
 import {
   $unreadFinishedSessionIds,
-  clearActiveSessionModel,
+  clearActiveSessionRuntime,
   setActiveSessionId,
   setCronSessions,
   setFreshDraftReady,
@@ -61,9 +61,9 @@ export function wipeSessionListsForGatewaySwitch(): void {
   setSelectedStoredSessionId(null)
   setMessages([])
   setFreshDraftReady(true)
-  // The next backend has no open session, so the model pill goes back to
-  // showing the composer's own pick rather than the old session's model.
-  clearActiveSessionModel()
+  // The next backend has no open session, so the model/effort/fast pills go
+  // back to showing the composer's own pick rather than the old session's.
+  clearActiveSessionRuntime()
 
   // Narrowed: account/marketplace/onboarding caches are global, not gateway-
   // scoped, so a mode swap must not refetch them.

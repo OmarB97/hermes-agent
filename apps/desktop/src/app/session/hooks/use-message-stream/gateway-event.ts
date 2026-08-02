@@ -37,12 +37,12 @@ import {
   $currentProvider,
   sessionMatchesStoredId,
   $localDeviceName,
+  setActiveSessionFastMode,
+  setActiveSessionReasoningEffort,
   setCurrentBranch,
   setCurrentCwd,
   setCurrentFallbackPolicy,
-  setCurrentFastMode,
   setCurrentPersonality,
-  setCurrentReasoningEffort,
   setCurrentServiceTier,
   setCurrentUsage,
   setLocalDeviceName,
@@ -257,6 +257,12 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           // (or a stale session model) and would silently revert the dropdown.
           // Active-session model/provider still flows through the session state
           // cache via updateSessionState → syncRuntimeMetadataToView below.
+          // Same reasoning applies to reasoning_effort/fast just below: they
+          // paint the runtime mirror (setActiveSessionReasoningEffort/
+          // setActiveSessionFastMode), never the composer's persisted pick —
+          // `apply` is also true for a global broadcast with no active session,
+          // so a heartbeat here could otherwise rewrite the pick under a fresh
+          // draft's feet.
 
           if (statePatch.fallbackPolicy) {
             setCurrentFallbackPolicy(statePatch.fallbackPolicy)
@@ -288,7 +294,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           }
 
           if (typeof payload?.reasoning_effort === 'string') {
-            setCurrentReasoningEffort(payload.reasoning_effort)
+            setActiveSessionReasoningEffort(payload.reasoning_effort)
           }
 
           if (typeof payload?.service_tier === 'string') {
@@ -296,7 +302,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           }
 
           if (typeof payload?.fast === 'boolean') {
-            setCurrentFastMode(payload.fast)
+            setActiveSessionFastMode(payload.fast)
           }
 
           if (typeof payload?.yolo === 'boolean') {

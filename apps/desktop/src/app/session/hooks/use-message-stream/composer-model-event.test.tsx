@@ -6,11 +6,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ClientSessionState } from '@/app/types'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import {
+  $currentFastMode,
   $currentModel,
   $currentProvider,
+  $currentReasoningEffort,
+  setCurrentFastMode,
   setCurrentModel,
   setCurrentModelSource,
-  setCurrentProvider
+  setCurrentProvider,
+  setCurrentReasoningEffort
 } from '@/store/session'
 import type { RpcEvent } from '@/types/hermes'
 
@@ -95,5 +99,55 @@ describe('session.info does not clobber composer model selection', () => {
 
     expect($currentModel.get()).toBe('deepseek-v4-flash')
     expect($currentProvider.get()).toBe('deepseek')
+  })
+})
+
+// Same guarantee, for the other two sticky composer fields (#318 fixed only
+// model/provider). This handler sits inside the `if (apply)` block, which is
+// also true for a global broadcast with no active session — so an unscoped
+// heartbeat carrying reasoning_effort/fast must not rewrite the stored keys
+// out from under a fresh draft either.
+describe('session.info does not clobber composer effort/fast selection', () => {
+  beforeEach(() => {
+    handleEvent = null
+    setCurrentReasoningEffort('high')
+    setCurrentFastMode(true)
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+    setCurrentReasoningEffort('')
+    setCurrentFastMode(false)
+  })
+
+  it('keeps a sticky pick when a global session.info carries a different reasoning_effort/fast', async () => {
+    await mountStream(null)
+
+    act(() =>
+      handleEvent!({
+        payload: { fast: false, reasoning_effort: 'low' },
+        type: 'session.info'
+      })
+    )
+
+    expect($currentReasoningEffort.get()).toBe('high')
+    expect($currentFastMode.get()).toBe(true)
+    expect(window.localStorage.getItem('hermes.desktop.composer.reasoning-effort')).toBe('high')
+    expect(window.localStorage.getItem('hermes.desktop.composer.fast')).toBe('true')
+  })
+
+  it('keeps the composer pick when an unscoped session.info arrives with no live session', async () => {
+    await mountStream(null)
+
+    act(() =>
+      handleEvent!({
+        payload: { cwd: '/tmp/project', fast: false, reasoning_effort: 'low' },
+        type: 'session.info'
+      })
+    )
+
+    expect($currentReasoningEffort.get()).toBe('high')
+    expect($currentFastMode.get()).toBe(true)
   })
 })
