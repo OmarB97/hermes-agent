@@ -2366,3 +2366,127 @@ class TestDispatchToolWithoutCliRef:
             assert calls[0][1].get("parent_agent") is None
         finally:
             registry.deregister("_test_dispatch_probe")
+
+
+class TestDiscoveryIsScopedToTheProcessHome:
+    """Discovery must not depend on which request triggered it.
+
+    Plugin discovery is lazy, and several tools call
+    ``_ensure_plugins_discovered()`` from inside an agent turn — ``tts_tool``,
+    ``web_tools``, ``video_generation_tool``, ``browser_tool``. The gateway's
+    turn handler binds ``set_hermes_home_override(session_profile_home)`` for
+    the duration of a turn, so before this was pinned, whichever session
+    happened to trigger the first discovery decided the whole process's plugin
+    registry: the launch profile could lose its own plugins *and* inherit
+    another profile's.
+
+    Plugins register process-global capabilities (tools, hooks, middleware,
+    platforms, the context engine) shared by every session on the backend, so
+    the process home is the only coherent scope for the sweep. Re-scoping it
+    per request would mean tearing registrations out from under live turns.
+    """
+
+    def _two_homes(self, tmp_path):
+        launch = tmp_path / "launch"
+        profile = tmp_path / "profiles" / "work"
+        for home, tag in ((launch, "launch"), (profile, "profile")):
+            _make_plugin_dir(
+                home / "plugins",
+                f"{tag}_plugin",
+                register_body=f"ctx.register_command('{tag}-cmd', lambda arg: '{tag}')",
+                auto_enable=False,
+            )
+            # auto_enable writes into $HERMES_HOME, which is the wrong home for
+            # whichever of the two is not currently active — opt in explicitly.
+            (home / "config.yaml").write_text(
+                yaml.safe_dump({"plugins": {"enabled": [f"{tag}_plugin"]}})
+            )
+        return launch, profile
+
+    def test_a_profile_scoped_request_does_not_capture_the_registry(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        launch, profile = self._two_homes(tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(launch))
+
+        mgr = PluginManager()
+        # First discovery fires from inside a turn scoped to another profile.
+        token = set_hermes_home_override(str(profile))
+        try:
+            mgr.discover_and_load()
+        finally:
+            reset_hermes_home_override(token)
+
+        assert "launch_plugin" in mgr._plugins
+        assert "profile_plugin" not in mgr._plugins
+        assert "launch-cmd" in mgr._plugin_commands
+        assert "profile-cmd" not in mgr._plugin_commands
+
+    def test_the_override_is_restored_after_discovery(self, tmp_path, monkeypatch):
+        """The sweep must not leak its binding into the caller's scope."""
+        from hermes_constants import (
+            get_hermes_home_override,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        launch, profile = self._two_homes(tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(launch))
+
+        mgr = PluginManager()
+        token = set_hermes_home_override(str(profile))
+        try:
+            mgr.discover_and_load()
+            assert get_hermes_home_override() == str(profile)
+        finally:
+            reset_hermes_home_override(token)
+
+    def test_the_override_is_restored_when_the_sweep_raises(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_constants import (
+            get_hermes_home_override,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        launch, profile = self._two_homes(tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(launch))
+
+        mgr = PluginManager()
+        monkeypatch.setattr(
+            mgr, "_discover_and_load_inner",
+            MagicMock(side_effect=RuntimeError("boom")),
+        )
+        token = set_hermes_home_override(str(profile))
+        try:
+            with pytest.raises(RuntimeError, match="boom"):
+                mgr.discover_and_load()
+            assert get_hermes_home_override() == str(profile)
+            # The failed sweep is not cached as "discovered".
+            assert mgr._discovered is False
+        finally:
+            reset_hermes_home_override(token)
+
+    def test_a_dedicated_profile_process_still_gets_its_own_plugins(
+        self, tmp_path, monkeypatch
+    ):
+        """Per-profile backends and slash workers export HERMES_HOME at spawn.
+
+        The process home IS that profile's home there, so pinning to it keeps
+        the ordinary per-profile deployment working — this is not a change that
+        forces every process onto one shared plugin set.
+        """
+        launch, profile = self._two_homes(tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        assert "profile_plugin" in mgr._plugins
+        assert "launch_plugin" not in mgr._plugins

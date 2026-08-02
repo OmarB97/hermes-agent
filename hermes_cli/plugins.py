@@ -46,7 +46,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Union
 
-from hermes_constants import get_hermes_home
+from hermes_constants import (
+    get_hermes_home,
+    get_process_hermes_home,
+    reset_hermes_home_override,
+    set_hermes_home_override,
+)
 from utils import env_var_enabled, fast_safe_load
 from hermes_cli.config import cfg_get
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
@@ -1308,14 +1313,45 @@ class PluginManager:
         # permanently stranded on the early-return above (the "No web provider
         # configured" class of failures).
         self._discovered = True
+        # Pin the sweep to the PROCESS home, not whatever home the triggering
+        # request happens to be scoped to.
+        #
+        # Discovery is a process-level operation: it imports modules and
+        # registers process-global capabilities (tools, hooks, middleware,
+        # platforms, the context engine) that every session on this backend
+        # then shares. But it is triggered lazily, and several tools call
+        # _ensure_plugins_discovered() from inside a turn — tts_tool,
+        # web_tools, video_generation_tool, browser_tool — where the turn
+        # handler has bound another profile's HERMES_HOME. Whichever session
+        # got there first therefore decided the whole process's plugin
+        # registry: the launch profile could lose its own plugins AND inherit
+        # another profile's.
+        #
+        # Binding here covers the user plugin dir, the enabled/disabled
+        # allow-lists (load_config follows the override too), and anything a
+        # plugin's own register() reads — one consistent scope instead of a
+        # directory from one home and a config from another. Subprocess
+        # workers that are dedicated to a profile export HERMES_HOME at spawn,
+        # so this resolves to that profile for them, which is correct.
+        #
+        # Same rationale as the dashboard's user plugin dir in
+        # hermes_cli/web_server.py and the goal store in #320.
+        token = set_hermes_home_override(str(get_process_hermes_home()))
         try:
             self._discover_and_load_inner()
         except BaseException:
             self._discovered = False
             raise
+        finally:
+            reset_hermes_home_override(token)
 
     def _discover_and_load_inner(self) -> None:
-        """The actual discovery sweep — see :meth:`discover_and_load`."""
+        """The actual discovery sweep — see :meth:`discover_and_load`.
+
+        Runs with the process home bound by :meth:`discover_and_load`, so the
+        ``get_hermes_home()`` and config reads below resolve to the launch
+        home regardless of which request triggered the sweep.
+        """
         manifests: List[PluginManifest] = []
 
         # 1. Bundled plugins (<repo>/plugins/<name>/)
