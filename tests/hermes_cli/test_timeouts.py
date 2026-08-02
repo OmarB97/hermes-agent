@@ -6,6 +6,7 @@ from hermes_cli.timeouts import (
     get_provider_first_chunk_timeout,
     get_provider_request_timeout,
     get_provider_stale_timeout,
+    resolve_provider_config_key,
 )
 
 
@@ -619,3 +620,169 @@ def test_explicit_non_stream_stale_timeout_is_honored_for_local_endpoints(monkey
     )
 
     assert agent._compute_non_stream_stale_timeout([]) == 300.0
+
+
+# ── resolve_provider_config_key: the public identity-recovery entry point ────
+#
+# Exposed so callers outside this module can key on a `providers:` ENTRY NAME
+# instead of on `agent.provider`, which is the bare billing class "custom" for
+# every user-declared endpoint. The managed-W2 route check in
+# `agent/chat_completion_helpers.py` compared entry names against
+# `agent.provider` directly and therefore matched nothing in production.
+
+
+def test_resolve_provider_config_key_recovers_the_entry_that_owns_the_endpoint(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(
+        tmp_path,
+        """\
+        providers:
+          ai-router:
+            api: "http://10.10.20.199:9081/v1"
+        """,
+    )
+
+    assert (
+        resolve_provider_config_key("custom", "http://10.10.20.199:9081/v1")
+        == "ai-router"
+    )
+    # Trailing slash / case are endpoint noise, not a different endpoint.
+    assert (
+        resolve_provider_config_key("custom", "HTTP://10.10.20.199:9081/v1/")
+        == "ai-router"
+    )
+
+
+def test_resolve_provider_config_key_reads_the_name_out_of_a_custom_prefix(
+    monkeypatch, tmp_path
+):
+    """``custom:<name>`` already carries the entry name — no config read."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(tmp_path, "providers: {}\n")
+
+    assert resolve_provider_config_key("custom:ai-router") == "ai-router"
+
+
+def test_resolve_provider_config_key_returns_none_for_a_named_provider(
+    monkeypatch, tmp_path
+):
+    """A named id IS its own config key, so there is nothing to recover.
+
+    ``None`` here does NOT mean "no entry exists" — it means "ask the config
+    directly". Callers keyed on entry names must check the id itself first.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(
+        tmp_path,
+        """\
+        providers:
+          anthropic:
+            request_timeout_seconds: 30
+        """,
+    )
+
+    import hermes_cli.timeouts as timeouts_mod
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("named providers must not pay for recovery")
+
+    monkeypatch.setattr(timeouts_mod, "_recover_custom_provider_key", _fail_if_called)
+
+    assert resolve_provider_config_key("anthropic") is None
+    assert resolve_provider_config_key("") is None
+
+
+def test_resolve_provider_config_key_delegates_to_the_private_helper(
+    monkeypatch, tmp_path
+):
+    """The wrapper must stay a wrapper.
+
+    ``test_named_provider_lookup_bypasses_custom_recovery_path`` monkeypatches
+    ``_recover_custom_provider_key`` by name; inlining or renaming it would
+    silently defeat that patch. Pin the delegation so the two cannot drift.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(tmp_path, "providers: {}\n")
+
+    import hermes_cli.timeouts as timeouts_mod
+
+    seen = {}
+
+    def _spy(provider_id, base_url, providers=None):
+        seen["args"] = (provider_id, base_url, providers)
+        return "spied"
+
+    monkeypatch.setattr(timeouts_mod, "_recover_custom_provider_key", _spy)
+
+    assert resolve_provider_config_key("custom", "http://host:1/v1") == "spied"
+    assert seen["args"][0] == "custom"
+    assert seen["args"][1] == "http://host:1/v1"
+
+
+def test_resolve_provider_config_key_refuses_a_contested_endpoint(
+    monkeypatch, tmp_path
+):
+    """Exactly-one-owner (#330), and the reason the wrapper loads ``providers``.
+
+    Two rows may legitimately declare the same base_url with distinct
+    credentials, so neither owns it. Loading the section here is what engages
+    that rule — the general reverse lookup underneath would return whichever
+    entry it happened to visit first.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(
+        tmp_path,
+        """\
+        providers:
+          ai-router:
+            api: "http://10.10.20.199:9081/v1"
+          ai-router-standby:
+            api: "http://10.10.20.199:9081/v1"
+        """,
+    )
+
+    assert resolve_provider_config_key("custom", "http://10.10.20.199:9081/v1") is None
+
+
+def test_resolve_provider_config_key_returns_none_for_an_unowned_endpoint(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(
+        tmp_path,
+        """\
+        providers:
+          ai-router:
+            api: "http://10.10.20.199:9081/v1"
+        """,
+    )
+
+    assert resolve_provider_config_key("custom", "http://10.10.20.250:8080/v1") is None
+
+
+def test_resolve_provider_config_key_falls_back_to_the_configured_provider(
+    monkeypatch, tmp_path
+):
+    """With no endpoint to match on, ``config.model.provider`` is the identity.
+
+    Inherited from ``canonical_custom_identity`` and right for credential and
+    timeout recovery. Callers that must not grant anything to an unidentified
+    endpoint are expected to refuse to call this without a base_url — see
+    ``_is_managed_local_w2_route``.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    _write_config(
+        tmp_path,
+        """\
+        model:
+          provider: ai-router
+        providers:
+          ai-router:
+            api: "http://10.10.20.199:9081/v1"
+        """,
+    )
+
+    assert resolve_provider_config_key("custom") == "ai-router"
