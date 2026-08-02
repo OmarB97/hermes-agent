@@ -4260,7 +4260,10 @@ class TestRunConversation:
 
         assert result["final_response"] == "Recovered on fallback"
         assert result["completed"] is True
-        mock_try_activate_fallback.assert_called_once_with()
+        # #269 threads the classified failover reason into the fallback switch.
+        mock_try_activate_fallback.assert_called_once_with(
+            FailoverReason.content_policy_blocked
+        )
         assert mock_run_codex_stream.call_count == 2
         assert hook_events[0]["error_type"] == "ContentPolicyBlocked"
         assert hook_events[0]["retryable"] is False
@@ -5816,12 +5819,22 @@ class TestRunConversation:
         assert result["completed"] is True
 
         # Verify the local estimate is actually the lower bound.
-        from agent.model_metadata import estimate_request_tokens_rough
+        from agent.model_metadata import (
+            estimate_request_tokens_rough,
+            output_tokens_that_fit,
+        )
         estimated_request = estimate_request_tokens_rough(
             first_call["messages"], tools=agent.tools or None,
         )
         local_available = 200_000 - estimated_request
         expected_cap = max(1, min(50_000, local_available) - 64)
+        # The retry is then anchored to output_tokens_that_fit(), the single
+        # source of truth for "how many output tokens fit". It reserves the
+        # input conservatively so the cap is one the provider will accept, so
+        # against a near-full window it binds below the arithmetic above.
+        local_fit = output_tokens_that_fit(200_000, first_call["messages"])
+        if local_fit is not None:
+            expected_cap = max(1, min(expected_cap, local_fit))
         assert local_available < 50_000
         assert second_call["max_tokens"] == expected_cap
         assert agent.context_compressor.context_length == 200_000
