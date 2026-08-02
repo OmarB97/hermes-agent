@@ -1,6 +1,8 @@
 """Tests for hermes_constants module."""
 
+import json
 import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -392,6 +394,56 @@ class TestGetDeviceName:
         monkeypatch.setattr(hermes_constants.socket, "gethostname", lambda: "ko-mac.local")
 
         assert get_device_name() == "ko-mac"
+
+
+class TestDeviceNameResolvers:
+    """The resolvers themselves, not stubbed out.
+
+    ``TestGetDeviceName`` monkeypatches both of these away to isolate
+    ``get_device_name``'s precedence logic, so nothing here was ever executed
+    under test.  That is how a ``NameError`` (``json`` used but never imported)
+    shipped in both of them: each body is wrapped in ``except Exception``, so
+    the failure was swallowed and the resolver just quietly returned ``None``.
+    """
+
+    def test_meshboard_resolver_reads_device_label(self, tmp_path, monkeypatch):
+        # The resolver probes ``~/Workspaces/.mesh`` before MESHBOARD_RUNTIME.
+        # Point home at an empty dir so a real mesh checkout on the developer's
+        # machine can't answer first and make this pass (or fail) by accident.
+        monkeypatch.setattr(hermes_constants.Path, "home", lambda: tmp_path / "home")
+
+        mesh_root = tmp_path / ".mesh"
+        (mesh_root / "registry").mkdir(parents=True)
+        (mesh_root / "registry" / "devices.json").write_text(
+            json.dumps({"devices": [{"id": "host-abc", "label": "ko-mac"}]}),
+            encoding="utf-8",
+        )
+        (mesh_root / "host-id").write_text("host-abc", encoding="utf-8")
+        monkeypatch.setenv("MESHBOARD_RUNTIME", str(mesh_root))
+
+        assert hermes_constants._resolve_meshboard_device_name() == "ko-mac"
+
+    def test_tailscale_resolver_reads_self_hostname(self, monkeypatch):
+        def _fake_run(cmd, **kwargs):
+            assert cmd[:2] == ["tailscale", "status"]
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"Self": {"HostName": "ko-mac"}}),
+                stderr="",
+            )
+
+        monkeypatch.setattr(subprocess, "run", _fake_run)
+
+        assert hermes_constants._resolve_tailscale_device_name() == "ko-mac"
+
+    def test_tailscale_resolver_returns_none_on_bad_json(self, monkeypatch):
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda cmd, **kwargs: SimpleNamespace(returncode=0, stdout="not json", stderr=""),
+        )
+
+        assert hermes_constants._resolve_tailscale_device_name() is None
 
 
 class TestIsContainer:
