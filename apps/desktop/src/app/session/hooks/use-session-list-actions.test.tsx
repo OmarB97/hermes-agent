@@ -160,6 +160,95 @@ describe('refreshSessions identity + loading hygiene', () => {
     off()
     expect(loadingStates).toEqual([false, true, false])
   })
+
+  // REGRESSION GUARD for the 2026-06-21 permanent-skeleton wedge. An app/backend
+  // version skew made every `hermes:api` call hang to its 45s timeout while a 30s
+  // interval poll kept firing. Each refresh was superseded before it settled, so
+  // the old `requestId === current` gate never matched in any `finally` and
+  // $sessionsLoading stayed true forever — a recoverable stall turned into a
+  // sidebar stuck on skeletons. The flag must clear once nothing is in flight,
+  // whichever request finishes last.
+  it('clears the loading flag after overlapping refreshes settle out of order', async () => {
+    const releases: Array<() => void> = []
+
+    listSidebarSessions.mockImplementation(
+      () =>
+        new Promise(resolve => {
+          releases.push(() => resolve(sidebar({ sessions: [row('a')], total: 1, profile_totals: {} })))
+        })
+    )
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    // Three overlapping refreshes over an EMPTY list — all take showLoading.
+    const pending: Array<Promise<unknown>> = []
+
+    await act(async () => {
+      pending.push(result.current.refreshSessions())
+      pending.push(result.current.refreshSessions())
+      pending.push(result.current.refreshSessions())
+      await Promise.resolve()
+    })
+
+    expect($sessionsLoading.get()).toBe(true)
+
+    // Settle oldest-first, so every response is a SUPERSEDED one (current id is
+    // already 3). Under the old gate none of these could clear the flag.
+    await act(async () => {
+      releases[0]()
+      await Promise.resolve()
+    })
+
+    expect($sessionsLoading.get()).toBe(false)
+
+    await act(async () => {
+      releases[1]()
+      releases[2]()
+      await Promise.all(pending)
+    })
+
+    expect($sessionsLoading.get()).toBe(false)
+  })
+
+  // The other half of the wedge: if the backend is unreachable every refresh
+  // REJECTS, so the success path never runs. Once nothing is left in flight the
+  // sidebar must stop showing skeletons rather than spinning forever.
+  it('clears the loading flag once every failing refresh has settled', async () => {
+    const rejects: Array<() => void> = []
+
+    listSidebarSessions.mockImplementation(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejects.push(() => reject(new Error('backend unreachable')))
+        })
+    )
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+    const pending: Array<Promise<unknown>> = []
+
+    await act(async () => {
+      pending.push(result.current.refreshSessions().catch(() => undefined))
+      pending.push(result.current.refreshSessions().catch(() => undefined))
+      await Promise.resolve()
+    })
+
+    expect($sessionsLoading.get()).toBe(true)
+
+    await act(async () => {
+      rejects[0]()
+      await Promise.resolve()
+    })
+
+    // One still in flight — keep the skeletons up.
+    expect($sessionsLoading.get()).toBe(true)
+
+    await act(async () => {
+      rejects[1]()
+      await Promise.all(pending)
+    })
+
+    expect($sessionsLoading.get()).toBe(false)
+  })
 })
 
 describe('refreshSessions batches slices into one request', () => {
