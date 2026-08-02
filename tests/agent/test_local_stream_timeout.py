@@ -1138,7 +1138,14 @@ class TestRuntimeFirstChunkBudgetIsReachable:
             monkeypatch.delenv(var, raising=False)
 
     def test_ai_router_is_recognised_as_a_managed_w2_route(self):
-        """The provider allowlist missed the one the desktop actually uses."""
+        """A bare config-entry name still matches directly, without a lookup.
+
+        This is the STUBBED shape, not the production one — see
+        ``TestFirstChunkBudgetThroughRealProviderResolution`` for what
+        ``agent.provider`` actually is at runtime. Stubbing it is precisely
+        what hid the original bug, so treat a green here as covering the
+        direct branch only.
+        """
         assert _is_managed_local_w2_route(self._Agent(), "deepseek-v4-flash-w2") is True
 
     def test_an_arbitrary_lan_provider_is_NOT_a_managed_w2_route(self):
@@ -1224,12 +1231,16 @@ class TestFirstChunkBudgetThroughRealProviderResolution:
     ``resolve_runtime_provider(requested="ai-router")`` returns the bare
     billing class ``"custom"`` for EVERY user-declared endpoint, so
     ``agent.provider`` is ``"custom"`` in production. Stubbing the provider is
-    what let this bug hide — with the real value, ``_is_managed_local_w2_route``
-    is False even on the lane its allowlist was written for, so the managed-W2
-    branch (and the context-scaled budget behind it) never ran in production
-    and every real local DFlash turn fell through to the step ladder.
+    what let the original bug hide — the allowlist held config-entry names and
+    was compared against a value that is never one, so the managed-W2 branch
+    (and the cold-start budget behind it) never ran in production on any lane,
+    and a fix that "added ai-router to the allowlist" shipped as dead code.
 
-    These tests build through the real resolver so that gap cannot reopen.
+    The contract these tests now pin: the allowlist is matched against the
+    config-entry name RECOVERED from the live endpoint, so a real resolved
+    agent on a declared managed lane reaches the floor — while an endpoint no
+    allowlisted entry owns still does not. Building through the real resolver
+    is what makes that gap unable to reopen; keep this shape.
     """
 
     @staticmethod
@@ -1278,34 +1289,142 @@ class TestFirstChunkBudgetThroughRealProviderResolution:
             "messages": [{"role": "user", "content": "x" * (tokens * 4)}],
         }
 
-    def test_declared_endpoint_resolves_to_the_bare_custom_billing_class(
+    _AI_ROUTER_CONFIG = """\
+    providers:
+      ai-router:
+        api: "http://10.10.20.199:9081/v1"
+    """
+
+    def test_bare_custom_billing_class_is_still_a_managed_w2_route(
         self, monkeypatch, tmp_path
     ):
-        """The premise the stubbed tests got wrong, pinned as a fact."""
+        """Both halves of the fix, in one place.
+
+        The premise the stubbed tests got wrong stays pinned as a fact:
+        resolution reports the bare billing class, NOT the entry name. What
+        changed is the conclusion drawn from it — the route check recovers the
+        entry name from the endpoint, so the managed lane is recognised anyway.
+
+        This assertion read ``is False`` before, documenting the bug: the 360s
+        floor was unreachable on the one lane its allowlist was written for.
+        """
         agent = self._agent(
             monkeypatch,
             tmp_path,
             requested="ai-router",
             model="deepseek-v4-flash-w2",
+            config_body=self._AI_ROUTER_CONFIG,
+        )
+
+        assert agent.provider == "custom"
+        assert _is_managed_local_w2_route(agent, "deepseek-v4-flash-w2") is True
+
+    def test_real_resolution_reaches_the_managed_w2_floor(
+        self, monkeypatch, tmp_path
+    ):
+        """A small prompt isolates the floor from the context scaling.
+
+        180s base + ~0 prefill would be the generic DFlash answer, and was what
+        this lane actually got in production. The managed branch floors it at
+        360s. Asserting on a SMALL prompt is deliberate: at 90k tokens the
+        context term dominates and would mask a floor that never applied.
+        """
+        agent = self._agent(
+            monkeypatch,
+            tmp_path,
+            requested="ai-router",
+            model="deepseek-v4-flash-w2",
+            config_body=self._AI_ROUTER_CONFIG,
+        )
+        payload = self._payload("deepseek-v4-flash-w2", 8)
+
+        assert resolve_dflash_local_first_chunk_timeout(agent, payload) == 360.0
+        # The gap BETWEEN chunks is a different cost and must not move.
+        assert resolve_stream_stale_timeout(agent, payload) == 180.0
+
+    def test_real_resolution_gets_the_cold_start_inclusive_budget(
+        self, monkeypatch, tmp_path
+    ):
+        """At scale the managed lane also gets the cold-start allowance.
+
+        Re-derived: this asserted 543.0, the generic budget (180s base + 4s/1k
+        * 90.7k), because the managed branch was unreachable. The managed
+        budget adds the measured 180s llama-swap cold start on top — the very
+        term that exists so the first W2 turn after an eviction is not killed
+        while healthy.
+        """
+        agent = self._agent(
+            monkeypatch,
+            tmp_path,
+            requested="ai-router",
+            model="deepseek-v4-flash-w2",
+            config_body=self._AI_ROUTER_CONFIG,
+        )
+        payload = self._payload("deepseek-v4-flash-w2", 90_700)
+
+        generic = 543.0
+        assert resolve_dflash_local_first_chunk_timeout(agent, payload) == 723.0
+        assert 723.0 - generic == 180.0, "the delta IS the cold-start allowance"
+        # Unchanged: the stale timeout never consulted the managed-W2 branch.
+        assert resolve_stream_stale_timeout(agent, payload) == generic
+
+    def test_custom_prefixed_runtime_id_also_matches(self, monkeypatch, tmp_path):
+        """``custom:<name>`` carries the entry name and needs no lookup."""
+        agent = self._agent(
+            monkeypatch,
+            tmp_path,
+            requested="ai-router",
+            model="deepseek-v4-flash-w2",
+            config_body=self._AI_ROUTER_CONFIG,
+        )
+        agent.provider = "custom:ai-router"
+
+        assert _is_managed_local_w2_route(agent, "deepseek-v4-flash-w2") is True
+        assert (
+            resolve_dflash_local_first_chunk_timeout(
+                agent, self._payload("deepseek-v4-flash-w2", 8)
+            )
+            == 360.0
+        )
+
+    def test_configured_but_unlisted_provider_stays_off_the_managed_lane(
+        self, monkeypatch, tmp_path
+    ):
+        """Recovery must not become "any declared endpoint serving W2".
+
+        ``ko-3090`` is a real, configured, local W2-capable endpoint that is
+        deliberately NOT on the managed lane. Recovering its name is the point;
+        granting it the floor would be the bug the allowlist exists to prevent.
+        """
+        agent = self._agent(
+            monkeypatch,
+            tmp_path,
+            requested="ko-3090",
+            model="deepseek-v4-flash-w2",
             config_body="""\
             providers:
-              ai-router:
-                api: "http://10.10.20.199:9081/v1"
+              ko-3090:
+                api: "http://10.10.20.77:8080/v1"
             """,
         )
 
         assert agent.provider == "custom"
         assert _is_managed_local_w2_route(agent, "deepseek-v4-flash-w2") is False
+        assert (
+            resolve_dflash_local_first_chunk_timeout(
+                agent, self._payload("deepseek-v4-flash-w2", 8)
+            )
+            == 180.0
+        )
 
-    def test_real_resolution_still_gets_a_context_scaled_first_chunk_budget(
+    def test_two_entries_sharing_an_endpoint_are_ambiguous(
         self, monkeypatch, tmp_path
     ):
-        """The managed-W2 floor is unreachable here; the budget must not be.
+        """Exactly-one-owner (#330): a contested endpoint has no owner.
 
-        With the real provider value the 360s floor and the cold-start
-        allowance do not apply (they stay gated to the W2 route by design).
-        What must apply is the context-scaled prefill term — otherwise this
-        lane gets a flat 240s for a 90.7k-token prompt, which is the bug.
+        Rows with distinct credentials may legitimately share a base_url, and
+        none of them can claim it alone — so recovery returns nothing and the
+        route falls back to the generic deadline rather than guessing.
         """
         agent = self._agent(
             monkeypatch,
@@ -1316,13 +1435,13 @@ class TestFirstChunkBudgetThroughRealProviderResolution:
             providers:
               ai-router:
                 api: "http://10.10.20.199:9081/v1"
+              ai-router-standby:
+                api: "http://10.10.20.199:9081/v1"
             """,
         )
-        payload = self._payload("deepseek-v4-flash-w2", 90_700)
 
-        # 180s base + 4s/1k * 90.7k = 542.8s, rounded. The old ladder gave 240.
-        assert resolve_dflash_local_first_chunk_timeout(agent, payload) == 543.0
-        assert resolve_stream_stale_timeout(agent, payload) == 543.0
+        assert agent.provider == "custom"
+        assert _is_managed_local_w2_route(agent, "deepseek-v4-flash-w2") is False
 
     def test_production_repro_ds4_lane_at_94829_tokens(self, monkeypatch, tmp_path):
         """The exact turn from agent.log 2026-08-02 09:43:11.
@@ -1387,6 +1506,144 @@ class TestFirstChunkBudgetThroughRealProviderResolution:
         other_model = self._payload("deepseek-v4-flash-iq3xxs", 94_829)
         assert (
             resolve_dflash_local_first_chunk_timeout(agent, other_model) == 1200.0
+        )
+
+
+class TestManagedW2RouteIdentityRecoveryBoundaries:
+    """What the recovered-identity match must refuse, and what it must not cost.
+
+    The route check is the gate on a hardcoded timing exception for one
+    physical lane, so widening it is a real regression: every endpoint it
+    wrongly admits gets a 360s floor and a 180s cold-start allowance measured
+    on hardware that is not it. These tests fix the two boundaries — the
+    refusals, and the per-turn cost of asking at all.
+    """
+
+    W2 = "deepseek-v4-flash-w2"
+
+    @staticmethod
+    def _home(monkeypatch, tmp_path, config_body: str) -> None:
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / ".env").write_text("", encoding="utf-8")
+        (tmp_path / "config.yaml").write_text(
+            textwrap.dedent(config_body), encoding="utf-8"
+        )
+
+    @staticmethod
+    def _agent(provider: str, base_url: str):
+        return SimpleNamespace(provider=provider, base_url=base_url)
+
+    def test_no_base_url_refuses_the_config_provider_fallback(
+        self, monkeypatch, tmp_path
+    ):
+        """Documented choice: endpoint identity only, never ``model.provider``.
+
+        ``resolve_provider_config_key`` will fall back to
+        ``config.model.provider`` when there is no endpoint to match on — right
+        for recovering an operator's own credentials and timeouts, wrong here.
+        This lane's floor is OUR hardcoded exception for specific hardware, and
+        an agent with no base_url is an endpoint we cannot identify; handing it
+        the exception on the strength of a config field would let any ad-hoc
+        endpoint inherit it. The first assertion proves the fallback really
+        would have fired, so this refusal stays deliberate rather than
+        accidentally becoming unreachable.
+        """
+        from hermes_cli.timeouts import resolve_provider_config_key
+
+        self._home(
+            monkeypatch,
+            tmp_path,
+            """\
+            model:
+              provider: ai-router
+            providers:
+              ai-router:
+                api: "http://10.10.20.199:9081/v1"
+            """,
+        )
+
+        assert resolve_provider_config_key("custom", None) == "ai-router"
+        assert _is_managed_local_w2_route(self._agent("custom", ""), self.W2) is False
+
+    def test_non_w2_model_never_pays_for_identity_recovery(
+        self, monkeypatch, tmp_path
+    ):
+        """Cost guard: recovery reads config, and this runs every API turn.
+
+        The model test must short-circuit before the lookup, so the overhead
+        lands only on the handful of turns that could possibly be on this lane.
+        The second half asserts the patch targets a name that is actually
+        called — otherwise the guard would pass by pointing at nothing.
+        """
+        import agent.chat_completion_helpers as helpers
+
+        self._home(
+            monkeypatch,
+            tmp_path,
+            """\
+            providers:
+              ai-router:
+                api: "http://10.10.20.199:9081/v1"
+            """,
+        )
+        calls = []
+
+        def _record(provider_id, base_url=None, providers=None):
+            calls.append(provider_id)
+            return "ai-router"
+
+        monkeypatch.setattr(helpers, "resolve_provider_config_key", _record)
+        agent = self._agent("custom", "http://10.10.20.199:9081/v1")
+
+        assert _is_managed_local_w2_route(agent, "qwen3.6-27b") is False
+        assert _is_managed_local_w2_route(agent, "deepseek-v4-flash-iq3xxs") is False
+        assert calls == [], f"config lookup ran for a non-W2 model: {calls}"
+
+        assert _is_managed_local_w2_route(agent, self.W2) is True
+        assert calls == ["custom"]
+
+    def test_a_named_provider_never_pays_for_identity_recovery(
+        self, monkeypatch, tmp_path
+    ):
+        """A non-``custom`` id already IS its config key — nothing to recover.
+
+        Keeps the cost off built-in providers, and is why the remote-endpoint
+        and arbitrary-LAN cases stay False without touching config at all.
+        """
+        self._home(monkeypatch, tmp_path, "providers: {}\n")
+
+        def _fail(*args, **kwargs):
+            raise AssertionError("recovery must not run for a named provider")
+
+        monkeypatch.setattr(
+            "hermes_cli.timeouts._recover_custom_provider_key", _fail
+        )
+
+        assert (
+            _is_managed_local_w2_route(
+                self._agent("other-lan", "http://10.10.20.211:8080/v1"), self.W2
+            )
+            is False
+        )
+
+    def test_broken_config_cannot_raise_into_the_request_path(
+        self, monkeypatch, tmp_path
+    ):
+        """Recovery failure degrades to the generic deadline, never an error."""
+        import agent.chat_completion_helpers as helpers
+
+        self._home(monkeypatch, tmp_path, "providers: {}\n")
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("config is unreadable")
+
+        monkeypatch.setattr(helpers, "resolve_provider_config_key", _boom)
+
+        assert (
+            _is_managed_local_w2_route(
+                self._agent("custom", "http://10.10.20.199:9081/v1"), self.W2
+            )
+            is False
         )
 
 
