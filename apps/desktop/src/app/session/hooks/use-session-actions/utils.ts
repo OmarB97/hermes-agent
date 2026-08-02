@@ -10,13 +10,13 @@ import {
   $currentCwd,
   $sessions,
   sessionMatchesStoredId,
+  setActiveSessionModel,
+  setActiveSessionProvider,
   setCurrentBranch,
   setCurrentCwd,
   setCurrentFallbackPolicy,
   setCurrentFastMode,
-  setCurrentModel,
   setCurrentPersonality,
-  setCurrentProvider,
   setCurrentReasoningEffort,
   setCurrentServiceTier,
   setCurrentUsage,
@@ -530,13 +530,17 @@ export function applyRuntimeInfo(
 
   reportInstallMethodWarning(info.install_warning)
 
+  // Runtime metadata paints the mirror, never the composer's persisted pick:
+  // session.create echoes a spawn's `-m` override straight back as `info.model`
+  // (tui_gateway/server.py), so treating it as a selection re-aimed every chat
+  // the user started afterwards (#298).
   if (typeof info.model === 'string') {
-    setCurrentModel(info.model)
+    setActiveSessionModel(info.model)
     sessionState.model = info.model
   }
 
   if (typeof info.provider === 'string') {
-    setCurrentProvider(info.provider)
+    setActiveSessionProvider(info.provider)
     sessionState.provider = info.provider
   }
 
@@ -599,8 +603,10 @@ export function applyRuntimeInfo(
 }
 
 export function applyStoredSessionPreviewRuntimeInfo(stored: { model?: null | string } | undefined) {
-  setCurrentModel(stored?.model || '')
-  setCurrentProvider('')
+  // A resume in flight has no runtime id yet, so the mirror (not $activeSessionId)
+  // is what keeps the stored row's model on screen until session.info lands.
+  setActiveSessionModel(stored?.model || '')
+  setActiveSessionProvider('')
   setCurrentFallbackPolicy('')
   setCurrentReasoningEffort('')
   setCurrentServiceTier('')

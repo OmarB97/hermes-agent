@@ -305,6 +305,27 @@ export const $resumeFailedSessionId = atom<string | null>(null)
 export const $resumeExhaustedSessionId = atom<string | null>(null)
 export const $currentModel = atom(storedString(COMPOSER_MODEL_KEY) ?? '')
 export const $currentProvider = atom(storedString(COMPOSER_PROVIDER_KEY) ?? '')
+// The model/provider the OPEN session is actually running — mirrored from
+// session.info (and from a stored row while its resume is in flight). Kept
+// apart from $currentModel/$currentProvider above, which are the composer's
+// sticky *selection*: that one persists to localStorage and is what
+// `desktopSessionCreateParams` ships as the next chat's override. Writing
+// runtime metadata back into the selection is how a `hermes desktop spawn -m
+// <model>` used to re-aim every chat the user started afterwards (#298) — the
+// spawn's model comes straight back on session.create's `info.model` and on
+// every session.info thereafter. Runtime → mirror, user pick → selection.
+//
+// `null` means "no session owns the display" (a fresh draft), so the composer's
+// pick shows through; `''` means a session is open and reported no model, which
+// paints the pill's loader exactly as a blank selection used to.
+export const $activeSessionModel = atom<null | string>(null)
+export const $activeSessionProvider = atom<null | string>(null)
+
+/** What the PRIMARY chat surface displays: the open session's model, falling
+ *  back to the composer's sticky pick on a fresh draft. A tile computes the
+ *  same shape from its own `$sessionStates` slice (see buildTileView). */
+export const $primaryModel = computed([$activeSessionModel, $currentModel], (live, picked) => live ?? picked)
+export const $primaryProvider = computed([$activeSessionProvider, $currentProvider], (live, picked) => live ?? picked)
 // Effective per-session fallback policy reflected from session.info. The
 // durable source is backend config; this atom only mirrors the focused session.
 export const $currentFallbackPolicy = atom<'' | 'any' | 'local-only' | 'off'>('')
@@ -406,6 +427,18 @@ export const setCurrentModel = (next: Updater<string>) => {
 export const setCurrentProvider = (next: Updater<string>) => {
   updateAtom($currentProvider, next)
   persistString(COMPOSER_PROVIDER_KEY, $currentProvider.get() || null)
+}
+
+// Runtime mirrors — deliberately NOT persisted. Pass `null` to hand the display
+// back to the composer's sticky pick (a fresh draft owns no session).
+export const setActiveSessionModel = (next: Updater<null | string>) => updateAtom($activeSessionModel, next)
+export const setActiveSessionProvider = (next: Updater<null | string>) => updateAtom($activeSessionProvider, next)
+
+/** Hand the model display back to the composer's pick — a fresh draft, or a
+ *  gateway swap that left no open session. */
+export const clearActiveSessionModel = () => {
+  setActiveSessionModel(null)
+  setActiveSessionProvider(null)
 }
 
 export const getCurrentModelSource = (): ComposerModelSource => {
