@@ -9,7 +9,12 @@ sending (and anchors the reactive retry to the same estimate).
 from types import SimpleNamespace
 
 from agent.chat_completion_helpers import _preflight_clamp_output_tokens
-from agent.model_metadata import estimate_messages_tokens_rough, output_tokens_that_fit
+from agent.model_metadata import (
+    _OUTPUT_FIT_MIN_USABLE,
+    _OUTPUT_FIT_WINDOW_MARGIN,
+    estimate_messages_tokens_rough,
+    output_tokens_that_fit,
+)
 
 
 # A prompt large enough that a half-window output cap overflows a 128K window.
@@ -18,11 +23,29 @@ _BIG = [{"role": "user", "content": "x" * 232000}]
 _SMALL = [{"role": "user", "content": "hello there"}]
 _CTX = 131072
 
-# ~115k tokens in a 131,072 window: past the point where the multiplicative
-# input reservation (1.2x + 1536) exhausts the window, but the prompt itself
-# still leaves ~16k tokens of genuine headroom.  This is the regime where the
-# old ``min_output`` floor turned "nothing fits" into "1 token fits".
+# ~115k tokens in a 131,072 window (87.7% fill): past the 1/1.15 ceiling, so the
+# safety contract itself admits no usable cap — 1.15 * 115,008 already exceeds
+# the whole window.  This is the regime where the old ``min_output`` floor turned
+# "nothing fits" into "1 token fits".
 _NEAR_FULL = [{"role": "user", "content": "x" * 460000}]
+
+# A 200,000-token window, where the fill bands below are wide enough to name
+# individual estimates.  ``_HIGH_FILL_TOKENS`` is the case from the report: the
+# preferred 1.2x cushion admits nothing at all there, while the 1.15x safety
+# contract still has thousands of output tokens to give.
+_CTX_200K = 200_000
+_HIGH_FILL_TOKENS = 166_008
+
+
+def _msgs(tokens):
+    """Messages whose rough estimate is ~``tokens`` (~4 chars/token)."""
+    return [{"role": "user", "content": "x" * (tokens * 4)}]
+
+
+def _fits_for_a_denser_server(msgs, fit, ctx):
+    """The documented safety contract: a server tokenizing ~15% denser than our
+    estimate must still leave the clamped request inside the window."""
+    return int(estimate_messages_tokens_rough(msgs) * 1.15) + fit < ctx
 
 
 def _agent(max_tokens=None, ephemeral=None, ctx=_CTX):
@@ -100,9 +123,9 @@ class TestReactiveRetryConverges:
 class TestNearFullWindowNeverYieldsAUselessCap:
     """A near-full window must report "no usable fit", never a 1-token floor.
 
-    ``output_tokens_that_fit`` reserves the input multiplicatively (1.2x), so
-    once the estimate passes ~82.7% of the window the reservation swallows it
-    whole.  Returning the ``min_output`` floor there manufactured a "1 output
+    Past ~87% fill (the ``1/1.15`` ceiling) even the safety contract admits
+    nothing: any positive cap would put a denser-tokenizing server over the
+    window.  Returning the ``min_output`` floor there manufactured a "1 output
     token fits" budget out of "nothing fits", and both callers consumed it as a
     real number: the provider accepts a max_tokens=1 retry and returns a single
     truncated token, so the turn *succeeds* with output the user cannot use.
@@ -153,3 +176,107 @@ class TestNearFullWindowNeverYieldsAUselessCap:
         # The retry must stay anchored to what the provider said actually fits.
         assert safe_out > 1_000
         assert safe_out == max(1, min(provider_available, local_available_out) - 64)
+
+
+class TestHighFillBandDegradesGracefully:
+    """The 82.7%-100% fill band: no cliff from a healthy cap straight to ``None``.
+
+    The 1.2x reservation is an *uncertainty allowance* for servers that tokenize
+    denser than the ~4 chars/token heuristic, not a real token cost — and near a
+    full window that allowance (0.2 * est) exceeds the entire remaining headroom.
+    Holding it there reported "nothing fits" while thousands of output tokens
+    genuinely did, which switched the pre-flight clamp off for every turn in the
+    band: each one sent the full configured max_tokens, ate a provider 400, and
+    only then got a usable cap from the reactive retry.  A guaranteed extra
+    round-trip per turn.
+
+    So the reservation now degrades to the 1.15x safety contract instead of
+    vanishing.  ``None`` is still the answer past the ``1/1.15`` ceiling, where
+    nothing usable genuinely fits.
+    """
+
+    def test_reported_fit_where_the_preferred_cushion_admits_none(self):
+        # The case from the report: at est=166,008 in a 200,000 window the 1.2x
+        # reservation overruns the window outright, while the 1.15x contract
+        # still admits ~9,000 output tokens.
+        msgs = _msgs(_HIGH_FILL_TOKENS)
+        est = estimate_messages_tokens_rough(msgs)
+        assert int(est * 1.2) + 1536 > _CTX_200K  # preferred cushion: nothing
+        fit = output_tokens_that_fit(_CTX_200K, msgs)
+        assert fit is not None and fit > 5_000
+        assert _fits_for_a_denser_server(msgs, fit, _CTX_200K)
+
+    def test_band_is_covered_without_a_hole(self):
+        # Sweep the whole band the old formula gave up on.  Every fill level
+        # from the 1.2x limit (~82.7%) up to the 1.15x ceiling (~86.9%) must
+        # report a real cap, and the caps must taper rather than jump to None.
+        for pct in range(83, 87):
+            msgs = _msgs(int(_CTX_200K * pct / 100))
+            fit = output_tokens_that_fit(_CTX_200K, msgs)
+            assert fit is not None, f"no cap reported at {pct}% fill"
+            assert fit >= _OUTPUT_FIT_MIN_USABLE
+            assert _fits_for_a_denser_server(msgs, fit, _CTX_200K)
+
+    def test_none_only_when_nothing_usable_genuinely_fits(self):
+        # The complement of the sweep above, and the property that keeps this
+        # honest: wherever the function still declines to answer, the safety
+        # contract really does admit nothing usable.  A cliff — declining while
+        # thousands of tokens fit — fails here.  Stepped finely enough to land
+        # inside the transition rather than skipping over it.
+        #
+        # The bound allows for ``_OUTPUT_FIT_WINDOW_MARGIN``: that slack is
+        # deliberately held back from every answer, so the contract admitting
+        # one margin's worth of tokens on top of the usable floor is still
+        # "nothing to offer".  The bound is tight — swept over every estimate in
+        # the window, the largest headroom ever declined is exactly this.
+        slack = _OUTPUT_FIT_MIN_USABLE + _OUTPUT_FIT_WINDOW_MARGIN
+        for tokens in range(int(_CTX_200K * 0.80), _CTX_200K, 500):
+            msgs = _msgs(tokens)
+            if output_tokens_that_fit(_CTX_200K, msgs) is not None:
+                continue
+            est = estimate_messages_tokens_rough(msgs)
+            contract_max = _CTX_200K - int(est * 1.15) - 1
+            assert contract_max <= slack, (
+                f"est={est} reported None while {contract_max} tokens fit"
+            )
+
+    def test_no_reported_cap_is_too_small_to_use(self):
+        # The original defect, swept across the band: a cap of a handful of
+        # tokens is a truncated response the provider accepts, not a working
+        # request.  Below the usable floor the answer must be None.
+        for tokens in range(1_000, _CTX_200K, 500):
+            fit = output_tokens_that_fit(_CTX_200K, _msgs(tokens))
+            assert fit is None or fit >= _OUTPUT_FIT_MIN_USABLE
+
+    def test_low_fill_reservation_is_unchanged(self):
+        # The degraded tier must not loosen the band that already works: below
+        # the 1.2x limit the answer is still exactly the preferred reservation.
+        for pct in (10, 40, 70, 80):
+            msgs = _msgs(int(_CTX_200K * pct / 100))
+            est = estimate_messages_tokens_rough(msgs)
+            expected = _CTX_200K - (int(est * 1.2) + 1024) - 512
+            assert output_tokens_that_fit(_CTX_200K, msgs) == expected
+
+    def test_preflight_clamp_fires_in_the_band(self):
+        # The point of the exercise: the clamp is back on above ~82.7% fill, so
+        # the turn no longer spends a round-trip discovering its own cap.
+        a = _agent(max_tokens=65536, ctx=_CTX_200K)
+        _preflight_clamp_output_tokens(a, _msgs(_HIGH_FILL_TOKENS))
+        assert a._ephemeral_max_output_tokens is not None
+        assert a._ephemeral_max_output_tokens >= _OUTPUT_FIT_MIN_USABLE
+        assert a._ephemeral_max_output_tokens < 65536
+
+    def test_reactive_retry_still_converges_in_one_step_in_the_band(self):
+        # #271: vLLM reports the offending input as a max_tokens-dependent LOWER
+        # bound, so available_out tracks whatever cap we just sent and a plain
+        # shrink-and-retry never converges.  In the band the local anchor used to
+        # be None; now it exists and pulls the retry straight to a fitting cap.
+        msgs = _msgs(_HIGH_FILL_TOKENS)
+        local_fit = output_tokens_that_fit(_CTX_200K, msgs)
+        assert local_fit is not None
+        for requested in (65536, 65471, 65406):
+            available_out = requested - 1  # the lower bound, not the truth
+            safe_out = max(1, available_out - 64)
+            safe_out = max(1, min(safe_out, local_fit))
+            assert safe_out == local_fit  # one step, from any starting cap
+            assert _fits_for_a_denser_server(msgs, safe_out, _CTX_200K)

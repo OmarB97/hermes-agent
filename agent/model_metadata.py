@@ -2626,24 +2626,47 @@ def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
     return ((total_chars + 3) // 4) + image_tokens
 
 
-# Over-reservation factor applied to the rough input estimate before sizing the
-# output cap.  ``estimate_messages_tokens_rough`` assumes ~4 chars/token, but
-# dense tool-call / JSON / log transcripts (typical of agentic sessions)
-# tokenize closer to ~3.4 chars/token, so the server counts materially more
-# input than we estimate.  Over-reserving the input keeps the request strictly
-# inside the window even when the estimate under-counts.  Observed gap on
-# deepseek-v4-flash-w2: est 58,039 vs server >=65,797 (~1.13x); 1.2x + a fixed
-# pad gives comfortable headroom without wasting much of the window.
+# Over-reservation applied to the rough input estimate before sizing the output
+# cap.  ``estimate_messages_tokens_rough`` assumes ~4 chars/token, but dense
+# tool-call / JSON / log transcripts (typical of agentic sessions) tokenize
+# closer to ~3.4 chars/token, so the server counts materially more input than we
+# estimate.  Over-reserving the input keeps the request strictly inside the
+# window even when the estimate under-counts.  Observed gap on
+# deepseek-v4-flash-w2: est 58,039 vs server >=65,797 (~1.13x).
+#
+# The reservation has two tiers, because this allowance is an *uncertainty
+# cushion*, not a real token cost:
+#
+#   PREFERRED (1.2x + a fixed pad) — what we spend while the window can afford
+#   it.  Comfortable, and nearly free when most of the window is still empty.
+#
+#   SAFETY (23/20 = 1.15x) — the contract every reported fit must honour: a
+#   server tokenizing 15% denser than our estimate must still leave the clamped
+#   request inside the window.  This is the floor the reservation degrades to,
+#   never past.
+#
+# The tiers matter near a full window, where the preferred cushion alone
+# (0.2 * est) exceeds all the remaining headroom: holding it there reports
+# "nothing fits" while several thousand output tokens genuinely do (at
+# est=166,008 in a 200,000 window it admits none, the contract admits ~9,000).
 _OUTPUT_FIT_INPUT_FACTOR = 1.2
 _OUTPUT_FIT_INPUT_PAD = 1024
+# Kept rational so the ceiling is exact integer arithmetic (23/20 == 1.15).
+_OUTPUT_FIT_SAFETY_NUM = 23
+_OUTPUT_FIT_SAFETY_DEN = 20
 _OUTPUT_FIT_WINDOW_MARGIN = 512
+# Smallest cap worth reporting.  Below this a clamp does not produce a working
+# request, just a truncated answer the provider happily returns and the user
+# cannot use — the max_tokens=1 defect.  ``None`` (leave the cap alone, let the
+# provider's own budget decide) is the honest answer there instead.
+_OUTPUT_FIT_MIN_USABLE = 512
 
 
 def output_tokens_that_fit(
     context_length: Optional[int],
     api_messages: List[Dict[str, Any]],
     *,
-    min_output: int = 1,
+    min_output: int = _OUTPUT_FIT_MIN_USABLE,
 ) -> Optional[int]:
     """Largest output cap that keeps prompt + output inside the model window.
 
@@ -2652,7 +2675,7 @@ def output_tokens_that_fit(
 
     Returns ``None`` when this function has no useful cap to offer — either the
     window is unknown/invalid, or the reserved input already fills it so no
-    positive cap is left.  In both cases the caller must leave ``max_tokens`` to
+    usable cap is left.  In both cases the caller must leave ``max_tokens`` to
     its own budget logic and NOT clamp to this result.  ``None`` is never a
     licence to shrink; a near-full window is compression's problem, not
     something a tiny output cap can fix.
@@ -2673,24 +2696,43 @@ def output_tokens_that_fit(
     (each shrink raises the reported floor in lockstep); anchoring the retry to
     this local estimate makes it converge to a fitting value in one step.
 
-    Note the reservation is multiplicative (``_OUTPUT_FIT_INPUT_FACTOR``), so it
-    exhausts the window once the estimate passes roughly
-    ``(context_length - 1536) / 1.2`` — ~82.7% fill.  Past that point this
-    returns ``None`` and the proactive clamp stops firing, leaving the provider
-    to report its own authoritative budget on the reactive path.
+    The reservation degrades in two tiers as the window fills (see the constants
+    above).  The preferred 1.2x cushion is multiplicative, so it exhausts the
+    window on its own once the estimate passes ``(context_length - 2048) / 1.2``
+    — ~82.5% fill.  That is where the *cushion* becomes unaffordable, not where
+    the request stops fitting, so past that point the reservation drops to the
+    1.15x safety contract and keeps reporting real caps (~9,000 tokens at 83%
+    fill of a 200,000 window, tapering to ``min_output``).  ``None`` arrives
+    only when the contract itself admits nothing usable, at ~87% fill — the
+    ``1/1.15`` ceiling — and there the proactive clamp stands down and lets the
+    provider report its own authoritative budget on the reactive path.
     """
     if not isinstance(context_length, int) or context_length <= 0:
         return None
     est = estimate_messages_tokens_rough(api_messages)
     if not isinstance(est, int) or est < 0:
         return None
-    reserved_input = int(est * _OUTPUT_FIT_INPUT_FACTOR) + _OUTPUT_FIT_INPUT_PAD
-    fit = context_length - reserved_input - _OUTPUT_FIT_WINDOW_MARGIN
-    # Below ``min_output`` there is no cap worth handing back.  Returning the
+    budget = context_length - _OUTPUT_FIT_WINDOW_MARGIN
+    # Preferred tier: the comfortable cushion, kept whenever the window can pay
+    # for it and still leave a usable cap.
+    fit = budget - (int(est * _OUTPUT_FIT_INPUT_FACTOR) + _OUTPUT_FIT_INPUT_PAD)
+    if fit < max(min_output, _OUTPUT_FIT_MIN_USABLE):
+        # Degraded tier: reserve exactly what the safety contract requires and
+        # hand back the rest.  ``- 1`` keeps ``server_input + fit < window``
+        # strict.  The fixed pad is dropped here on purpose: it is a rounding
+        # cushion for small prompts, and at the fill levels that reach this
+        # branch the 0.15 * est term is orders of magnitude larger, so the pad
+        # buys no safety and costs real output tokens.
+        safety_reserved = (
+            est * _OUTPUT_FIT_SAFETY_NUM + _OUTPUT_FIT_SAFETY_DEN - 1
+        ) // _OUTPUT_FIT_SAFETY_DEN
+        fit = budget - safety_reserved - 1
+    # Below ``min_output`` there is no cap worth handing back.  Returning a
     # floor here (as this did before) manufactured a "1 output token fits"
     # budget out of "nothing fits", and both callers consumed it as real: the
     # reactive retry clamped a healthy provider-authoritative cap down to 1, and
-    # the pre-flight clamp did the same to every request above ~82.7% fill.
+    # the pre-flight clamp did the same to every request whose window had run
+    # out of room for the reservation.
     return fit if fit >= min_output else None
 
 
