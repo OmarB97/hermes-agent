@@ -2659,7 +2659,17 @@ _OUTPUT_FIT_WINDOW_MARGIN = 512
 # request, just a truncated answer the provider happily returns and the user
 # cannot use — the max_tokens=1 defect.  ``None`` (leave the cap alone, let the
 # provider's own budget decide) is the honest answer there instead.
-_OUTPUT_FIT_MIN_USABLE = 512
+#
+# Deliberately the same value as ``conversation_loop.
+# _LENGTH_CONTINUE_MIN_HEADROOM_TOKENS``: that guard refuses to scaffold another
+# length-continuation round below it, on the grounds that there is no room left
+# for a useful completion.  Same question, so the same answer — and the two must
+# not disagree.  A clamp below that threshold would fight it: the truncated
+# response starts a continuation round, the boost there sizes the next cap to
+# the real context headroom, and this clamp shrinks it straight back to a value
+# the continuation guard itself considers too small to write into.  (No import —
+# conversation_loop imports this module, not the other way round.)
+_OUTPUT_FIT_MIN_USABLE = 2048
 
 
 def output_tokens_that_fit(
@@ -2697,15 +2707,16 @@ def output_tokens_that_fit(
     this local estimate makes it converge to a fitting value in one step.
 
     The reservation degrades in two tiers as the window fills (see the constants
-    above).  The preferred 1.2x cushion is multiplicative, so it exhausts the
-    window on its own once the estimate passes ``(context_length - 2048) / 1.2``
-    — ~82.5% fill.  That is where the *cushion* becomes unaffordable, not where
-    the request stops fitting, so past that point the reservation drops to the
-    1.15x safety contract and keeps reporting real caps (~9,000 tokens at 83%
-    fill of a 200,000 window, tapering to ``min_output``).  ``None`` arrives
-    only when the contract itself admits nothing usable, at ~87% fill — the
-    ``1/1.15`` ceiling — and there the proactive clamp stands down and lets the
-    provider report its own authoritative budget on the reactive path.
+    above).  The preferred 1.2x cushion is multiplicative, so it stops leaving a
+    usable cap once the estimate passes ``(context_length - 3584) / 1.2`` —
+    ~81.8% fill of a 200,000-token window.  That is where the *cushion* becomes
+    unaffordable, not where the request stops fitting, so past that point the
+    reservation drops to the 1.15x safety contract and keeps reporting real caps
+    (~10,900 tokens at 82% fill, tapering to ``min_output``).  ``None`` arrives
+    only when the contract itself admits nothing usable, at ~85.8% fill — where
+    the ``1/1.15`` ceiling meets the usable floor — and there the proactive
+    clamp stands down and lets the provider report its own authoritative budget
+    on the reactive path.
     """
     if not isinstance(context_length, int) or context_length <= 0:
         return None
