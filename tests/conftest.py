@@ -454,11 +454,12 @@ def mock_config():
     }
 
 
-# ── Per-test timeout — handled by the isolation plugin ─────────────────────
+# ── Per-file timeout — enforced by the runner, not by a plugin ─────────────
 #
-# The subprocess-per-test plugin enforces the configured ``isolate_timeout``
-# ini key by terminating the child if it overruns. The old SIGALRM-based
-# fixture (POSIX-only, didn't work on Windows) is gone.
+# ``scripts/run_tests_parallel.py`` runs one pytest subprocess per FILE and
+# kills the process tree if it overruns ``--file-timeout`` (default 300s).
+# There is no per-test isolation plugin and no ``isolate_timeout`` ini key;
+# the old SIGALRM-based fixture (POSIX-only, didn't work on Windows) is gone.
 
 
 @pytest.fixture(autouse=True)
