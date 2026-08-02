@@ -209,7 +209,6 @@ declare global {
           model?: string
           provider?: string
           profile?: string
-          toolsets?: string[]
           // `--delegated`: nobody is watching, so the chat must not stop to ask.
           delegated?: boolean
           delegatedTimeoutMs?: number

@@ -135,6 +135,14 @@ def _read_control_file(path: Path) -> dict:
 def _spawn_request_body(args) -> dict:
     """Build the JSON body for POST /spawn, omitting unset optional fields.
 
+    Only carries what the renderer can actually bind to a new session:
+    model/provider/profile become per-session overrides on ``session.create``.
+    Toolsets deliberately do NOT belong here — the gateway resolves
+    ``enabled_toolsets`` per process, not per session, so the app would have to
+    drop the value (see the note in ``hermes_cli/subcommands/gui.py``). The
+    control server rejects a ``toolsets`` key outright rather than take one it
+    cannot honor.
+
     Raises RuntimeError for flag combinations argparse cannot express.
     """
     body: dict = {"prompt": args.prompt}
@@ -146,12 +154,6 @@ def _spawn_request_body(args) -> dict:
     profile = _requested_profile(args)
     if profile:
         body["profile"] = profile
-
-    raw_toolsets = getattr(args, "toolsets", None)
-    if raw_toolsets:
-        toolsets = [t.strip() for t in raw_toolsets.split(",") if t.strip()]
-        if toolsets:
-            body["toolsets"] = toolsets
 
     delegated = bool(getattr(args, "delegated", False))
     timeout_seconds = getattr(args, "delegated_timeout", None)
