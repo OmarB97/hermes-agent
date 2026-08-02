@@ -1,6 +1,7 @@
 """Tests for agent/anthropic_adapter.py — Anthropic Messages API adapter."""
 
 import json
+import subprocess
 import sys
 import time
 from types import SimpleNamespace
@@ -695,6 +696,41 @@ class TestResolveWithRefresh:
         assert result == "refreshed-token"
 
 
+def _fake_subprocess_run_setup_token(argv, *_args, **_kwargs):
+    """Argv-aware ``subprocess.run`` double for ``run_oauth_setup_token()``.
+
+    That function issues two *different* subprocess calls, and only one of them
+    has its result inspected:
+
+      1. ``claude setup-token`` — the CompletedProcess is ignored entirely.
+      2. ``security find-generic-password -s 'Claude Code-credentials' -w`` —
+         issued on Darwin by ``_read_claude_code_credentials_from_keychain()``
+         (reached via ``read_claude_code_credentials()``), which checks
+         ``.returncode`` and then calls ``json.loads(.stdout)``.
+
+    A single shapeless ``MagicMock(returncode=0)`` satisfied (1) but handed (2)
+    a MagicMock ``stdout``, so ``json.loads()`` raised ``TypeError`` — which the
+    reader's ``except json.JSONDecodeError`` guard does not cover, so it escaped
+    to the test. Returning a real ``CompletedProcess`` per command keeps the
+    production reader in the path instead of stubbing it out.
+
+    These tests isolate the credential *file* and *env var* sources, so the
+    keychain must answer "no such item": exit status 44 with empty stdout, which
+    is what ``/usr/bin/security`` really emits when the entry is absent.
+    """
+    if argv and argv[0] == "security":
+        return subprocess.CompletedProcess(
+            argv,
+            44,
+            stdout="",
+            stderr=(
+                "security: SecKeychainSearchCopyNext: "
+                "The specified item could not be found in the keychain."
+            ),
+        )
+    return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+
 class TestRunOauthSetupToken:
     def test_raises_when_claude_not_installed(self, monkeypatch):
         monkeypatch.setattr("shutil.which", lambda _: None)
@@ -719,8 +755,7 @@ class TestRunOauthSetupToken:
         }))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
+        with patch("subprocess.run", side_effect=_fake_subprocess_run_setup_token) as mock_run:
             token = run_oauth_setup_token()
 
         assert token == "from-cred-file"
@@ -737,8 +772,7 @@ class TestRunOauthSetupToken:
         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
+        with patch("subprocess.run", side_effect=_fake_subprocess_run_setup_token):
             token = run_oauth_setup_token()
 
         assert token == "from-env-var"
@@ -750,8 +784,7 @@ class TestRunOauthSetupToken:
         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
 
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
+        with patch("subprocess.run", side_effect=_fake_subprocess_run_setup_token):
             token = run_oauth_setup_token()
 
         assert token is None
