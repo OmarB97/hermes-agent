@@ -513,7 +513,10 @@ prompt_caching:
 #
 # Model: leave empty to use the provider's default.  When empty, OpenRouter
 # uses "google/gemini-3-flash-preview" and Nous uses "gemini-3-flash".
-# Other providers pick a sensible default automatically.
+# Other providers pick a sensible default automatically.  When the provider
+# names one of your own providers:/custom_providers: entries, empty means that
+# entry's own default_model — not your main chat model, which the endpoint may
+# not serve at all.  "auto" and "main" still use your main chat model.
 #
 # auxiliary:
 #   # One lane for EVERY task that pins nothing of its own — smart approval,

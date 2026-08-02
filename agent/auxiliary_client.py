@@ -517,6 +517,42 @@ _API_KEY_PROVIDER_AUX_MODELS_FALLBACK: Dict[str, str] = {
 # can still use this dict directly. Kept in sync with _FALLBACK above.
 _API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = _API_KEY_PROVIDER_AUX_MODELS_FALLBACK
 
+# Provider names that mean "whatever lane the main runtime resolved" rather
+# than a user-declared endpoint.  A blank model on one of these must keep
+# inheriting the main chat model, so callers of
+# :func:`_named_provider_default_model` skip them.  Bare ``custom`` belongs
+# here: it is the anonymous OPENAI_BASE_URL / ``model.base_url`` endpoint the
+# main lane already owns, not a named ``providers:`` row.
+_MAIN_LANE_PROVIDER_SENTINELS = frozenset({"auto", "main", "custom"})
+
+
+def _named_provider_default_model(provider: Optional[str]) -> Optional[str]:
+    """Return the default model a named provider entry declares, or None.
+
+    Both config shapes are covered because ``_get_named_custom_provider``
+    normalises them onto one key: ``providers.<name>.default_model`` (dict
+    shape) and ``custom_providers[].model`` (legacy list shape) both arrive
+    as ``entry["model"]``.
+
+    Callers filter the main-lane sentinels themselves rather than having this
+    helper do it — ``auxiliary.route`` normalises a bare ``base_url`` to
+    ``provider: custom`` and still wants the lookup for an entry a user
+    literally named ``custom``.
+    """
+    name = (provider or "").strip()
+    if not name:
+        return None
+    try:
+        from hermes_cli.runtime_provider import _get_named_custom_provider
+
+        entry = _get_named_custom_provider(name)
+    except Exception:
+        return None
+    if not entry:
+        return None
+    return str(entry.get("model") or "").strip() or None
+
+
 # Vision-specific model overrides for direct providers.
 # When the user's main provider has a dedicated vision/multimodal model that
 # differs from their main chat model, map it here.  The vision auto-detect
@@ -6468,14 +6504,9 @@ def _auxiliary_route_target(
         # (resolve_provider_client, "if not model and provider != auto") fills
         # it from ``_read_main_model()`` — i.e. it sends the MAIN model's id to
         # the auxiliary endpoint, which is the one thing this lane must not do.
-        try:
-            from hermes_cli.runtime_provider import _get_named_custom_provider
-
-            entry = _get_named_custom_provider(named_provider)
-        except Exception:
-            entry = None
-        if entry:
-            model = str(entry.get("model") or "").strip() or None
+        # ``_resolve_task_provider_model`` applies the same rule to the
+        # per-task ``auxiliary.<task>.provider`` pin.
+        model = _named_provider_default_model(named_provider)
     api_mode = str(route.get("api_mode", "") or "").strip() or None
     return {
         "provider": provider,
@@ -6831,6 +6862,33 @@ def _resolve_task_provider_model(
         provider, base_url = _expand_direct_api_alias(provider, base_url)
     if cfg_provider:
         cfg_provider, cfg_base_url = _expand_direct_api_alias(cfg_provider, cfg_base_url)
+
+    # ── Named lane, no model pinned → that lane's own default model ──────
+    # ``auxiliary.<task>.provider: my-local-lane`` with no ``model:`` reads as
+    # "use that provider's default model".  Leave the slot blank and
+    # resolve_provider_client's universal fallback ("if not model and provider
+    # != auto", :4923) fills it from ``_read_main_model()`` — it sends the MAIN
+    # chat model's id to an endpoint that may not serve that model at all,
+    # which is a 404 from a local lane rather than an answer.  The entry's own
+    # ``default_model`` is the user's stated intent, so it wins first; the
+    # provider catalog default and ``_read_main_model()`` still backstop a lane
+    # that declares no model of its own.
+    #
+    # ``auxiliary.route`` already resolves its lane this way
+    # (_auxiliary_route_target); PR #340 deliberately left this per-task path
+    # alone to keep its blast radius to the route it was adding.
+    #
+    # Runs AFTER the alias expansion above so a direct-API alias
+    # (``provider: openai`` → custom + api.openai.com) is a sentinel by then
+    # and cannot pair a same-named entry's model with the aliased endpoint.
+    #
+    # The main-lane sentinels are excluded on purpose: ``auto``, ``main`` and
+    # bare ``custom`` all mean "the lane the main runtime already resolved", so
+    # a blank model there must keep inheriting the main chat model.
+    if not resolved_model:
+        lane_provider = str(provider or cfg_provider or "").strip()
+        if lane_provider and lane_provider.lower() not in _MAIN_LANE_PROVIDER_SENTINELS:
+            resolved_model = _named_provider_default_model(lane_provider)
 
     # An explicit provider arg without an explicit base_url must not bypass
     # the task's configured endpoint: adopt auxiliary.<task>.base_url/api_key

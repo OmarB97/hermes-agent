@@ -1011,6 +1011,28 @@ When `base_url` is set, Hermes ignores the provider and calls that endpoint dire
 
 Available providers for auxiliary tasks: `auto`, `main`, plus any provider in the [provider registry](/reference/environment-variables) — `openrouter`, `nous`, `openai-codex`, `copilot`, `copilot-acp`, `anthropic`, `gemini`, `qwen-oauth`, `zai`, `kimi-coding`, `kimi-coding-cn`, `minimax`, `minimax-cn`, `minimax-oauth`, `deepseek`, `nvidia`, `xai`, `xai-oauth`, `ollama-cloud`, `alibaba`, `bedrock`, `huggingface`, `arcee`, `xiaomi`, `kilocode`, `opencode-zen`, `opencode-go`, `azure-foundry` — or any named custom provider from your `custom_providers` list (e.g. `provider: "beans"`).
 
+**Pointing a task at one of your own provider entries.** When `provider` names a
+`providers:` or `custom_providers:` entry and you leave `model` empty, the task
+uses that entry's own `default_model`:
+
+```yaml
+providers:
+  my-local-lane:
+    api: "http://127.0.0.1:8080/v1"
+    default_model: "qwen3-4b"
+
+auxiliary:
+  approval:
+    provider: "my-local-lane"   # no model: → sends qwen3-4b
+```
+
+That matters most for local endpoints, which serve a different model set than
+your main provider: sending your main chat model's id there is a 404, not an
+answer. `auto` and `main` are unchanged — they still mean "use my main chat
+model" — and an explicit `model:` on the task always wins. If the entry
+declares no `default_model`, the task falls back to your main chat model as
+before.
+
 :::tip MiniMax OAuth
 `minimax-oauth` logs in via browser OAuth (no API key needed). Run `hermes model` and select **MiniMax (OAuth)** to authenticate. Auxiliary tasks use `MiniMax-M2.7-highspeed` automatically. See the [MiniMax OAuth guide](../guides/minimax-oauth.md).
 :::
