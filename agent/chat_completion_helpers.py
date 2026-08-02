@@ -337,7 +337,8 @@ def _is_managed_local_w2_route(agent: Any, model: Any) -> bool:
         # must never raise into a request path — degrade to the generic
         # deadline instead.
         logger.debug(
-            "Managed-W2 provider identity recovery failed for %r", provider,
+            "Managed-W2 provider identity recovery failed for %r",
+            provider,
             exc_info=True,
         )
         return False
