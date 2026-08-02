@@ -1,6 +1,7 @@
 import type { UsageStats } from '@/types/hermes'
 
 export interface TokenUsagePayload {
+  compressions?: unknown
   context_length?: unknown
   context_pct?: unknown
   context_tokens?: unknown
@@ -58,12 +59,18 @@ export function usageFromTokenUsagePayload(payload: TokenUsagePayload | null | u
   }
 
   const usage: Partial<UsageStats> = {}
+  // Carried so a mid-turn compression's context DROP survives the monotonic
+  // guard in mergeUsageSnapshot — without it the meter would pin high until
+  // the turn ended, which is the whole window this payload exists to cover.
+  const compressions = nonNegativeNumber(payload.compressions)
   const input = nonNegativeNumber(payload.input_tokens)
   const output = nonNegativeNumber(payload.output_tokens)
   const total = nonNegativeNumber(payload.total_tokens)
   const contextUsed = nonNegativeNumber(payload.context_tokens)
   const contextMax = positiveNumber(payload.context_length)
   const contextPercent = percentFrom(payload)
+
+  if (compressions !== undefined) {usage.compressions = compressions}
 
   if (input !== undefined) {usage.input = input}
 

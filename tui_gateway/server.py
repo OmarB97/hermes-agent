@@ -3680,6 +3680,51 @@ def _get_usage(agent) -> dict:
     return usage
 
 
+def _emit_token_usage(sid: str) -> None:
+    """Push current context occupancy to the client mid-turn.
+
+    Usage otherwise only crosses the wire at turn boundaries: ``session.info``
+    just before ``message.start`` (carrying the PREVIOUS turn's occupancy) and
+    ``message.complete`` at the end. A conversational chat turns over often
+    enough that the gauge looks live, but one long agentic turn — which is what
+    every ``hermes desktop spawn --delegated`` run is — sends nothing at all
+    between its two ends, so the desktop context meter sits frozen for the whole
+    run while the window really fills. Measured 2026-08-02 on session
+    20260802_062726_a24427: one turn, 22 API calls, 40 tool calls, 95,377
+    prompt tokens, and not one usage update after the first.
+
+    The desktop has handled ``token.usage`` since before this existed; nothing
+    ever emitted it. Note the payload key names are that handler's flat shape
+    (``context_tokens``/``context_length``/``context_pct``), not ``_get_usage``'s.
+
+    Silent when the window is still unknown — a fresh compressor reports
+    ``last_prompt_tokens`` 0 and ``_get_usage`` deliberately omits the gauge
+    rather than fabricating 0%.
+    """
+    agent = (_sessions.get(sid) or {}).get("agent")
+    if agent is None:
+        return
+    try:
+        usage = _get_usage(agent)
+    except Exception:
+        return
+    if "context_used" not in usage:
+        return
+    _emit(
+        "token.usage",
+        sid,
+        {
+            "context_tokens": usage["context_used"],
+            "context_length": usage["context_max"],
+            "context_pct": usage["context_percent"],
+            "compressions": usage.get("compressions", 0),
+            "input_tokens": usage.get("input", 0),
+            "output_tokens": usage.get("output", 0),
+            "total_tokens": usage.get("total", 0),
+        },
+    )
+
+
 def _probe_credentials(agent) -> str:
     """Light credential check at session creation — returns warning or ''."""
     try:
@@ -4132,6 +4177,11 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
         pass
     if _tool_progress_enabled(sid) or payload.get("inline_diff"):
         _emit("tool.complete", sid, payload)
+    # Outside the tool-progress gate on purpose: the context meter must track a
+    # long turn even for a client that streams no tool cards. Each completed
+    # tool follows an API response, which is exactly when the compressor's
+    # occupancy moved, so this is one small frame per round trip.
+    _emit_token_usage(sid)
 
 
 def _on_tool_progress(

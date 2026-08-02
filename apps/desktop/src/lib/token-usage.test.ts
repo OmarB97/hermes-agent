@@ -23,6 +23,25 @@ describe('usageFromTokenUsagePayload', () => {
     })
   })
 
+  it('carries the compression count so a mid-turn compaction can lower the gauge', () => {
+    // A long agentic turn can compress before it ends. Without the count the
+    // monotonic guard in mergeUsageSnapshot reads the smaller window as a
+    // regression and pins the meter high for the rest of the turn.
+    const beforeCompaction = mergeTokenUsagePayload(
+      { calls: 4, input: 0, output: 0, total: 0 },
+      { compressions: 0, context_length: 262_144, context_pct: 82, context_tokens: 215_000 }
+    )
+
+    expect(
+      mergeTokenUsagePayload(beforeCompaction, {
+        compressions: 1,
+        context_length: 262_144,
+        context_pct: 24,
+        context_tokens: 63_000
+      })
+    ).toMatchObject({ compressions: 1, context_percent: 24, context_used: 63_000 })
+  })
+
   it('derives context percent when the backend omits context_pct', () => {
     expect(
       usageFromTokenUsagePayload({
