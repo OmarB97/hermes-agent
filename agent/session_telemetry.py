@@ -420,6 +420,23 @@ def hydrate_agent_session_telemetry(agent: Any) -> bool:
         return _hydrate_agent_session_telemetry_locked(agent)
 
 
+def mark_session_telemetry_bound(agent: Any) -> bool:
+    """Complete a bind for a row that has nothing to restore.
+
+    Hydration exists to recover a *resumed* row's durable counters.  A row the
+    binding call just created is all-zero, so projecting it would erase the
+    telemetry the live runtime already holds.  Marking the bind records that
+    the session is bound without applying the row, which also keeps a later
+    ``_ensure_db_session`` in the same turn from re-projecting the row once
+    partial writes have landed in it.
+    """
+    session_id = getattr(agent, "session_id", None)
+    if not session_id:
+        return False
+    agent._session_telemetry_hydrated_session_id = session_id
+    return True
+
+
 def persist_current_telemetry_snapshot(agent: Any) -> bool:
     """Seed a newly rotated session with the cumulative runtime counters.
 
@@ -1223,6 +1240,7 @@ __all__ = [
     "clear_pending_request_during_unwind",
     "clear_pending_request_on_success",
     "hydrate_agent_session_telemetry",
+    "mark_session_telemetry_bound",
     "new_pending_owner",
     "pending_projection_guard",
     "persist_current_telemetry_snapshot",
