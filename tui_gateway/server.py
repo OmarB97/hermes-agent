@@ -1645,6 +1645,12 @@ def _start_agent_build(sid: str, session: dict) -> None:
                         kw["reasoning_config_override"] = reasoning
                     if (tier := current.get("create_service_tier_override")) is not None:
                         kw["service_tier_override"] = tier
+                # Not `if pinned:` — a pin of None is the resolved `all`
+                # sentinel and must still reach _make_agent. Absence of the key
+                # (a session made before this existed) is the only "no pin".
+                pinned = current.get("create_toolsets_override", _NO_TOOLSET_OVERRIDE)
+                if pinned is not _NO_TOOLSET_OVERRIDE:
+                    kw["toolsets_override"] = pinned
                 agent = _make_agent(sid, key, **kw)
             finally:
                 _clear_session_context(tokens)
@@ -2978,6 +2984,109 @@ def _load_tool_progress_mode() -> str:
     return mode if mode in {"off", "new", "all", "verbose"} else "all"
 
 
+#: "No per-session toolset pin was given" — distinct from a pin of ``None``,
+#: which is the resolved form of ``all``/``*`` and means *every* toolset.
+_NO_TOOLSET_OVERRIDE = object()
+
+
+class _ToolsetResolution(NamedTuple):
+    """What an explicit list of toolset names resolved to.
+
+    ``enabled`` is what to hand ``AIAgent(enabled_toolsets=...)``: a concrete
+    list, or ``None`` for the ``all``/``*`` sentinel meaning every toolset.
+    ``enabled`` is ``None`` when nothing resolved either — ``ok`` is what
+    tells those two apart, so never read one without the other.
+    """
+
+    enabled: list[str] | None
+    ok: bool
+    #: Names that are neither a built-in/plugin toolset nor a known MCP server.
+    unknown: list[str]
+    #: Names of MCP servers that exist but are `enabled: false` in config.
+    disabled: list[str]
+    #: Entries dropped because ``all``/``*`` was also present and outranks them.
+    ignored: list[str]
+
+
+def _resolve_toolset_names(names: list[str]) -> _ToolsetResolution:
+    """Resolve explicit toolset names against built-ins, plugins and MCP servers.
+
+    Shared by the process-wide resolver (``HERMES_TUI_TOOLSETS``, below) and the
+    per-session ``session.create`` override, so a spawn accepts exactly the
+    vocabulary the env var does — built-in toolsets, plugin toolsets (after a
+    discovery pass), enabled MCP server names, and the ``all``/``*`` sentinel —
+    rather than a second, subtly different idea of what a toolset name is.
+
+    Reporting the rejects (rather than quietly dropping them) is the whole
+    point: a name that silently resolves to nothing is how #38798 turned into a
+    text-only agent nobody could explain. Callers decide what to do with them —
+    the env resolver warns to stderr and falls back, ``session.create`` refuses
+    to build a session whose tools would not be the ones that were asked for.
+    """
+    try:
+        from toolsets import validate_toolset
+    except Exception:
+        return _ToolsetResolution(None, False, list(names), [], [])
+
+    built_in = [name for name in names if validate_toolset(name)]
+    unresolved = [name for name in names if name not in built_in]
+
+    # A plugin's toolsets only exist post-discovery, so an unrecognized name is
+    # not yet a wrong one — pay for discovery only when something is unresolved.
+    if unresolved:
+        try:
+            from hermes_cli.plugins import discover_plugins
+
+            discover_plugins()
+            plugin_valid = [name for name in unresolved if validate_toolset(name)]
+        except Exception:
+            plugin_valid = []
+
+        if plugin_valid:
+            built_in.extend(plugin_valid)
+            unresolved = [name for name in unresolved if name not in plugin_valid]
+
+    if any(name in {"all", "*"} for name in built_in):
+        return _ToolsetResolution(
+            None, True, [], [], [name for name in names if name not in {"all", "*"}]
+        )
+
+    if not unresolved:
+        return _ToolsetResolution(built_in, bool(built_in), [], [], [])
+
+    mcp_names: set[str] = set()
+    mcp_disabled: set[str] = set()
+    try:
+        from hermes_cli.config import read_raw_config
+        from hermes_cli.tools_config import _parse_enabled_flag
+
+        raw_cfg = read_raw_config()
+        mcp_servers = (
+            raw_cfg.get("mcp_servers")
+            if isinstance(raw_cfg.get("mcp_servers"), dict)
+            else {}
+        )
+        for name, server_cfg in mcp_servers.items():
+            if not isinstance(server_cfg, dict):
+                continue
+            if _parse_enabled_flag(server_cfg.get("enabled", True), default=True):
+                mcp_names.add(str(name))
+            else:
+                mcp_disabled.add(str(name))
+    except Exception:
+        mcp_names = set()
+        mcp_disabled = set()
+
+    mcp_valid = [name for name in unresolved if name in mcp_names]
+    disabled = [name for name in unresolved if name in mcp_disabled]
+    unknown = [
+        name for name in unresolved if name not in mcp_names and name not in mcp_disabled
+    ]
+    valid = built_in + mcp_valid
+
+    return _ToolsetResolution(valid, bool(valid), unknown, disabled, [])
+
+
 def _load_enabled_toolsets() -> list[str] | None:
     explicit = [
         item.strip()
@@ -3013,85 +3122,32 @@ def _load_enabled_toolsets() -> list[str] | None:
         validate_toolset = None
 
     if explicit and validate_toolset is not None:
-        built_in = [name for name in explicit if validate_toolset(name)]
-        unresolved = [name for name in explicit if name not in built_in]
+        resolution = _resolve_toolset_names(explicit)
 
-        if unresolved:
-            try:
-                from hermes_cli.plugins import discover_plugins
-
-                discover_plugins()
-                plugin_valid = [name for name in unresolved if validate_toolset(name)]
-            except Exception:
-                plugin_valid = []
-
-            if plugin_valid:
-                built_in.extend(plugin_valid)
-                unresolved = [name for name in unresolved if name not in plugin_valid]
-
-        if any(name in {"all", "*"} for name in built_in):
-            ignored = [name for name in explicit if name not in {"all", "*"}]
-            if ignored:
-                print(
-                    "[tui] HERMES_TUI_TOOLSETS=all enables every toolset; "
-                    f"ignoring additional entries: {', '.join(ignored)}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            return None
-
-        if not unresolved:
-            return built_in
-
-        mcp_names: set[str] = set()
-        mcp_disabled: set[str] = set()
-        try:
-            from hermes_cli.config import read_raw_config
-            from hermes_cli.tools_config import _parse_enabled_flag
-
-            raw_cfg = read_raw_config()
-            mcp_servers = (
-                raw_cfg.get("mcp_servers")
-                if isinstance(raw_cfg.get("mcp_servers"), dict)
-                else {}
-            )
-            for name, server_cfg in mcp_servers.items():
-                if not isinstance(server_cfg, dict):
-                    continue
-                if _parse_enabled_flag(server_cfg.get("enabled", True), default=True):
-                    mcp_names.add(str(name))
-                else:
-                    mcp_disabled.add(str(name))
-        except Exception:
-            mcp_names = set()
-            mcp_disabled = set()
-
-        mcp_valid = [name for name in unresolved if name in mcp_names]
-        disabled = [name for name in unresolved if name in mcp_disabled]
-        unknown = [
-            name
-            for name in unresolved
-            if name not in mcp_names and name not in mcp_disabled
-        ]
-        valid = built_in + mcp_valid
-
-        if unknown:
+        if resolution.ignored:
             print(
-                f"[tui] ignoring unknown HERMES_TUI_TOOLSETS entries: {', '.join(unknown)}",
+                "[tui] HERMES_TUI_TOOLSETS=all enables every toolset; "
+                f"ignoring additional entries: {', '.join(resolution.ignored)}",
                 file=sys.stderr,
                 flush=True,
             )
-        if disabled:
+        if resolution.unknown:
+            print(
+                f"[tui] ignoring unknown HERMES_TUI_TOOLSETS entries: {', '.join(resolution.unknown)}",
+                file=sys.stderr,
+                flush=True,
+            )
+        if resolution.disabled:
             print(
                 "[tui] ignoring disabled MCP servers in HERMES_TUI_TOOLSETS "
                 "(set enabled: true in config.yaml to use): "
-                f"{', '.join(disabled)}",
+                f"{', '.join(resolution.disabled)}",
                 file=sys.stderr,
                 flush=True,
             )
 
-        if valid:
-            return valid
+        if resolution.ok:
+            return resolution.enabled
 
         fallback_notice = (
             "[tui] no valid HERMES_TUI_TOOLSETS entries; using configured CLI toolsets"
@@ -4908,6 +4964,12 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
         session.pop("model_override", None)
         session.pop("create_reasoning_override", None)
         session.pop("create_service_tier_override", None)
+        # A spawn's `toolsets` pin is session-scoped in exactly the same sense,
+        # so it dies at the same boundary. This is also what makes the tools UI
+        # coherent: `tools.configure` rebuilds through here, so toggling a
+        # toolset re-derives from config instead of being silently overruled by
+        # a pin the user never sees and cannot clear.
+        session.pop("create_toolsets_override", None)
         session.pop("one_turn_model_restore", None)
         new_agent = _make_agent(
             sid,
@@ -5122,6 +5184,7 @@ def _make_agent(
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
     platform_override: str | None = None,
+    toolsets_override: object = _NO_TOOLSET_OVERRIDE,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
@@ -5274,7 +5337,15 @@ def _make_agent(
             if service_tier_override is not None
             else _load_service_tier()
         ),
-        enabled_toolsets=_load_enabled_toolsets(),
+        # A session.create `toolsets` pin wins over the process-wide resolution
+        # for this session only. Sentinel rather than None because None is a
+        # meaningful VALUE here (the `all`/`*` sentinel — every toolset), so it
+        # cannot double as "no override given".
+        enabled_toolsets=(
+            _load_enabled_toolsets()
+            if toolsets_override is _NO_TOOLSET_OVERRIDE
+            else toolsets_override
+        ),
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
         # Mirrors the messaging gateway + CLI so the desktop/TUI honors the same
         # routing instead of letting OpenRouter pick providers at random.
@@ -6433,6 +6504,53 @@ def _(rid, params: dict) -> dict:
             "priority" if is_truthy_value(params.get("fast")) else ""
         )
 
+    # ``toolsets`` (per-session tool pin): a programmatic caller — today
+    # ``hermes desktop spawn --toolsets`` — can give ONE new chat a narrower (or
+    # wider) tool set than this process resolved, without touching config the
+    # way ``tools.configure`` does. Same per-session posture as model/effort/
+    # fast above: picking tools for one chat must not change what the user's
+    # next chat gets.
+    #
+    # Binding here is what keeps it cheap. AGENTS.md rules out swapping
+    # toolsets mid-conversation because it invalidates the per-conversation
+    # prompt cache; this is resolved BEFORE the agent is built and before the
+    # first turn, so there is no cached prefix to invalidate. Omitted means
+    # "whatever this process resolved" — the unchanged path for every typed
+    # chat.
+    #
+    # Names are validated against the vocabulary HERMES_TUI_TOOLSETS accepts.
+    # A name that does not resolve FAILS the create: the caller pinned tools
+    # because they cared which tools, so handing back a session with a
+    # different set is the one outcome worse than an error.
+    create_toolsets_override = _NO_TOOLSET_OVERRIDE
+    if (raw_toolsets := params.get("toolsets")) is not None:
+        if not isinstance(raw_toolsets, list) or any(
+            not isinstance(name, str) for name in raw_toolsets
+        ):
+            return _err(rid, 4025, "toolsets must be an array of strings")
+
+        requested = [name.strip() for name in raw_toolsets if name.strip()]
+        if not requested:
+            return _err(
+                rid,
+                4025,
+                "toolsets was empty — omit it to inherit the current toolsets",
+            )
+
+        resolution = _resolve_toolset_names(requested)
+        if rejected := (resolution.unknown + resolution.disabled):
+            detail = ", ".join(rejected)
+            hint = (
+                " (set enabled: true in config.yaml to use a disabled MCP server)"
+                if resolution.disabled
+                else ""
+            )
+            return _err(rid, 4026, f"unknown toolsets: {detail}{hint}")
+        if not resolution.ok:
+            return _err(rid, 4026, f"no usable toolsets in: {', '.join(requested)}")
+
+        create_toolsets_override = resolution.enabled
+
     ready = threading.Event()
     now = time.time()
     lease, limit_message = _claim_active_session_slot(
@@ -6463,6 +6581,7 @@ def _(rid, params: dict) -> dict:
             "model_override": session_model_override,
             "create_reasoning_override": create_reasoning_override,
             "create_service_tier_override": create_service_tier_override,
+            "create_toolsets_override": create_toolsets_override,
             "parent_session_id": parent_session_id,
             "pending_title": title or None,
             "profile_home": str(profile_home) if profile_home is not None else None,

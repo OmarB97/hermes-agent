@@ -209,6 +209,8 @@ declare global {
           model?: string
           provider?: string
           profile?: string
+          // `--toolsets`: pin this one chat's tools; validated backend-side.
+          toolsets?: string[]
           // `--delegated`: nobody is watching, so the chat must not stop to ask.
           delegated?: boolean
           delegatedTimeoutMs?: number

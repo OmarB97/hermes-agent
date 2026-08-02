@@ -2,8 +2,8 @@
 
 Covers the CLI half of the desktop spawn control channel:
   - happy path: exact POST URL/headers/body, including omitted None keys
-  - toolsets never reach the wire (the flag is gone; see
-    test_toolsets_never_reaches_the_wire)
+  - --toolsets: comma-separated normalization onto the wire, and the values
+    argparse cannot reject
   - control file missing (desktop app not running)
   - control file present but corrupt / missing required fields
   - --delegated / --delegated-timeout: wire shape and the flag combinations
@@ -41,6 +41,7 @@ def _ns(**kw):
         model=None,
         provider=None,
         profile=None,
+        toolsets=None,
         delegated=False,
         delegated_timeout=None,
     )
@@ -139,21 +140,12 @@ class TestHappyPath:
             "profile": "work",
         }
 
-    def test_toolsets_never_reaches_the_wire(self):
-        """A stray `toolsets` attribute must not be picked up into the body.
+    def test_splits_toolsets_onto_the_wire(self):
+        """The flag is comma-separated for humans; the wire contract is a list.
 
-        `--toolsets` shipped in #298 and was dead on arrival: the value was
-        POSTed here, validated by the control server, forwarded to the
-        renderer, and then dropped — the renderer only ever copied
-        model/provider/profile into its session overrides, and there was
-        nothing further to copy into, since the gateway's `session.create`
-        takes no toolsets parameter and `_make_agent` resolves
-        `enabled_toolsets` per process.
-
-        The flag is gone from the parser, so an args namespace can only carry
-        `toolsets` if a caller builds one by hand. Body-building must ignore it
-        rather than resurrect a field the app now rejects outright (see
-        apps/desktop/electron/spawn-control.ts).
+        Blank segments are dropped so a trailing comma or a stray space is not
+        POSTed as a toolset named "" — the gateway would refuse the whole
+        create for it.
         """
         _write_control_file()
         captured: dict = {}
@@ -162,13 +154,32 @@ class TestHappyPath:
             captured["body"] = json.loads(req.data.decode())
             return _fake_http_202()
 
-        args = _ns(prompt="do the thing")
-        args.toolsets = "browser,terminal"
-
         with patch.object(ds.urllib.request, "urlopen", side_effect=fake_urlopen):
-            ds.cmd_desktop_spawn(args)
+            ds.cmd_desktop_spawn(
+                _ns(prompt="do the thing", toolsets="file, terminal ,, skills")
+            )
 
-        assert captured["body"] == {"prompt": "do the thing"}
+        assert captured["body"] == {
+            "prompt": "do the thing",
+            "toolsets": ["file", "terminal", "skills"],
+        }
+
+    def test_toolsets_naming_nothing_exits_nonzero(self, capsys):
+        """`--toolsets " , ,"` is a typo, not a request to inherit.
+
+        argparse cannot express "non-empty after splitting", so this is the
+        layer that has to say it. Spawning with the app's toolsets instead
+        would be the exact accept-and-ignore this flag was removed for in #315.
+        """
+        _write_control_file()
+
+        with patch.object(ds.urllib.request, "urlopen") as urlopen:
+            with pytest.raises(SystemExit) as exc:
+                ds.cmd_desktop_spawn(_ns(toolsets=" , ,"))
+
+        assert exc.value.code == 1
+        urlopen.assert_not_called()
+        assert "--toolsets" in capsys.readouterr().out
 
 
 def _use_profile_home(monkeypatch, name="meshboard-worker"):

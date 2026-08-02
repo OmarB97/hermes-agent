@@ -137,25 +137,48 @@ it('sends no overrides when none were requested', async () => {
   expect(submitText.mock.calls[0][1]).toEqual({ attachments: [] })
 })
 
-// `toolsets` used to ride this payload and die here: the hook copies
-// model/provider/profile into `SessionCreateOverrides` and there is no fourth
-// field, because the gateway's `session.create` takes no toolsets parameter —
-// it resolves `enabled_toolsets` per process in `_make_agent`. The CLI flag and
-// the payload field are gone and `parseSpawnRequest` now rejects the key
-// outright, so this pins the last leg: even if a stale preload or a hand-rolled
-// IPC message smuggles one in, it must not reappear as a session override that
-// the backend would then ignore.
-it('ignores a toolsets field smuggled in by an out-of-date caller', async () => {
+// This is the leg that was missing for this flag's entire first life (#298,
+// removed in #315): the payload carried `toolsets` and the hook never read it.
+it('passes toolsets as a per-session override', async () => {
   const { submitText } = mount()
 
   await act(async () => {
-    spawnHandlers[0]({ prompt: 'go', profile: 'work', toolsets: ['browser', 'git'] })
+    spawnHandlers[0]({ prompt: 'go', profile: 'work', toolsets: ['file', 'terminal'] })
   })
 
   expect(submitText).toHaveBeenCalledWith('go', {
     attachments: [],
-    sessionOverrides: { profile: 'work' }
+    sessionOverrides: { profile: 'work', toolsets: ['file', 'terminal'] }
   })
+})
+
+// The regression that a hand-rolled `overrides.model || overrides.provider ||
+// overrides.profile` gate would reintroduce: a spawn pinning ONLY toolsets has
+// no model/provider/profile, so an unteachable gate drops the override object
+// wholesale and the pin never reaches session.create.
+it('sends overrides for a spawn that pins nothing but toolsets', async () => {
+  const { submitText } = mount()
+
+  await act(async () => {
+    spawnHandlers[0]({ prompt: 'go', toolsets: ['file'] })
+  })
+
+  expect(submitText).toHaveBeenCalledWith('go', {
+    attachments: [],
+    sessionOverrides: { toolsets: ['file'] }
+  })
+})
+
+// An empty array is not a pin — treating it as one would send `toolsets: []`,
+// which the gateway refuses, turning a no-op into a failed spawn.
+it('ignores an empty toolsets array', async () => {
+  const { submitText } = mount()
+
+  await act(async () => {
+    spawnHandlers[0]({ prompt: 'go', toolsets: [] })
+  })
+
+  expect(submitText.mock.calls[0][1]).toEqual({ attachments: [] })
 })
 
 // ------------------------------------------------------------- delegated mode
