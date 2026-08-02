@@ -44,6 +44,8 @@ def _ns(**kw):
         toolsets=None,
         delegated=False,
         delegated_timeout=None,
+        goal=None,
+        goal_turns=None,
     )
     defaults.update(kw)
     return argparse.Namespace(**defaults)
@@ -517,3 +519,123 @@ class TestDelegated:
         out = capsys.readouterr().out
         assert "✓" in out
         assert "delegated" in out
+
+
+class TestGoal:
+    """`--goal` gives the session a standing objective.
+
+    The loop itself is old (hermes_cli/goals.py, reachable as `/goal <text>`);
+    what this flag adds is setting it at session creation. The workaround it
+    replaces was spawning the prompt `"/goal <objective>"`, which worked only
+    because the renderer happens to parse slash commands out of a submitted
+    message — an interface nobody would have chosen.
+    """
+
+    def _body_for(self, **kw) -> dict:
+        _write_control_file()
+        captured: dict = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["body"] = json.loads(req.data.decode())
+            return _fake_http_202()
+
+        with patch.object(ds.urllib.request, "urlopen", side_effect=fake_urlopen):
+            ds.cmd_desktop_spawn(_ns(**kw))
+        return captured["body"]
+
+    def test_plain_spawn_sends_no_goal_keys(self):
+        # An ordinary spawn stays byte-identical to what it was before the flag.
+        assert self._body_for(prompt="hi") == {"prompt": "hi"}
+
+    def test_goal_alone_becomes_both_the_goal_and_the_opening_turn(self):
+        """Mirrors `/goal <text>`, which sets the goal and sends that same text
+        as the kickoff turn. Making the caller repeat it would be noise."""
+        assert self._body_for(prompt=None, goal="ship the parser") == {
+            "prompt": "ship the parser",
+            "goal": "ship the parser",
+        }
+
+    def test_an_explicit_prompt_stays_the_opening_turn(self):
+        """A different first move must remain expressible."""
+        assert self._body_for(prompt="read the tests first", goal="ship the parser") == {
+            "prompt": "read the tests first",
+            "goal": "ship the parser",
+        }
+
+    def test_goal_turns_rides_along_as_camel_case(self):
+        assert self._body_for(prompt=None, goal="ship it", goal_turns=40) == {
+            "prompt": "ship it",
+            "goal": "ship it",
+            "goalMaxTurns": 40,
+        }
+
+    def test_goal_composes_with_delegated_and_the_other_overrides(self):
+        """The case this was built for: an unattended session with a standing
+        objective, pinned to one profile and model."""
+        body = self._body_for(
+            prompt=None,
+            goal="ship the parser",
+            goal_turns=40,
+            delegated=True,
+            model="deepseek-v4-flash-0731-ds4",
+            provider="ai-router",
+            profile="work",
+        )
+
+        assert body == {
+            "prompt": "ship the parser",
+            "goal": "ship the parser",
+            "goalMaxTurns": 40,
+            "delegated": True,
+            "model": "deepseek-v4-flash-0731-ds4",
+            "provider": "ai-router",
+            "profile": "work",
+        }
+
+    def test_goal_and_prompt_are_stripped(self):
+        assert self._body_for(prompt="  ", goal="  ship it  ") == {
+            "prompt": "ship it",
+            "goal": "ship it",
+        }
+
+    def test_neither_prompt_nor_goal_fails_loud_naming_both_fixes(self, capsys):
+        _write_control_file()
+        with patch.object(ds.urllib.request, "urlopen") as urlopen:
+            with pytest.raises(SystemExit) as exc:
+                ds.cmd_desktop_spawn(_ns(prompt=None))
+
+        assert exc.value.code == 1
+        urlopen.assert_not_called()
+        out = capsys.readouterr().out
+        assert "--goal" in out
+
+    def test_goal_turns_without_a_goal_fails_loud(self, capsys):
+        """A turn budget with no goal would be read by nobody."""
+        _write_control_file()
+        with patch.object(ds.urllib.request, "urlopen") as urlopen:
+            with pytest.raises(SystemExit) as exc:
+                ds.cmd_desktop_spawn(_ns(prompt="hi", goal_turns=40))
+
+        assert exc.value.code == 1
+        urlopen.assert_not_called()
+        out = capsys.readouterr().out
+        assert "--goal-turns" in out
+        assert "--goal" in out
+
+    @pytest.mark.parametrize("turns", [0, -1])
+    def test_non_positive_goal_turns_fails_loud(self, turns, capsys):
+        _write_control_file()
+        with patch.object(ds.urllib.request, "urlopen") as urlopen:
+            with pytest.raises(SystemExit) as exc:
+                ds.cmd_desktop_spawn(_ns(prompt=None, goal="ship it", goal_turns=turns))
+
+        assert exc.value.code == 1
+        urlopen.assert_not_called()
+        assert "at least 1" in capsys.readouterr().out
+
+    def test_success_line_says_the_session_keeps_going(self, capsys):
+        self._body_for(prompt=None, goal="ship it", goal_turns=40)
+        out = capsys.readouterr().out
+        assert "✓" in out
+        assert "goal" in out
+        assert "40 turns" in out

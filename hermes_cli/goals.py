@@ -71,6 +71,15 @@ DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
 # A broken/invalid API key returns 401 every call — the loop must not
 # run until the turn budget, wasting every turn on an unreachable judge.
 DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES = 5
+# A turn that never produced a response (the per-turn timeout fired, or the turn
+# failed outright) is not evidence about the goal — the judge has nothing to read
+# — so it is recorded via ``record_turn_failure`` instead of ``evaluate_after_turn``.
+# The first such turn is retried, because a single timeout is usually one
+# unlucky long step rather than a stuck goal. The second consecutive one stalls
+# the goal: retrying forever would burn the whole budget on turns that never
+# report anything, and a goal nobody is making progress on has to become
+# visible rather than sit "active" while nothing happens.
+DEFAULT_MAX_CONSECUTIVE_TURN_FAILURES = 2
 
 
 CONTINUATION_PROMPT_TEMPLATE = (
@@ -395,7 +404,7 @@ class GoalState:
     """Serializable goal state stored per session."""
 
     goal: str
-    status: str = "active"          # active | paused | done | cleared
+    status: str = "active"          # active | paused | stalled | done | cleared
     turns_used: int = 0
     max_turns: int = DEFAULT_MAX_TURNS
     created_at: float = 0.0
@@ -408,6 +417,13 @@ class GoalState:
     # 401 every call — track them separately so the loop auto-pauses instead
     # of burning every turn budget slot on an unreachable judge.
     consecutive_transport_failures: int = 0   # judge API/transport errors in a row
+    # Turns that ended without a response at all — the per-turn timeout fired, or
+    # the turn failed. Distinct from the two judge counters above: those mean the
+    # judge could not be read, this means there was nothing for it to read. Reset
+    # by any turn that does produce a response. See record_turn_failure.
+    consecutive_turn_failures: int = 0
+    # What stalled the goal, for the status line. Set alongside status="stalled".
+    stalled_reason: Optional[str] = None
     # User-added criteria appended mid-loop via the /subgoal command.
     # When non-empty the judge prompt and continuation prompt both
     # include them so the agent works toward them and the judge factors
@@ -467,6 +483,8 @@ class GoalState:
             paused_reason=data.get("paused_reason"),
             consecutive_parse_failures=int(data.get("consecutive_parse_failures", 0) or 0),
             consecutive_transport_failures=int(data.get("consecutive_transport_failures", 0) or 0),
+            consecutive_turn_failures=int(data.get("consecutive_turn_failures", 0) or 0),
+            stalled_reason=data.get("stalled_reason"),
             subgoals=subgoals,
             waiting_on_pid=(int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None),
             waiting_on_session=(str(data["waiting_on_session"]) if data.get("waiting_on_session") else None),
@@ -1089,6 +1107,10 @@ class GoalManager:
     - ``status()`` — printable one-liner.
     - ``evaluate_after_turn(last_response)`` — call the judge, update state,
       and return a decision dict the caller uses to drive the next turn.
+    - ``record_turn_failure()`` — the other half of that boundary, for a turn
+      that produced no response at all (timed out / failed). Retries once,
+      then stalls the goal. Callers must route every finished turn through
+      one of the two, or a goal outlives the loop that was driving it.
     - ``next_continuation_prompt()`` — the canonical user-role message to
       feed back into ``run_conversation``.
     """
@@ -1108,7 +1130,11 @@ class GoalManager:
         return self._state is not None and self._state.status == "active"
 
     def has_goal(self) -> bool:
-        return self._state is not None and self._state.status in {"active", "paused"}
+        # "stalled" is a goal that still exists and is still resumable — it is
+        # parked because turns stopped reporting, not finished or thrown away.
+        # Leaving it out here would make /goal resume and /subgoal refuse to
+        # touch exactly the goal that most needs a nudge.
+        return self._state is not None and self._state.status in {"active", "paused", "stalled"}
 
     def has_contract(self) -> bool:
         return self._state is not None and self._state.has_contract()
@@ -1136,6 +1162,9 @@ class GoalManager:
         if s.status == "paused":
             extra = f" — {s.paused_reason}" if s.paused_reason else ""
             return f"⏸ Goal (paused, {meta}{extra}): {s.goal}"
+        if s.status == "stalled":
+            extra = f" — {s.stalled_reason}" if s.stalled_reason else ""
+            return f"⚠ Goal (stalled, {meta}{extra}): {s.goal}"
         if s.status == "done":
             return f"✓ Goal done ({meta}): {s.goal}"
         return f"Goal ({s.status}, {meta}): {s.goal}"
@@ -1189,6 +1218,11 @@ class GoalManager:
             return None
         self._state.status = "active"
         self._state.paused_reason = None
+        # Resuming a stalled goal is the operator saying "try again" — drop the
+        # failure streak too, or the very next timeout would re-stall instantly
+        # instead of getting the same one retry a fresh goal gets.
+        self._state.stalled_reason = None
+        self._state.consecutive_turn_failures = 0
         # Resuming starts fresh — clear any stale barrier.
         self._state.waiting_on_pid = None
         self._state.waiting_on_session = None
@@ -1461,6 +1495,12 @@ class GoalManager:
         else:
             state.consecutive_parse_failures = 0
 
+        # This turn produced a response, so whatever streak of silent turns
+        # preceded it is over. Without this reset a goal that times out once
+        # every few turns would creep to "stalled" across turns that were
+        # actually fine.
+        state.consecutive_turn_failures = 0
+
         # Track consecutive transport failures separately — persistent API
         # errors (401 auth, DNS, timeout) signal a broken config, not
         # transient network flakiness.  Auto-pause after N consecutive
@@ -1593,6 +1633,123 @@ class GoalManager:
             "reason": reason,
             "message": (
                 f"↻ Continuing toward goal ({state.turns_used}/{state.max_turns}): {reason}"
+            ),
+        }
+
+    def record_turn_failure(
+        self,
+        *,
+        kind: str = "timeout",
+        detail: str = "",
+    ) -> Dict[str, Any]:
+        """Record a turn that ended without a response, and decide what next.
+
+        A turn can end with nothing to show for it: the per-turn timeout fires
+        (``tui_gateway/server.py`` classifies the agent result as ``timed_out``
+        and labels it ``turn:timed out``), or the turn simply fails. Either way
+        the goal loop must not treat that as "the goal said nothing, therefore
+        continue forever" — and it must not treat it as a reason to stop
+        looking either. Before this method existed the caller skipped the goal
+        hook entirely on a failed turn, which left the goal ``active`` with no
+        continuation ever queued: the loop was stranded, silently, mid-run.
+
+        The judge is deliberately NOT called. There is no response to judge, and
+        handing it the error text would have it rule on the transport rather
+        than on the work.
+
+        ``kind`` is ``"timeout"`` or ``"failed"``; ``detail`` is the reason the
+        turn reported, used verbatim in the operator-visible message.
+
+        Returns the same decision dict shape as :meth:`evaluate_after_turn`, so
+        callers drive both through one code path.
+        """
+        state = self._state
+        if state is None or state.status != "active":
+            return {
+                "status": state.status if state else None,
+                "should_continue": False,
+                "continuation_prompt": None,
+                "verdict": "inactive",
+                "reason": "no active goal",
+                "message": "",
+            }
+
+        # Parked on a barrier: the turn that just failed was not the goal's to
+        # run, so it must not consume the goal's budget or its retry.
+        if self.is_waiting():
+            return {
+                "status": "active",
+                "should_continue": False,
+                "continuation_prompt": None,
+                "verdict": "waiting",
+                "reason": state.waiting_reason or "parked",
+                "message": "",
+            }
+
+        label = "timed out" if kind == "timeout" else "failed"
+        detail = _truncate((detail or "").strip(), 200)
+        suffix = f": {detail}" if detail else ""
+
+        # A failed turn still consumed model budget and wall-clock — it ran
+        # until it timed out. Counting it keeps a goal whose turns alternate
+        # success/timeout from looping forever: the streak resets on each good
+        # turn so it never stalls, and only the budget cap below stops it.
+        state.turns_used += 1
+        state.last_turn_at = time.time()
+        state.consecutive_turn_failures += 1
+        state.last_verdict = "failed"
+        state.last_reason = f"turn {label}{suffix}"
+
+        if state.consecutive_turn_failures >= DEFAULT_MAX_CONSECUTIVE_TURN_FAILURES:
+            state.status = "stalled"
+            state.stalled_reason = (
+                f"{state.consecutive_turn_failures} turns in a row ended with no "
+                f"response (last: {label}{suffix})"
+            )
+            save_goal(self.session_id, state)
+            return {
+                "status": "stalled",
+                "should_continue": False,
+                "continuation_prompt": None,
+                "verdict": "stalled",
+                "reason": state.stalled_reason,
+                "message": (
+                    f"⚠ Goal stalled — {state.consecutive_turn_failures} turns in a row "
+                    f"ended with no response (last one {label}{suffix}). "
+                    f"{state.turns_used}/{state.max_turns} turns used. "
+                    "Use /goal resume to try again, or /goal clear to stop."
+                ),
+            }
+
+        # The retry still has to respect the budget — otherwise a goal one turn
+        # from its cap could spend an extra turn it was never allowed.
+        if state.turns_used >= state.max_turns:
+            state.status = "paused"
+            state.paused_reason = f"turn budget exhausted ({state.turns_used}/{state.max_turns})"
+            save_goal(self.session_id, state)
+            return {
+                "status": "paused",
+                "should_continue": False,
+                "continuation_prompt": None,
+                "verdict": "failed",
+                "reason": state.last_reason,
+                "message": (
+                    f"⏸ Goal paused — the last turn {label}{suffix}, and "
+                    f"{state.turns_used}/{state.max_turns} turns are used. "
+                    "Use /goal resume to keep going, or /goal clear to stop."
+                ),
+            }
+
+        save_goal(self.session_id, state)
+        return {
+            "status": "active",
+            "should_continue": True,
+            "continuation_prompt": self.next_continuation_prompt(),
+            "verdict": "failed",
+            "reason": state.last_reason,
+            "message": (
+                f"↻ Turn {label}{suffix} — retrying toward the goal "
+                f"({state.turns_used}/{state.max_turns})."
             ),
         }
 

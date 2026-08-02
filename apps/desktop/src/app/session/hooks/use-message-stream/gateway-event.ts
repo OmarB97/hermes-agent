@@ -906,6 +906,32 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
             deferFallbackNotice(sessionId, notice, beforeMessageCount)
           }
+        } else if (sessionId && payload?.kind === 'goal') {
+          // The goal loop's verdict after each turn — "✓ Goal achieved",
+          // "↻ Continuing toward goal (3/20)", "⚠ Goal stalled", "⏸ budget
+          // exhausted". The CLI prints these and the Ink TUI renders them as a
+          // system line; the desktop had no handler at all, so the entire loop
+          // ran invisibly here: a goal session and an ordinary one looked
+          // identical, and a goal that finished or stalled said nothing. Same
+          // treatment as review.summary below — a persistent system message,
+          // not a toast, because this is how a watching operator reads progress.
+          const text = coerceGatewayText(payload?.text).trim()
+
+          if (text) {
+            flushQueuedDeltas(sessionId)
+            updateSessionState(sessionId, state => ({
+              ...state,
+              messages: [
+                ...state.messages,
+                {
+                  id: `goal-status-${Date.now()}`,
+                  role: 'system',
+                  parts: [textPart(text)],
+                  timestamp: Math.floor(Date.now() / 1000)
+                }
+              ]
+            }))
+          }
         } else if (sessionId && payload?.kind === 'compacting') {
           setSessionCompacting(sessionId, true)
           compactedTurnRef.current.add(sessionId)

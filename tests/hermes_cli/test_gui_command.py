@@ -395,7 +395,11 @@ def test_desktop_spawn_parser_dispatches_to_spawn_handler_not_gui():
     assert via_alias.prompt == "via alias"
 
 
-def test_desktop_spawn_requires_prompt_argument():
+def test_desktop_spawn_prompt_is_optional_so_goal_can_stand_alone():
+    """`--goal` supplies its own opening turn, so the positional had to become
+    optional. Argparse therefore no longer rejects a bare `spawn`; the "you
+    gave me nothing to send" error moved into _spawn_request_body, which can
+    name both ways to fix it (see test_desktop_spawn.py)."""
     from hermes_cli.subcommands.gui import build_gui_parser
 
     parser = argparse.ArgumentParser(prog="hermes")
@@ -404,9 +408,25 @@ def test_desktop_spawn_requires_prompt_argument():
         subparsers, cmd_gui=cli_main.cmd_gui, cmd_desktop_spawn=cli_main.cmd_desktop_spawn
     )
 
-    with pytest.raises(SystemExit) as exc:
-        parser.parse_args(["desktop", "spawn"])
-    assert exc.value.code == 2
+    bare = parser.parse_args(["desktop", "spawn"])
+    assert bare.prompt is None
+    assert bare.goal is None
+
+    goal_only = parser.parse_args(["desktop", "spawn", "--goal", "ship the parser"])
+    assert goal_only.func is cli_main.cmd_desktop_spawn
+    assert goal_only.prompt is None
+    assert goal_only.goal == "ship the parser"
+    assert goal_only.goal_turns is None
+
+    with_budget = parser.parse_args(
+        ["desktop", "spawn", "--goal", "ship it", "--goal-turns", "40"]
+    )
+    assert with_budget.goal_turns == 40
+
+    # A goal plus an explicit different opening move stays expressible.
+    both = parser.parse_args(["desktop", "spawn", "start here", "--goal", "ship it"])
+    assert both.prompt == "start here"
+    assert both.goal == "ship it"
 
 
 def test_desktop_spawn_delegated_flags_parse():

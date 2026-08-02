@@ -61,6 +61,8 @@ interface SpawnPayload {
   provider?: string
   profile?: string
   toolsets?: string[]
+  goal?: string
+  goalMaxTurns?: number
   delegated?: boolean
   delegatedTimeoutMs?: number
 }
@@ -88,10 +90,11 @@ interface SpawnBridgeParams {
  * means the transcript, tool cards, titles and sidebar all behave exactly as
  * they do for a typed message, with no parallel streaming path to maintain.
  *
- * Model/provider/profile/toolsets ride along as per-session overrides rather
- * than being written into the composer's selection stores (or, for toolsets,
- * into config via `tools.configure`) — all of which persist. A spawn must not
- * silently change the model or the tools the user gets on their next chat.
+ * Model/provider/profile/toolsets/goal ride along as per-session overrides
+ * rather than being written into the composer's selection stores (or, for
+ * toolsets, into config via `tools.configure`) — all of which persist. A spawn
+ * must not silently change the model or the tools the user gets on their next
+ * chat.
  *
  * A `--delegated` spawn additionally gets the unattended contract prepended to
  * its prompt, and its session is marked so `useDelegatedClarify` will answer a
@@ -140,6 +143,18 @@ export function useSpawnBridge({ startFreshSession, submitText, updateSessionSta
 
       if (payload.toolsets?.length) {
         overrides.toolsets = payload.toolsets
+      }
+
+      // The goal rides down as a session override for the same reason the model
+      // does: it belongs to this one session. It is NOT prepended to the prompt
+      // — the backend owns the loop, and a goal living in the first message is
+      // exactly the `/goal <objective>` workaround this replaces.
+      if (payload.goal) {
+        overrides.goal = payload.goal
+
+        if (payload.goalMaxTurns) {
+          overrides.goalMaxTurns = payload.goalMaxTurns
+        }
       }
 
       // The contract goes in the prompt itself so the model reads it before it

@@ -20,12 +20,22 @@ export interface SessionCreateOverrides {
    *  fails the create if any does not resolve, so a pinned session either has
    *  the tools that were asked for or does not exist. */
   toolsets?: string[]
+  /** Standing objective for this session. The gateway starts its goal loop
+   *  against this at create time, so the first turn is already judged — rather
+   *  than the loop only existing once someone has typed `/goal`. */
+  goal?: string
+  /** Turn budget for `goal`. Omitted means the backend's configured default. */
+  goalMaxTurns?: number
 }
 
 /** True when at least one override is actually set (empty objects are noise). */
 export function hasSessionOverrides(overrides: null | SessionCreateOverrides | undefined): boolean {
   return Boolean(
     overrides &&
-      (overrides.model || overrides.provider || overrides.profile || overrides.toolsets?.length)
+      (overrides.model ||
+        overrides.provider ||
+        overrides.profile ||
+        overrides.toolsets?.length ||
+        overrides.goal)
   )
 }

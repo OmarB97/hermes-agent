@@ -223,6 +223,12 @@ async function desktopSessionCreateParams(
     // one. Omitted is the normal path and means "whatever the backend
     // resolved", which is what every typed chat sends.
     ...(overrides?.toolsets?.length ? { toolsets: overrides.toolsets } : {}),
+    // Same shape as toolsets: no composer control backs a goal, so the key
+    // exists only when a caller asked for one. The backend rejects a create
+    // whose goal it cannot store, which is what keeps a "goal session" from
+    // silently being an ordinary chat that stops after one turn.
+    ...(overrides?.goal ? { goal: overrides.goal } : {}),
+    ...(overrides?.goal && overrides.goalMaxTurns ? { goal_max_turns: overrides.goalMaxTurns } : {}),
     fast: selection.fast
   }
 }

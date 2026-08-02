@@ -357,6 +357,141 @@ class TestGoalManager:
         assert d2["verdict"] == "inactive"
         assert d2["should_continue"] is False
 
+    def test_turn_failure_retries_once(self, hermes_home):
+        """A timed-out turn is a failed continuation, not the end of the goal."""
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="tf-retry", default_max_turns=10)
+        mgr.set("build the thing")
+
+        decision = mgr.record_turn_failure(kind="timeout", detail="stream stalled after 180s")
+
+        assert decision["should_continue"] is True
+        assert decision["verdict"] == "failed"
+        assert "build the thing" in (decision["continuation_prompt"] or "")
+        assert "timed out" in decision["message"]
+        assert "stream stalled after 180s" in decision["message"]
+        assert mgr.state.status == "active"
+        # The failed turn consumed real model time, so it counts against budget.
+        assert mgr.state.turns_used == 1
+        assert mgr.state.consecutive_turn_failures == 1
+
+    def test_second_consecutive_turn_failure_stalls(self, hermes_home):
+        """Retry once, then stop and say so — never retry a dead loop forever."""
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="tf-stall", default_max_turns=10)
+        mgr.set("build the thing")
+
+        mgr.record_turn_failure(kind="timeout", detail="first")
+        decision = mgr.record_turn_failure(kind="timeout", detail="second")
+
+        assert decision["should_continue"] is False
+        assert decision["verdict"] == "stalled"
+        assert decision["continuation_prompt"] is None
+        assert mgr.state.status == "stalled"
+        assert "no response" in decision["message"]
+        assert "/goal resume" in decision["message"]
+        # Stalled is still a goal — resume and subgoal edits must reach it.
+        assert mgr.has_goal() is True
+        assert mgr.is_active() is False
+
+    def test_turn_failure_streak_resets_on_a_good_turn(self, hermes_home):
+        """One timeout between healthy turns must not creep toward stalled."""
+        from hermes_cli import goals
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="tf-reset", default_max_turns=20)
+        mgr.set("build the thing")
+
+        mgr.record_turn_failure(kind="timeout", detail="blip")
+        assert mgr.state.consecutive_turn_failures == 1
+
+        with patch.object(goals, "judge_goal", return_value=("continue", "progress", False, None, False)):
+            mgr.evaluate_after_turn("did a step")
+        assert mgr.state.consecutive_turn_failures == 0
+
+        # A later lone timeout therefore gets its own retry, not a stall.
+        decision = mgr.record_turn_failure(kind="timeout", detail="blip again")
+        assert decision["should_continue"] is True
+        assert mgr.state.status == "active"
+
+    def test_turn_failure_respects_turn_budget(self, hermes_home):
+        """The retry cannot spend a turn the budget does not have."""
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="tf-budget", default_max_turns=1)
+        mgr.set("build the thing")
+
+        decision = mgr.record_turn_failure(kind="timeout", detail="only turn")
+
+        assert decision["should_continue"] is False
+        assert mgr.state.status == "paused"
+        assert "budget" in (mgr.state.paused_reason or "").lower()
+
+    def test_turn_failure_inactive_goal_is_a_noop(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="tf-inactive")
+        assert mgr.record_turn_failure()["verdict"] == "inactive"
+
+        mgr.set("a goal")
+        mgr.pause()
+        decision = mgr.record_turn_failure()
+        assert decision["verdict"] == "inactive"
+        assert decision["should_continue"] is False
+        assert mgr.state.turns_used == 0
+
+    def test_turn_failure_while_parked_does_not_burn_budget(self, hermes_home):
+        """A turn that failed while the goal waits on a barrier is not the
+        goal's turn — it must not consume the budget or the one retry."""
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="tf-parked", default_max_turns=10)
+        mgr.set("build the thing")
+        mgr.wait_for_seconds(300, reason="CI running")
+
+        decision = mgr.record_turn_failure(kind="timeout", detail="ignored")
+
+        assert decision["should_continue"] is False
+        assert decision["verdict"] == "waiting"
+        assert mgr.state.turns_used == 0
+        assert mgr.state.consecutive_turn_failures == 0
+
+    def test_resume_clears_the_stall(self, hermes_home):
+        """/goal resume on a stalled goal gets the same fresh retry a new
+        goal gets — otherwise the next timeout re-stalls immediately."""
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="tf-resume", default_max_turns=10)
+        mgr.set("build the thing")
+        mgr.record_turn_failure(kind="timeout", detail="one")
+        mgr.record_turn_failure(kind="timeout", detail="two")
+        assert mgr.state.status == "stalled"
+
+        mgr.resume()
+        assert mgr.state.status == "active"
+        assert mgr.state.consecutive_turn_failures == 0
+        assert mgr.state.stalled_reason is None
+
+        decision = mgr.record_turn_failure(kind="timeout", detail="three")
+        assert decision["should_continue"] is True
+
+    def test_stalled_state_survives_a_reload(self, hermes_home):
+        """The stall is what a watching operator reads — it has to persist."""
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="tf-persist", default_max_turns=10)
+        mgr.set("build the thing")
+        mgr.record_turn_failure(kind="timeout", detail="one")
+        mgr.record_turn_failure(kind="timeout", detail="two")
+
+        reloaded = GoalManager(session_id="tf-persist")
+        assert reloaded.state.status == "stalled"
+        assert reloaded.state.consecutive_turn_failures == 2
+        assert "no response" in (reloaded.state.stalled_reason or "")
+        assert "stalled" in reloaded.status_line()
+
     def test_continuation_prompt_shape(self, hermes_home):
         """The continuation prompt must include the goal text verbatim —
         and must be safe to inject as a user-role message (prompt-cache

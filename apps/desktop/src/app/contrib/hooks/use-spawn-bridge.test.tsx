@@ -181,6 +181,59 @@ it('ignores an empty toolsets array', async () => {
   expect(submitText.mock.calls[0][1]).toEqual({ attachments: [] })
 })
 
+// ----------------------------------------------------------------------- goal
+
+it('passes goal as a per-session override', async () => {
+  const { submitText } = mount()
+
+  await act(async () => {
+    spawnHandlers[0]({ prompt: 'go', goal: 'ship the release' })
+  })
+
+  expect(submitText).toHaveBeenCalledWith('go', {
+    attachments: [],
+    sessionOverrides: { goal: 'ship the release' }
+  })
+})
+
+it('passes goal and goalMaxTurns together', async () => {
+  const { submitText } = mount()
+
+  await act(async () => {
+    spawnHandlers[0]({ prompt: 'go', goal: 'ship the release', goalMaxTurns: 40 })
+  })
+
+  expect(submitText).toHaveBeenCalledWith('go', {
+    attachments: [],
+    sessionOverrides: { goal: 'ship the release', goalMaxTurns: 40 }
+  })
+})
+
+// goalMaxTurns budgets a loop that only exists once a goal starts it — with no
+// goal in the payload it has nothing to attach to, so it must not ride alone.
+it('drops goalMaxTurns when no goal was requested', async () => {
+  const { submitText } = mount()
+
+  await act(async () => {
+    spawnHandlers[0]({ prompt: 'go', goalMaxTurns: 40 })
+  })
+
+  expect(submitText.mock.calls[0][1]).toEqual({ attachments: [] })
+})
+
+// Unlike `--delegated`, a goal is not a prompt-engineering trick: the backend
+// reads it off session.create and runs its own loop against it, so prepending
+// it to the text would just be a duplicate the model has to ignore.
+it('does not alter the prompt text for a goal spawn', async () => {
+  const { submitText } = mount()
+
+  await act(async () => {
+    spawnHandlers[0]({ prompt: 'summarise the repo', goal: 'reach full coverage' })
+  })
+
+  expect(submitText.mock.calls[0][0]).toBe('summarise the repo')
+})
+
 // ------------------------------------------------------------- delegated mode
 
 // The contract has to reach the model, and it has to reach it BEFORE the brief
@@ -247,6 +300,22 @@ it('falls back to the default wait when none was given', async () => {
   expect(updateSessionState.mock.results[0].value).toMatchObject({
     delegatedTimeoutMs: DELEGATED_CLARIFY_TIMEOUT_MS
   })
+})
+
+// The two features touch different halves of the spawn (prompt text vs.
+// session overrides) and must not step on each other when asked for together.
+it('composes a goal with delegated: contract prepend and goal override both apply', async () => {
+  const { submitText } = mount()
+
+  await act(async () => {
+    spawnHandlers[0]({ prompt: 'write up the auth flow', goal: 'ship the release', delegated: true })
+  })
+
+  const sent = submitText.mock.calls[0][0]
+
+  expect(sent.startsWith(DELEGATION_CONTRACT)).toBe(true)
+  expect(sent.endsWith('write up the auth flow')).toBe(true)
+  expect(submitText.mock.calls[0][1]).toMatchObject({ sessionOverrides: { goal: 'ship the release' } })
 })
 
 it('ignores a spawn with no usable prompt', async () => {

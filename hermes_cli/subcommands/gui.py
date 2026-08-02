@@ -81,7 +81,43 @@ def build_gui_parser(
             "app to already be running (`hermes desktop`)."
         ),
     )
-    spawn_parser.add_argument("prompt", help="Prompt to run in a new desktop chat session")
+    # Optional so `--goal` can stand on its own: a goal spawn's objective is
+    # already the thing to work on, and making the caller repeat it as a
+    # positional would be noise. One of the two must be present — checked in
+    # _spawn_request_body, which can say which one is missing and why.
+    spawn_parser.add_argument(
+        "prompt",
+        nargs="?",
+        default=None,
+        help=(
+            "Prompt to run in a new desktop chat session. Optional when --goal "
+            "is given, in which case the objective is used as the opening turn."
+        ),
+    )
+    spawn_parser.add_argument(
+        "--goal",
+        default=None,
+        metavar="OBJECTIVE",
+        help=(
+            "Run the session against a standing objective: after each turn a "
+            "judge decides whether the objective is met, and if not the app "
+            "submits the next step itself. The session keeps going without "
+            "anyone typing, and stops when the objective is reached, the turn "
+            "budget runs out, or it stalls. Same machinery as the /goal "
+            "command, set before the first turn instead of during it."
+        ),
+    )
+    spawn_parser.add_argument(
+        "--goal-turns",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "How many turns the goal may spend before it pauses for you "
+            "(default 20, or goals.max_turns in config.yaml). Only meaningful "
+            "with --goal."
+        ),
+    )
     spawn_parser.add_argument(
         "-m",
         "--model",
