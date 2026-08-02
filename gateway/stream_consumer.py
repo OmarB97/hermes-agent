@@ -166,7 +166,14 @@ class GatewayStreamConsumer:
         self._segment_preview_message_ids: "set[str]" = set()
         self._already_sent = False
         self._edit_supported = True  # Disabled when progressive edits are no longer usable
-        self._last_edit_time = 0.0
+        # "Never edited" sentinel: the throttle below is `time.monotonic() -
+        # _last_edit_time >= interval`, so this must read as infinitely long
+        # ago to let the first edit through unthrottled.  A literal 0.0 only
+        # looks old because monotonic()'s epoch is usually large (boot on
+        # Linux) — on a host booted less than `edit_interval` seconds ago it
+        # makes the elapsed time come out as the uptime and needlessly delays
+        # the first streaming edit.  -inf is uptime-independent.
+        self._last_edit_time = float("-inf")
         self._last_sent_text = ""   # Track last-sent text to skip redundant edits
         # True when the most recent _send_or_edit split-and-delivered across
         # continuation messages (the adapter adopted a new message id).
