@@ -299,6 +299,38 @@ def test_kill_pid_that_vanishes_mid_walk_passes_through(monkeypatch):
         p.wait(timeout=5)
 
 
+def test_kill_still_blocked_when_only_an_ancestor_vanishes(monkeypatch):
+    """An *ancestor* exiting mid-walk must NOT wave a foreign PID through.
+
+    ``parents()`` materializes the whole chain up to launchd, so NoSuchProcess
+    fires both when the target dies (allowed — nothing left to protect) and
+    when some unrelated process above us exits while we walk past it. In the
+    second case the target is alive and still unattributed, so it stays
+    refused: otherwise an exit anywhere above us would be enough to let a
+    signal reach the live gateway, which is the one thing this guard exists
+    to stop.
+    """
+    import psutil
+
+    real_process = psutil.Process
+    # A pid that is real and foreign, but not our child.
+    foreign_pid = FOREIGN_PID
+    ancestor_pid = foreign_pid + 1  # any pid that is not the target
+
+    def _ancestor_vanishes(pid, *args, **kwargs):
+        proc = real_process(pid, *args, **kwargs)
+
+        def _died():
+            raise psutil.NoSuchProcess(ancestor_pid)
+
+        proc.parents = _died
+        return proc
+
+    monkeypatch.setattr(psutil, "Process", _ancestor_vanishes)
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        os.kill(foreign_pid, signal.SIGTERM)
+
+
 def test_subprocess_pkill_with_unrelated_pattern_passes_through():
     """``pkill -f some-unrelated-pattern`` (no hermes/python) is fine."""
     # We don't actually run pkill — just verify the guard would let it

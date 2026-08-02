@@ -620,7 +620,7 @@ def _live_system_guard(request, monkeypatch):
             for parent in walker.parents():
                 if parent.pid == test_pid:
                     return True
-        except _psutil.NoSuchProcess:
+        except _psutil.NoSuchProcess as exc:
             # The target died between Process() and the parent walk, or is
             # an unreaped zombie whose chain can no longer be read
             # (ZombieProcess subclasses NoSuchProcess). Either way it is
@@ -628,7 +628,15 @@ def _live_system_guard(request, monkeypatch):
             # same reasoning as the stale-PID branch above. Blocking here
             # turned "child exited a moment before we signalled it" into a
             # load-dependent test failure.
-            return True
+            #
+            # Only when the exception names the TARGET, though. ``parents()``
+            # materializes the whole chain up to launchd, so this also fires
+            # when some unrelated *ancestor* exits while we walk past it —
+            # and there the target is still alive and still unattributed.
+            # Allowing that would let an exit anywhere above us wave through
+            # a signal to a live foreign process, which is the one thing the
+            # guard exists to stop.
+            return getattr(exc, "pid", None) == pid
         except Exception:
             return False
         return False
