@@ -3919,6 +3919,13 @@ def run_conversation(
                         # dies at "max compression attempts reached". Anchor to our
                         # own conservative estimate of what actually fits so the cap
                         # converges to a working value in one step.
+                        # ``None`` means the local estimate has no usable cap to
+                        # offer (unknown window, or the prompt already fills it).
+                        # Keep the provider-authoritative ``safe_out`` in that
+                        # case — do NOT floor to a token or two.  The provider
+                        # accepts such a retry and returns a truncated answer,
+                        # so the turn "succeeds" with unusable output instead of
+                        # failing loudly into compression.
                         _local_fit = output_tokens_that_fit(old_ctx, api_messages)
                         if _local_fit is not None:
                             safe_out = max(1, min(safe_out, _local_fit))

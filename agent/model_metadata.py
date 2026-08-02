@@ -2648,8 +2648,20 @@ def output_tokens_that_fit(
     """Largest output cap that keeps prompt + output inside the model window.
 
     Uses a conservative (over-reserved) local estimate of the prompt size so the
-    result is a value the provider will accept.  Returns ``None`` when the
-    window is unknown/invalid (caller should leave ``max_tokens`` untouched).
+    result is a value the provider will accept.
+
+    Returns ``None`` when this function has no useful cap to offer — either the
+    window is unknown/invalid, or the reserved input already fills it so no
+    positive cap is left.  In both cases the caller must leave ``max_tokens`` to
+    its own budget logic and NOT clamp to this result.  ``None`` is never a
+    licence to shrink; a near-full window is compression's problem, not
+    something a tiny output cap can fix.
+
+    Callers must not substitute a floor of their own for ``None``: an output cap
+    of a handful of tokens is not a working request, it is a truncated response
+    the provider accepts and the user cannot use.  ``min_output`` is the
+    smallest fit worth reporting, not a value to fall back to — anything below
+    it reports ``None``.
 
     This is the single source of truth for "how many output tokens fit", used
     both proactively (before the request, to clamp an oversized cap) and
@@ -2660,6 +2672,12 @@ def output_tokens_that_fit(
     "shrink max_tokens by the reported delta and retry" loop never converges
     (each shrink raises the reported floor in lockstep); anchoring the retry to
     this local estimate makes it converge to a fitting value in one step.
+
+    Note the reservation is multiplicative (``_OUTPUT_FIT_INPUT_FACTOR``), so it
+    exhausts the window once the estimate passes roughly
+    ``(context_length - 1536) / 1.2`` — ~82.7% fill.  Past that point this
+    returns ``None`` and the proactive clamp stops firing, leaving the provider
+    to report its own authoritative budget on the reactive path.
     """
     if not isinstance(context_length, int) or context_length <= 0:
         return None
@@ -2668,7 +2686,12 @@ def output_tokens_that_fit(
         return None
     reserved_input = int(est * _OUTPUT_FIT_INPUT_FACTOR) + _OUTPUT_FIT_INPUT_PAD
     fit = context_length - reserved_input - _OUTPUT_FIT_WINDOW_MARGIN
-    return fit if fit >= min_output else min_output
+    # Below ``min_output`` there is no cap worth handing back.  Returning the
+    # floor here (as this did before) manufactured a "1 output token fits"
+    # budget out of "nothing fits", and both callers consumed it as real: the
+    # reactive retry clamped a healthy provider-authoritative cap down to 1, and
+    # the pre-flight clamp did the same to every request above ~82.7% fill.
+    return fit if fit >= min_output else None
 
 
 def _count_image_tokens(msg: Dict[str, Any], cost_per_image: int) -> int:
