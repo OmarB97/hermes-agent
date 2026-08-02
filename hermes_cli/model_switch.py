@@ -2448,10 +2448,33 @@ def list_authenticated_providers(
     # picker to render, but the gateway only passes this current model slice to
     # list_authenticated_providers(). Surface the active endpoint explicitly so
     # /model does not look like it ignored config.yaml.
+    #
+    # A runtime provider of "custom" does NOT imply the endpoint is unnamed:
+    # resolve_runtime_provider() reports provider="custom" + base_url for every
+    # user-defined provider, so a `--provider ai-router` session arrives here
+    # looking identical to a bare one-off and would be rendered twice — once
+    # under its configured name, once as an anonymous "Custom endpoint" alias.
+    #
+    # Endpoint identity is the test, not model membership: a row's model list is
+    # one live probe away from changing, so keying on membership would make the
+    # picker's sections flicker with endpoint reachability.
+    #
+    # Exactly one, because rows with distinct credentials or wire protocols can
+    # share an endpoint (tenants behind one proxy URL) and none of them can claim
+    # the session alone. Suppressing then would leave only rows that don't own it
+    # — inventory._single_named_custom_match declines the same ambiguity, and the
+    # two must agree or a suppressed row leaves nothing correct behind.
+    _endpoint_owners = [
+        _row
+        for _row in results
+        if _norm_url(_row.get("api_url") or "") == _current_base_url_norm
+        and _row.get("slug") != "custom"
+    ]
     if (
         _current_provider_norm == "custom"
         and current_base_url
         and "custom" not in seen_slugs
+        and len(_endpoint_owners) != 1
         and not any(
             isinstance(_cp, dict)
             and str(

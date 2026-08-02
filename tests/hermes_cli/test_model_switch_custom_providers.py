@@ -1691,3 +1691,101 @@ def test_excluded_providers_empty_is_noop(monkeypatch):
         excluded_providers=[],
     )
     assert [p["slug"] for p in a] == [p["slug"] for p in b]
+
+
+def test_bare_custom_row_is_not_synthesized_for_an_already_named_endpoint(monkeypatch):
+    """A `--provider ai-router` spawn must not produce a second row.
+
+    resolve_runtime_provider() reports every user-defined provider as
+    provider="custom" + base_url, so the picker sees bare "custom" even when
+    the endpoint is declared under `providers:`. Section 3 already emitted that
+    endpoint under its own name; synthesizing the "Custom endpoint" row too
+    rendered the same endpoint twice.
+    """
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
+
+    providers = list_authenticated_providers(
+        current_provider="custom",
+        current_base_url="http://10.55.0.3:8000/v1",
+        current_model="deepseek-v4-flash-0731-ds4",
+        user_providers={
+            "ai-router": {
+                "api": "http://10.55.0.3:8000/v1",
+                "name": "ai-router",
+                "models": {"deepseek-v4-flash-0731-ds4": {"context_length": 131072}},
+            }
+        },
+        custom_providers=[],
+    )
+
+    at_endpoint = [
+        p
+        for p in providers
+        if str(p.get("api_url") or "").rstrip("/") == "http://10.55.0.3:8000/v1"
+    ]
+    assert [p["slug"] for p in at_endpoint] == ["ai-router"]
+    assert not any(p.get("source") == "model-config" for p in providers)
+
+
+def test_bare_custom_row_is_still_synthesized_for_an_unnamed_endpoint(monkeypatch):
+    """The one-off `model.provider: custom` + `model.base_url:` shape has no
+    named row to fall back on, so it must keep its synthesized entry."""
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
+
+    providers = list_authenticated_providers(
+        current_provider="custom",
+        current_base_url="http://10.99.0.9:9999/v1",
+        current_model="mystery-model",
+        user_providers={
+            "ai-router": {"api": "http://10.55.0.3:8000/v1", "name": "ai-router"}
+        },
+        custom_providers=[],
+    )
+
+    synthesized = [p for p in providers if p.get("source") == "model-config"]
+    assert [p["slug"] for p in synthesized] == ["custom"]
+    assert synthesized[0]["api_url"] == "http://10.99.0.9:9999/v1"
+
+
+def test_bare_custom_row_survives_an_endpoint_with_several_owners(monkeypatch):
+    """Suppression requires an unambiguous owner.
+
+    Entries with distinct credentials stay distinct rows even on one endpoint
+    (tenants behind a shared proxy URL). None of them can claim the session, so
+    the synthesized row must stay — it is the only row left carrying the live
+    endpoint, and dropping it would leave the picker marking a credential-less
+    placeholder as current.
+    """
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
+    monkeypatch.setenv("KEY_A", "sk-a")
+    monkeypatch.setenv("KEY_B", "sk-b")
+
+    providers = list_authenticated_providers(
+        current_provider="custom",
+        current_base_url="http://proxy.local/v1",
+        current_model="shared-m",
+        user_providers={
+            "tenant-a": {
+                "api": "http://proxy.local/v1",
+                "name": "tenant-a",
+                "key_env": "KEY_A",
+                "models": {"shared-m": {}},
+            },
+            "tenant-b": {
+                "api": "http://proxy.local/v1",
+                "name": "tenant-b",
+                "key_env": "KEY_B",
+                "models": {"shared-m": {}},
+            },
+        },
+        custom_providers=[],
+    )
+
+    owners = [p["slug"] for p in providers if p.get("api_url") == "http://proxy.local/v1"]
+    assert "tenant-a" in owners and "tenant-b" in owners
+    synthesized = [p for p in providers if p.get("source") == "model-config"]
+    assert [p["slug"] for p in synthesized] == ["custom"]
+    assert synthesized[0]["api_url"] == "http://proxy.local/v1"
