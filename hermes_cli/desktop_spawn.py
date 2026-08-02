@@ -17,7 +17,9 @@ that profile's home. See :func:`_requested_profile` for why that name has
 to be recovered from ``HERMES_HOME`` rather than read off ``args``.
 
 This CLI command is a one-shot fire-and-forget POST, not a client for the
-resulting session: the desktop app owns it from here.
+resulting session: the desktop app owns it from here. That is precisely why
+the provider override is checked before the POST — see
+:func:`_provider_refusal` for why a bad one cannot be reported back after it.
 
 ``--delegated`` marks the spawn unattended. The behaviour that follows from
 that — the contract prepended to the prompt, and answering a clarify prompt
@@ -100,6 +102,119 @@ def _requested_profile(args) -> str | None:
     if home.parent.name == "profiles":
         return home.name
     return None
+
+
+def _unresolvable_provider(provider: str) -> str | None:
+    """Return why ``provider`` cannot run here, or None if it resolves.
+
+    Provider names are per-profile vocabulary, not global: ``providers:`` and
+    ``custom_providers:`` live in each profile's own ``config.yaml``. Observed
+    2026-08-02: ``--provider ai-router`` (the root profile's own provider)
+    against ``meshboard-game-dev``, whose only provider is
+    ``meshboard-qualified-local``, died in agent init with *"Unknown provider
+    'ai-router'"* and left a 0-message session behind.
+
+    Asks the backend's own question with the backend's own resolver: this
+    process already runs under the target profile's ``HERMES_HOME`` (the
+    global pre-parse rewrote it before argparse), and
+    ``resolve_runtime_provider`` is what the agent calls at turn start.
+
+    Only an ``invalid_provider`` failure counts. "Known provider, missing
+    credentials" (``missing_api_key``, or the untyped "No <vendor> credentials
+    found") is a different problem with its own in-app onboarding prompt, and
+    this process may not see credentials the backend can — treating those as
+    unresolvable would break spawns that work today. A resolver bug likewise
+    reports nothing: the turn still gets its own chance to resolve for real.
+    """
+    from hermes_cli.auth import AuthError
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    try:
+        resolve_runtime_provider(requested=provider)
+    except AuthError as exc:
+        if getattr(exc, "code", None) != "invalid_provider":
+            return None
+        return str(exc)
+    except Exception:
+        return None
+    return None
+
+
+def _provider_refusal(provider: str, profile: str, detail: str) -> str:
+    """Message for a PINNED spawn whose provider cannot run in that profile.
+
+    Hard-fails because this is the one case the check is sound for: the body
+    pins ``profile``, so the session provably runs under the very config that
+    was just read.
+
+    It has to be caught before the POST because the control channel cannot
+    report it afterwards. ``POST /spawn`` answers 202 as soon as Electron main
+    holds the request — ``deliverSpawnToRenderer`` reports "delivered" for one
+    it has merely parked — and there is no reply channel from the renderer
+    back to the CLI. So the CLI's ``✓`` only ever meant "the app accepted
+    this", never "the turn ran".
+
+    What the doomed spawn left behind is a 0-message row: ``session.create``
+    deliberately persists nothing (``tui_gateway/server.py``), so the row is
+    written by the first ``prompt.submit`` — a row with no messages *is* a
+    turn that started and failed. Refusing here creates no session at all.
+    """
+    return (
+        f"--provider {provider!r} is not a provider in profile {profile!r}, "
+        f"so the turn would fail in agent init:\n\n  {detail}\n\n"
+        "Provider names come from that profile's own config.yaml (providers: "
+        "/ custom_providers:), so a name that works in another profile can be "
+        "unknown here. Nothing was sent — no session was created."
+    )
+
+
+def _provider_caveat(provider: str, detail: str) -> str:
+    """Message for an UNPINNED spawn whose provider looks unresolvable.
+
+    Names ``default`` as the profile it read, because an unpinned spawn is the
+    ROOT home by definition (see :func:`_requested_profile`) and the root home
+    *is* the default profile — ``get_profile_dir("default")`` returns it —
+    whatever that root path happens to be.
+
+    Warns instead of refusing, because here the check is NOT sound in either
+    direction. An unpinned spawn is routed by the app, and the renderer
+    resolves an omitted profile against its own live gateway selection — which
+    moves whenever an earlier spawn pinned one. So this process read the wrong
+    config, and it cannot tell which way:
+
+    * measured in the dev sandbox 2026-08-02 — with the app launched on
+      ``default``, an earlier ``--profile labtwo`` spawn left the live gateway
+      on ``labtwo``; a later unpinned ``--provider lab-router`` (valid in
+      ``default``, so it checked clean) then ran under ``labtwo`` and died on
+      *"Unknown provider 'lab-router'"*.
+    * the mirror case is a provider declared ONLY in the profile the app is
+      on. Refusing that would block a spawn that would have worked — a
+      false refusal is worse than the husk, because the husk at least ran.
+
+    So say what was read and what could not be known, and still send it.
+    """
+    return (
+        f"--provider {provider!r} is not a provider in profile 'default', "
+        f"which is the config this command could read:\n"
+        f"\n  {detail}\n\n"
+        "This spawn pins no profile, so the app runs it under whichever "
+        "profile it is on — if that is a profile where the name IS defined, "
+        "it will work. Pass --profile to check and pin the same one."
+    )
+
+
+def _spawn_destination_note(profile: str | None) -> str:
+    """Return the ``(profile: …)`` fragment for the success line.
+
+    Always says something. A pinned spawn names its profile; an unpinned one
+    is routed by the app, and saying so is the only way the CLI can flag the
+    second seam the operator hit — the app's window showing one profile while
+    an unpinned spawn ran under another. Claiming a profile this side merely
+    guessed would be worse than admitting the app decides.
+    """
+    if profile:
+        return f" (profile: {profile})"
+    return " (profile: the app's active one — pass --profile to pin it)"
 
 
 def _read_control_file(path: Path) -> dict:
@@ -308,16 +423,27 @@ def cmd_desktop_spawn(args) -> int:
         print(f"✗ {exc}")
         sys.exit(1)
 
+    # Check the provider override BEFORE the POST, never after: the 202 is
+    # unconditional and there is no channel to retract it on. A pinned spawn
+    # is refused outright, because only then does the config just read provably
+    # govern the turn; an unpinned one can only be warned about.
+    provider = str(body.get("provider") or "")
+    pinned = body.get("profile")
+    if provider and (detail := _unresolvable_provider(provider)):
+        if pinned:
+            print(f"✗ {_provider_refusal(provider, str(pinned), detail)}")
+            sys.exit(1)
+        print(f"⚠ {_provider_caveat(provider, detail)}")
+
     try:
         _post_spawn(port=control["port"], token=str(control["token"]), body=body)
     except RuntimeError as exc:
         print(f"✗ {exc}")
         sys.exit(1)
 
-    # Name the profile when one was requested: the session opens in the
-    # running app's window whichever profile it runs under, so the transcript
-    # is the only other place that distinction shows up.
-    where = f" (profile: {body['profile']})" if body.get("profile") else ""
+    # The session opens in the running app's window whichever profile it runs
+    # under, so this line is the only place that distinction is visible up front.
+    where = _spawn_destination_note(body.get("profile"))
     notes = []
     if body.get("delegated"):
         notes.append("delegated — it will not stop to ask")

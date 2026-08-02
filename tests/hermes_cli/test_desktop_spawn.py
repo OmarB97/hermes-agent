@@ -11,6 +11,11 @@ Covers the CLI half of the desktop spawn control channel:
   - profile routing: the control file is read from the ROOT home (one app
     process serves every profile), and the requested profile is recovered
     from HERMES_HOME because the global pre-parse strips the flag
+  - --provider validated against the TARGET profile's config before the POST
+    (provider names are per-profile vocabulary), and the matching guard that
+    a missing credential is NOT mistaken for an unknown name
+  - the success line naming where the session landed, including the unpinned
+    case the CLI cannot resolve itself
   - 401 (stale token), connection refused (stale file), 503 (no window),
     a generic non-202 status, and a generic 4xx with server-supplied detail
 
@@ -88,6 +93,29 @@ def _fake_http_202():
     return cm
 
 
+def _declare_provider(name="ai-router", base_url="http://127.0.0.1:9/v1"):
+    """Declare ``name`` as a custom provider in the active profile's config.
+
+    Provider names are per-profile vocabulary (``providers:`` /
+    ``custom_providers:`` in each profile's own ``config.yaml``), and a spawn
+    that names one is now validated against the target profile's config — so a
+    test passing ``--provider X`` without declaring X anywhere is asserting on
+    a combination the CLI correctly refuses. No credential is needed: a
+    ``custom_providers`` entry resolves on name + base_url alone.
+
+    Writes to ``get_hermes_home()``, which is the per-test tmp home (and the
+    profile home in the profile-scoped tests) — never a real ``~/.hermes``.
+    """
+    from hermes_cli.config import get_hermes_home
+
+    home = get_hermes_home()
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        f"custom_providers:\n  - name: {name}\n    base_url: {base_url}\n",
+        encoding="utf-8",
+    )
+
+
 class TestHappyPath:
     def test_posts_exact_url_header_and_body_omitting_none_keys(self, capsys):
         _write_control_file(port=51234, token="tok_abc")
@@ -119,6 +147,7 @@ class TestHappyPath:
 
     def test_includes_optional_fields(self):
         _write_control_file(port=9999, token="tok_xyz")
+        _declare_provider("ai-router")
         captured: dict = {}
 
         def fake_urlopen(req, timeout=None):
@@ -307,6 +336,194 @@ class TestProfileRouting:
         assert str(profile_home / "desktop" / "control.json") not in out
 
 
+class TestProviderOverrideValidation:
+    """`--provider` is checked against the TARGET profile before the POST.
+
+    Regression cover for a spawn that reported success and left a dead
+    session. Provider names are per-profile vocabulary, so `--provider
+    ai-router` — valid in the root profile — is unknown inside a profile whose
+    only provider is `meshboard-qualified-local`, and the turn died in agent
+    init with "Unknown provider 'ai-router'".
+
+    It has to be caught before the POST because nothing can report it after:
+    `/spawn` answers 202 as soon as Electron main holds the request, and there
+    is no reply channel from the renderer back to the CLI.
+    """
+
+    def test_unknown_provider_in_the_target_profile_fails_loud_and_posts_nothing(
+        self, monkeypatch, capsys
+    ):
+        _use_profile_home(monkeypatch, "meshboard-game-dev")
+        _write_control_file()
+        # The target profile's whole provider vocabulary — no "ai-router".
+        _declare_provider("meshboard-qualified-local")
+
+        with patch.object(ds.urllib.request, "urlopen") as urlopen:
+            with pytest.raises(SystemExit) as exc:
+                ds.cmd_desktop_spawn(_ns(provider="ai-router"))
+
+        assert exc.value.code == 1
+        # The whole point: no request means no session.create, so no
+        # 0-message husk row in the target profile's state.db.
+        urlopen.assert_not_called()
+
+        out = capsys.readouterr().out
+        assert "ai-router" in out
+        assert "meshboard-game-dev" in out
+        assert "no session was created" in out
+
+    def test_provider_declared_in_the_target_profile_is_accepted(self, monkeypatch):
+        _use_profile_home(monkeypatch, "meshboard-game-dev")
+        _write_control_file()
+        _declare_provider("meshboard-qualified-local")
+        captured: dict = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["body"] = json.loads(req.data.decode())
+            return _fake_http_202()
+
+        with patch.object(ds.urllib.request, "urlopen", side_effect=fake_urlopen):
+            result = ds.cmd_desktop_spawn(_ns(provider="meshboard-qualified-local"))
+
+        assert result == 0
+        assert captured["body"]["provider"] == "meshboard-qualified-local"
+        assert captured["body"]["profile"] == "meshboard-game-dev"
+
+    def test_missing_credentials_is_not_treated_as_an_unknown_name(self):
+        """Only an unresolvable NAME blocks a spawn — a missing key must not.
+
+        "Known provider, no credentials" has its own in-app onboarding prompt,
+        and the app may hold credentials this process cannot see. Rejecting it
+        here would break spawns that work today, so the gate keys on the
+        `invalid_provider` code rather than on any resolution failure.
+        """
+        _write_control_file()
+        posted: list = []
+
+        def fake_urlopen(req, timeout=None):
+            posted.append(json.loads(req.data.decode()))
+            return _fake_http_202()
+
+        # `gemini` is a real provider name with no key in the hermetic env.
+        with patch.object(ds.urllib.request, "urlopen", side_effect=fake_urlopen):
+            result = ds.cmd_desktop_spawn(_ns(provider="gemini"))
+
+        assert result == 0
+        assert posted and posted[0]["provider"] == "gemini"
+
+    def test_unpinned_unresolvable_provider_warns_but_still_sends(self, capsys):
+        """An unpinned spawn is warned about, never refused.
+
+        The check is unsound in BOTH directions here, because the app — not
+        this process — picks the profile. Measured in the dev sandbox: an
+        earlier `--profile labtwo` spawn left the app's live gateway on
+        `labtwo`, so a later unpinned spawn checked against `default` was
+        speaking for the wrong config.
+
+        The mirror case is why this must not exit non-zero: a provider declared
+        ONLY in the profile the app is on resolves nowhere this process can
+        see, and refusing it would block a spawn that would have worked. A
+        false refusal is worse than the husk — the husk at least ran.
+        """
+        _write_control_file()
+        # Nothing declared: "lab-router" is unknown in the profile we can read.
+        posted: list = []
+
+        def fake_urlopen(req, timeout=None):
+            posted.append(json.loads(req.data.decode()))
+            return _fake_http_202()
+
+        with patch.object(ds.urllib.request, "urlopen", side_effect=fake_urlopen):
+            result = ds.cmd_desktop_spawn(_ns(provider="lab-router"))
+
+        assert result == 0
+        # Sent anyway — this is a caveat on a real 202, not a refusal.
+        assert posted and posted[0]["provider"] == "lab-router"
+
+        out = capsys.readouterr().out
+        assert "⚠" in out
+        assert "lab-router" in out
+        assert "pins no profile" in out
+        assert "✓" in out
+
+    def test_pinned_provider_override_does_not_warn(self, monkeypatch, capsys):
+        """A pinned spawn validates and runs under the same profile.
+
+        There is no gap to warn about, so the caveat must stay out of the
+        common case or it trains the reader to ignore it.
+        """
+        _use_profile_home(monkeypatch, "meshboard-game-dev")
+        _write_control_file()
+        _declare_provider("meshboard-qualified-local")
+
+        with patch.object(
+            ds.urllib.request, "urlopen", side_effect=lambda *a, **k: _fake_http_202()
+        ):
+            ds.cmd_desktop_spawn(_ns(provider="meshboard-qualified-local"))
+
+        out = capsys.readouterr().out
+        assert "⚠" not in out
+        assert "profile: meshboard-game-dev" in out
+
+    def test_spawn_with_no_provider_override_is_never_gated(self):
+        """The common case must not depend on config being readable at all.
+
+        With no `--provider`, the session uses the target profile's own
+        configured provider — nothing for this side to second-guess.
+        """
+        _write_control_file()
+        posted: list = []
+
+        def fake_urlopen(req, timeout=None):
+            posted.append(json.loads(req.data.decode()))
+            return _fake_http_202()
+
+        with patch.object(ds.urllib.request, "urlopen", side_effect=fake_urlopen):
+            result = ds.cmd_desktop_spawn(_ns())
+
+        assert result == 0
+        assert posted == [{"prompt": "hello"}]
+
+
+class TestSuccessLineDestination:
+    """The success line always says where the session landed.
+
+    `✓` only ever meant "the app accepted this"; it never meant "the turn
+    ran". Naming the destination is what makes the unpinned case — the app's
+    window showing one profile while the spawn ran under another — visible
+    instead of silent.
+    """
+
+    def test_pinned_spawn_names_the_profile(self, monkeypatch, capsys):
+        _use_profile_home(monkeypatch, "meshboard-worker")
+        _write_control_file()
+
+        with patch.object(
+            ds.urllib.request, "urlopen", side_effect=lambda *a, **k: _fake_http_202()
+        ):
+            ds.cmd_desktop_spawn(_ns())
+
+        assert "profile: meshboard-worker" in capsys.readouterr().out
+
+    def test_unpinned_spawn_says_the_app_chooses(self, capsys):
+        """No profile on the wire means the app routes it — don't invent a name.
+
+        Printing the CLI's own home as if it were the destination would be a
+        guess: the renderer resolves an omitted profile against its own live
+        selection.
+        """
+        _write_control_file()
+
+        with patch.object(
+            ds.urllib.request, "urlopen", side_effect=lambda *a, **k: _fake_http_202()
+        ):
+            ds.cmd_desktop_spawn(_ns())
+
+        out = capsys.readouterr().out
+        assert "profile: the app's active one" in out
+        assert "--profile" in out
+
+
 class TestControlFileFailures:
     def test_missing_control_file_exits_nonzero_with_actionable_message(self, capsys):
         # No control.json written — the per-test HERMES_HOME has no desktop/ dir.
@@ -474,6 +691,7 @@ class TestDelegated:
         assert body["delegatedTimeoutMs"] == 1500
 
     def test_delegated_composes_with_the_other_overrides(self):
+        _declare_provider("ai-router")
         body = self._body_for(
             prompt="hi",
             model="deepseek-v4-flash-0731-ds4",
@@ -572,6 +790,9 @@ class TestGoal:
     def test_goal_composes_with_delegated_and_the_other_overrides(self):
         """The case this was built for: an unattended session with a standing
         objective, pinned to one profile and model."""
+        # A pinned `--provider` is now checked against the target profile's
+        # config, so it has to exist there for the spawn to be sent at all.
+        _declare_provider("ai-router")
         body = self._body_for(
             prompt=None,
             goal="ship the parser",
