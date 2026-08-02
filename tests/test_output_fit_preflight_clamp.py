@@ -18,6 +18,12 @@ _BIG = [{"role": "user", "content": "x" * 232000}]
 _SMALL = [{"role": "user", "content": "hello there"}]
 _CTX = 131072
 
+# ~115k tokens in a 131,072 window: past the point where the multiplicative
+# input reservation (1.2x + 1536) exhausts the window, but the prompt itself
+# still leaves ~16k tokens of genuine headroom.  This is the regime where the
+# old ``min_output`` floor turned "nothing fits" into "1 token fits".
+_NEAR_FULL = [{"role": "user", "content": "x" * 460000}]
+
 
 def _agent(max_tokens=None, ephemeral=None, ctx=_CTX):
     return SimpleNamespace(
@@ -89,3 +95,61 @@ class TestReactiveRetryConverges:
             # with it, it drops straight to the fitting cap.
             assert safe_out <= local_fit
             assert safe_out < requested - 1000
+
+
+class TestNearFullWindowNeverYieldsAUselessCap:
+    """A near-full window must report "no usable fit", never a 1-token floor.
+
+    ``output_tokens_that_fit`` reserves the input multiplicatively (1.2x), so
+    once the estimate passes ~82.7% of the window the reservation swallows it
+    whole.  Returning the ``min_output`` floor there manufactured a "1 output
+    token fits" budget out of "nothing fits", and both callers consumed it as a
+    real number: the provider accepts a max_tokens=1 retry and returns a single
+    truncated token, so the turn *succeeds* with output the user cannot use.
+    """
+
+    def test_prompt_itself_still_leaves_real_headroom(self):
+        # Guard the fixture: this must be the "reservation exhausted the window"
+        # case, not the "prompt genuinely does not fit" case.
+        est = estimate_messages_tokens_rough(_NEAR_FULL)
+        assert est < _CTX
+        assert _CTX - est > 10_000
+
+    def test_reports_none_rather_than_a_floor(self):
+        assert output_tokens_that_fit(_CTX, _NEAR_FULL) is None
+
+    def test_every_reported_fit_is_a_real_fit(self):
+        # Sweep the whole fill range and hold every non-None answer to the same
+        # safety property the function documents: a server tokenizing ~15%
+        # denser than our estimate must still leave the clamped request
+        # in-window.  A fabricated floor fails this — it is precisely a number
+        # that does NOT fit — so this catches the regression at its root rather
+        # than by pattern-matching the literal 1.
+        for tokens in range(1_000, _CTX, 2_500):
+            msgs = [{"role": "user", "content": "x" * (tokens * 4)}]
+            fit = output_tokens_that_fit(_CTX, msgs)
+            if fit is None:
+                continue
+            server_input = int(estimate_messages_tokens_rough(msgs) * 1.15)
+            assert server_input + fit < _CTX, (
+                f"{tokens=} reported fit={fit} that does not actually fit"
+            )
+
+    def test_preflight_leaves_cap_alone_instead_of_clamping_to_one(self):
+        a = _agent(max_tokens=65536)
+        _preflight_clamp_output_tokens(a, _NEAR_FULL)
+        # No clamp at all: the provider gets the real cap, 400s, and the
+        # reactive path then uses the provider's authoritative budget.
+        assert a._ephemeral_max_output_tokens is None
+
+    def test_reactive_retry_keeps_provider_authoritative_cap(self):
+        # Mirrors the arithmetic in conversation_loop's output-cap retry.
+        provider_available = 25_000
+        local_available_out = _CTX - estimate_messages_tokens_rough(_NEAR_FULL)
+        safe_out = max(1, min(provider_available, local_available_out) - 64)
+        local_fit = output_tokens_that_fit(_CTX, _NEAR_FULL)
+        if local_fit is not None:
+            safe_out = max(1, min(safe_out, local_fit))
+        # The retry must stay anchored to what the provider said actually fits.
+        assert safe_out > 1_000
+        assert safe_out == max(1, min(provider_available, local_available_out) - 64)

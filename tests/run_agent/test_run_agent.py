@@ -5819,24 +5819,19 @@ class TestRunConversation:
         assert result["completed"] is True
 
         # Verify the local estimate is actually the lower bound.
-        from agent.model_metadata import (
-            estimate_request_tokens_rough,
-            output_tokens_that_fit,
-        )
+        from agent.model_metadata import estimate_request_tokens_rough
         estimated_request = estimate_request_tokens_rough(
             first_call["messages"], tools=agent.tools or None,
         )
         local_available = 200_000 - estimated_request
         expected_cap = max(1, min(50_000, local_available) - 64)
-        # The retry is then anchored to output_tokens_that_fit(), the single
-        # source of truth for "how many output tokens fit". It reserves the
-        # input conservatively so the cap is one the provider will accept, so
-        # against a near-full window it binds below the arithmetic above.
-        local_fit = output_tokens_that_fit(200_000, first_call["messages"])
-        if local_fit is not None:
-            expected_cap = max(1, min(expected_cap, local_fit))
+        # output_tokens_that_fit() over-reserves the input multiplicatively, so
+        # against this near-full window it has no usable cap to offer and
+        # returns None. The retry must then keep the provider-authoritative
+        # arithmetic above rather than collapsing to a 1-token cap.
         assert local_available < 50_000
         assert second_call["max_tokens"] == expected_cap
+        assert second_call["max_tokens"] > 1
         assert agent.context_compressor.context_length == 200_000
         mock_compress.assert_not_called()
 
