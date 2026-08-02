@@ -17,7 +17,7 @@ import pytest
 
 
 @pytest.fixture()
-def server():
+def server(notification_poller_reaper):
     with patch.dict(
         "sys.modules",
         {
@@ -32,6 +32,19 @@ def server():
         import importlib
 
         mod = importlib.import_module("tui_gateway.server")
+        # ``_init_session`` starts a notification poller, and clearing
+        # ``_sessions`` below does not stop it — the loop only breaks on
+        # ``_finalized`` / ``_notif_stop``, which only ``_teardown_session``
+        # sets. Left alone, each of the three ``_init_session`` tests here
+        # leaves a daemon thread polling the process-wide
+        # ``process_registry.completion_queue`` for the rest of the run.
+        # Reaped through the shared helper rather than the module-wide
+        # ``reap_notification_pollers`` fixture: that one imports
+        # ``tui_gateway.server`` at setup, and this fixture has to be the
+        # process's first importer of it — the ``patch.dict`` above is what
+        # makes the module import against mocked ``hermes_constants`` /
+        # ``hermes_state``.
+        notification_poller_reaper(mod)
         yield mod
         # Reset module-level session state without re-importing. importlib.reload
         # would re-register the module's atexit hooks (ThreadPoolExecutor
