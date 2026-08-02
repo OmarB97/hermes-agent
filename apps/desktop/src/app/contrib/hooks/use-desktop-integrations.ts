@@ -10,6 +10,7 @@ import { isSecondaryWindow } from '@/store/windows'
 
 import { requestComposerFocus, requestComposerInsert } from '../../chat/composer/focus'
 import { appViewForPath, isOverlayView, NEW_CHAT_ROUTE, sessionRoute } from '../../routes'
+import { useExternalSessionSync } from '../../session/hooks/use-external-session-sync'
 
 interface DesktopIntegrationsParams {
   chatOpen: boolean
@@ -168,4 +169,9 @@ export function useDesktopIntegrations({
 
     return onSessionsChanged(() => void refreshSessions())
   }, [refreshSessions])
+
+  // A process OUTSIDE this app (headless `hermes -z …`, cron, a CLI session in
+  // another terminal) wrote into a profile store -> re-pull the sidebar. The
+  // BroadcastChannel above only reaches our own windows.
+  useExternalSessionSync({ refreshSessions })
 }
