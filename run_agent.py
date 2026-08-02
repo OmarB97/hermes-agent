@@ -1436,6 +1436,41 @@ class AIAgent:
             is not None
             or os.getenv("HERMES_API_CALL_STALE_TIMEOUT") is not None
         )
+        # DFlash is consulted BEFORE the reasoning floor already folded into
+        # ``stale_base``, and returns unconditionally. That ordering is
+        # deliberate, and it matters because ``deepseek-v4-flash`` sits in BOTH
+        # tables: the reasoning floor (600s) and the DFlash family. Below ~105k
+        # tokens the DFlash budget (180s + 4s/1k) is the SMALLER number, so this
+        # branch hands back less patience than the floor would — read as an
+        # oversight, it looks like the local path undercutting a mitigation.
+        #
+        # It is not. The two numbers are scoped to different lanes:
+        #
+        #   * The floor is a model-CLASS number for cloud gateways whose idle
+        #     kill lands before the thinking phase ends. ``deepseek-v4-flash``
+        #     was added to it for a hosted provider (opencode-go, #60338), and
+        #     it still governs there in full — this branch is gated on
+        #     ``is_local_endpoint``, so a cloud DFlash request never reaches it.
+        #   * The DFlash budget is a LANE-specific measured one, and it is
+        #     deliberately TIGHT: see ``_dflash_local_stale_timeout``, which
+        #     bounds this family harder than the generic local ceiling
+        #     (``_generic_local_stale_timeout``, 900s + scaling) precisely
+        #     because this family's cold start was measured and an unknown
+        #     self-hosted model's was not. Being under the class floor is the
+        #     point, not a regression against it.
+        #
+        # The streaming side resolves the same collision the same way, so the
+        # two agree: ``interruptible_streaming_api_call`` skips the floor
+        # outright when a local DFlash first-chunk budget exists
+        # (``_reasoning_floor is not None and _dflash_first_chunk_timeout is
+        # None``), and before #263 the floor lived structurally inside the
+        # non-local arm — it has never applied to a local endpoint. Verified
+        # equal at every context size on a generic local DFlash lane: 196s @4k,
+        # 312s @33k, 540s @90k, 980s @200k.
+        #
+        # Pinned by ``test_default_local_dflash_non_stream_stale_timeout_is_bounded``,
+        # which asserts 180s for ``deepseek-v4-flash-w2`` — a model in the floor
+        # table — and would fail at 600s if the floor won here.
         if not has_explicit_timeout and base_url and is_local_endpoint(base_url):
             from agent.chat_completion_helpers import _dflash_local_stale_timeout
 

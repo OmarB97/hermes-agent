@@ -4434,6 +4434,18 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # xAI Grok reasoning, etc.) routinely exceed the default 180s chat-
     # model threshold during their thinking phase. The base timeout is
     # resolved first; this floor can only increase it.
+    #
+    # The ``_dflash_first_chunk_timeout is None`` half is what keeps the floor
+    # off a local DFlash lane, and it is load-bearing rather than incidental:
+    # ``deepseek-v4-flash`` is in the floor table AND in the DFlash family, and
+    # below ~105k tokens the floor (600s) is the LARGER number, so dropping this
+    # guard would silently replace a measured lane budget with a model-class one.
+    # The floor's own rationale is a cloud gateway idle-killing a socket, which
+    # is not a thing a local endpoint does — and before #263 the floor lived
+    # structurally inside the non-local arm of this resolver, so it has never
+    # applied to a local endpoint. ``AIAgent._compute_non_stream_stale_timeout``
+    # resolves the identical collision the identical way (DFlash first, returned
+    # unconditionally); the fuller account of why lives there.
     from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
     _reasoning_floor = get_reasoning_stale_timeout_floor(api_kwargs.get("model"))
     if _reasoning_floor is not None and _dflash_first_chunk_timeout is None:
