@@ -63,6 +63,8 @@ Click **Show auxiliary** to reveal the 11 task slots:
 
 Every auxiliary task defaults to `auto` — meaning Hermes tries your main model for that job too. If that route is unavailable or hits a capacity-style failure, `auto` follows any task-specific `auxiliary.<task>.fallback_chain`, then the main `fallback_providers` / `fallback_model` chain, then Hermes' built-in auxiliary discovery chain. Override a specific task when you want a cheaper or faster model for a side-job.
 
+If your answer is the same for *every* task — "keep the short side calls off my main model" — set one `auxiliary.route` block in `config.yaml` instead of eleven slots. It changes what `auto` resolves to, per-task settings still win, and `provider: main` puts any single task back on the main model. It matters most on a single-slot local server, where a short auxiliary call evicts the KV slot holding your long conversation and costs you the prompt cache on the next real turn. See [One lane for every auxiliary task](/user-guide/configuration#one-lane-for-every-auxiliary-task-auxiliaryroute).
+
 ### Common override patterns
 
 | Task | When to override |

@@ -1023,11 +1023,113 @@ Available providers for auxiliary tasks: `auto`, `main`, plus any provider in th
 The `"main"` provider option means "use whatever provider my main agent uses" — it's only valid inside `auxiliary:`, `compression:`, and primary fallback entries (`fallback_providers:` or legacy `fallback_model:`). It is **not** a valid value for your top-level `model.provider` setting. If you use a custom OpenAI-compatible endpoint, set `provider: custom` in your `model:` section. See [AI Providers](/integrations/providers) for all main model provider options.
 :::
 
+### One lane for every auxiliary task (`auxiliary.route`)
+
+Setting each task individually gets repetitive when the answer is the same for
+all of them: *"send the short side calls somewhere that isn't my main model."*
+`auxiliary.route` is that single setting.
+
+```yaml
+auxiliary:
+  route:
+    provider: "openrouter"
+    model: "google/gemini-3-flash-preview"
+```
+
+Every auxiliary task that pins nothing of its own — smart approval, goal judge,
+title generation, compression, web extraction, MCP reasoning, and the rest —
+now runs there instead of on your main chat model.
+
+**Why you would want this.** Cost is the obvious reason, but the bigger one is
+**prompt-cache protection**. Auxiliary calls are short; your conversation is
+not. On a single-slot local inference server a 2–6K-token approval check
+evicts the KV slot holding a 95K-token conversation, and your next real turn
+re-reads the entire prefix from scratch instead of hitting the cache. Moving
+the short calls off that endpoint keeps the conversation's slot warm. The same
+logic applies to hosted providers with per-conversation prompt caching, just
+with a smaller cliff.
+
+**Precedence** — most specific wins:
+
+```
+auxiliary.<task>.*     →  auxiliary.route.*     →  "auto" (your main model)
+```
+
+So `auxiliary.route` changes what `"auto"` resolves to. A task that names its
+own `provider`, `base_url`, or `model` keeps that, untouched.
+
+**Opting one task back onto the main model** is one line — `"main"` is an
+explicit per-task pin, so it beats the route:
+
+```yaml
+auxiliary:
+  route:
+    provider: "openrouter"
+    model: "google/gemini-3-flash-preview"
+  compression:
+    provider: "main"          # summarise on the main model after all
+```
+
+**Every field**, all optional and all empty by default:
+
+| Key | What it does |
+|-----|-------------|
+| `provider` | Provider id, or the name of a `providers:` / `custom_providers:` entry |
+| `model` | Model to request; empty uses the provider's (or the entry's) default |
+| `base_url` | Direct OpenAI-compatible endpoint instead of a provider |
+| `api_key` | Inline key for `base_url` |
+| `key_env` | Name of the env var holding the key (preferred over `api_key`) |
+| `api_mode` | `chat_completions`, `codex_responses`, `anthropic_messages` |
+| `timeout` | Seconds per routed call; `0` keeps each task's own timeout |
+| `transient_retries` | Same-lane retries on a transport blip; **default `0`** |
+
+Set `model` explicitly when you route to a bare `base_url` — there is no
+provider entry to read a default from, and a model id from one endpoint rarely
+exists on another.
+
+:::note Vision is not routed
+Image payloads need a multimodal model, and the vision path has its own
+capability-aware provider chain. `auxiliary.route` is a text lane; use
+`auxiliary.vision` to give screenshots and image analysis their own backend.
+:::
+
+:::note Background review and the curator stay on your main model
+Both replay the conversation transcript, which is *already warm* in your main
+model's prompt cache — running them elsewhere would pay a full cold write for
+no cache benefit. They read `auxiliary.background_review` /`auxiliary.curator`
+directly and ignore the route. Set those blocks explicitly if you want them
+moved.
+:::
+
+:::warning Cache protection is best-effort by design
+With the default `fallback_policy: "any"`, an auxiliary lane that is
+unreachable — or that answers with a 401 — silently falls back to your main
+model rather than failing the task. That is deliberate: smart approvals fail
+*closed* to a human prompt, so a routed lane that simply errored out would turn
+every flagged command in an unattended run into a stalled approval. You get a
+warning in chat and in `errors.log`, the main model answers, and an unreachable
+lane is skipped for ten minutes instead of being retried on every call. If a
+route is configured but you keep seeing auxiliary traffic on your main model,
+check `hermes logs --level warning`.
+:::
+
 ### Full auxiliary config reference
 
 ```yaml
 auxiliary:
-  # Image analysis (vision_analyze tool + browser screenshots)
+  # Optional single lane for every task that pins nothing of its own.
+  # Empty = off (the default): tasks resolve to "auto" = your main model.
+  route:
+    provider: ""               # provider id, or a providers:/custom_providers: entry name
+    model: ""                  # empty = provider / entry default
+    base_url: ""               # direct OpenAI-compatible endpoint instead of a provider
+    api_key: ""                # inline key for base_url
+    key_env: ""                # env var holding the key (preferred)
+    api_mode: ""               # chat_completions | codex_responses | anthropic_messages
+    timeout: 0                 # seconds; 0 = use each task's own timeout
+    transient_retries: 0       # routed lanes do not retry by default
+
+  # Image analysis (vision_analyze tool + browser screenshots) — never routed
   vision:
     provider: "auto"           # "auto", "openrouter", "nous", "codex", "main", etc.
     model: ""                  # e.g. "openai/gpt-4o", "google/gemini-2.5-flash"

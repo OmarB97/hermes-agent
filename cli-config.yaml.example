@@ -516,6 +516,28 @@ prompt_caching:
 # Other providers pick a sensible default automatically.
 #
 # auxiliary:
+#   # One lane for EVERY task that pins nothing of its own — smart approval,
+#   # goal judge, title generation, compression, web_extract, ... Empty = off,
+#   # which is the default: those tasks resolve to "auto" = your main model.
+#   #
+#   # Why: auxiliary calls are short, your conversation is not. On a
+#   # single-slot local server a 2-6K-token approval check evicts the KV slot
+#   # holding a 95K-token conversation and the next real turn re-reads the
+#   # whole prefix instead of hitting the prompt cache.
+#   #
+#   # Precedence: auxiliary.<task>.*  >  auxiliary.route.*  >  "auto".
+#   # Put one task back on the main model with `provider: "main"` on that task.
+#   # Vision is never routed here (image payloads need a multimodal model).
+#   route:
+#     provider: ""           # provider id, or a providers:/custom_providers: entry name
+#     model: ""              # empty = provider / entry default
+#     base_url: ""           # direct OpenAI-compatible endpoint instead of a provider
+#     api_key: ""            # inline key for base_url
+#     key_env: ""            # env var holding the key (preferred over api_key)
+#     api_mode: ""           # chat_completions | codex_responses | anthropic_messages
+#     timeout: 0             # seconds; 0 = use each task's own timeout
+#     transient_retries: 0   # routed lanes do not retry by default
+#
 #   # Image analysis: vision_analyze tool + browser screenshots
 #   vision:
 #     provider: "auto"
