@@ -876,7 +876,7 @@ The **stale non-stream detection** kills non-streaming calls that produce no res
 
 The **pre-first-chunk timeout** is how long Hermes waits for the *first* streamed token on a local DeepSeek-V4 Flash endpoint. That window covers queue admission, model load, and prefill of the entire prompt, so it grows with the conversation: a 95K-token turn is budgeted far longer than a 20K one. Set `providers.<id>.first_chunk_timeout_seconds` (or `providers.<id>.models.<model>.first_chunk_timeout_seconds`) to pin it yourself — it outranks `stale_timeout_seconds`, because waiting for the first token and waiting between tokens measure different things, and a slow-prefill lane can reasonably want minutes for one and seconds for the other.
 
-Declare these under the **named** provider entry (`providers.ai-router`), not under `custom`. Every user-declared endpoint resolves to the billing class `custom` at runtime; Hermes maps it back to the entry that owns the endpoint URL.
+Declare these under the **named** provider entry (`providers.my-local-lane`), not under `custom`. Every user-declared endpoint resolves to the billing class `custom` at runtime; Hermes maps it back to the entry that owns the endpoint URL.
 
 ## Context Pressure Warnings
 
