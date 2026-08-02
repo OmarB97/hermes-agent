@@ -137,20 +137,28 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
       const liveSessionId = 'sessionId' in selection ? (selection.sessionId ?? null) : primaryRuntimeId
       const touchesPrimary = !liveSessionId || liveSessionId === primaryRuntimeId
 
-      const prevModel = touchesPrimary ? $currentModel.get() : ($sessionStates.get()[liveSessionId!]?.model ?? '')
-
-      const prevProvider = touchesPrimary
-        ? $currentProvider.get()
-        : ($sessionStates.get()[liveSessionId!]?.provider ?? '')
-
+      // The composer's sticky pick and the live session's model are separate
+      // values now (a spawned session runs an override the pick never saw), so
+      // each rolls back to its own previous value rather than a shared one.
+      const prevPickedModel = $currentModel.get()
+      const prevPickedProvider = $currentProvider.get()
+      const liveState = liveSessionId ? $sessionStates.get()[liveSessionId] : undefined
+      const prevLiveModel = liveState?.model ?? ''
+      const prevLiveProvider = liveState?.provider ?? ''
       const prevSource = getCurrentModelSource()
 
       if (touchesPrimary) {
         setCurrentModel(selection.model)
         setCurrentProvider(selection.provider)
         markComposerSelectionManual()
-      } else if (liveSessionId) {
-        // Optimistic tile paint — session.info will confirm; rollback on error.
+      }
+
+      // Optimistic paint for ANY live session — session.info confirms, rollback
+      // on error. The primary surface displays the session's model (not the
+      // composer pick), so it needs this write just as a tile does; routing
+      // through the delegate keeps the cache, the primary view and every tile
+      // mirror in agreement.
+      if (liveSessionId) {
         sessionTileDelegate()?.updateSession(liveSessionId, state => ({
           ...state,
           model: selection.model,
@@ -178,18 +186,25 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
         return true
       } catch (err) {
         if (touchesPrimary) {
-          setCurrentModel(prevModel)
-          setCurrentProvider(prevProvider)
+          setCurrentModel(prevPickedModel)
+          setCurrentProvider(prevPickedProvider)
           setCurrentModelSource(prevSource)
-        } else if (liveSessionId) {
+        }
+
+        if (liveSessionId) {
           sessionTileDelegate()?.updateSession(liveSessionId, state => ({
             ...state,
-            model: prevModel,
-            provider: prevProvider
+            model: prevLiveModel,
+            provider: prevLiveProvider
           }))
         }
 
-        updateModelOptionsCache(liveSessionId, prevProvider, prevModel, touchesPrimary && !liveSessionId)
+        updateModelOptionsCache(
+          liveSessionId,
+          liveSessionId ? prevLiveProvider : prevPickedProvider,
+          liveSessionId ? prevLiveModel : prevPickedModel,
+          touchesPrimary && !liveSessionId
+        )
         notifyError(err, copy.modelSwitchFailed)
 
         return false

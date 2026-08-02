@@ -8,12 +8,12 @@ import {
   $busy,
   $currentCwd,
   $currentFastMode,
-  $currentModel,
-  $currentProvider,
   $currentReasoningEffort,
   $lastVisibleMessageIsUser,
   $messages,
   $messagesEmpty,
+  $primaryModel,
+  $primaryProvider,
   $selectedStoredSessionId
 } from '@/store/session'
 
@@ -53,8 +53,10 @@ export const PRIMARY_SESSION_VIEW: SessionView = {
   $lastVisibleIsUser: $lastVisibleMessageIsUser,
   $messages,
   $messagesEmpty,
-  $model: $currentModel,
-  $provider: $currentProvider,
+  // The OPEN session's model, not the composer's persisted pick — those are
+  // the same value only on a fresh draft (see $primaryModel).
+  $model: $primaryModel,
+  $provider: $primaryProvider,
   $reasoningEffort: $currentReasoningEffort,
   $runtimeId: $activeSessionId,
   $storedId: $selectedStoredSessionId

@@ -28,6 +28,7 @@ import {
   $sessions,
   $sessionsTotal,
   $yoloActive,
+  clearActiveSessionModel,
   type NewChatWorkspaceTarget,
   sessionAliasIds,
   setActiveSessionId,
@@ -334,8 +335,10 @@ export function useSessionActions({
       // localStorage) — a new chat FOLLOWS your last pick instead of snapping
       // back to the profile default, so we deliberately don't reset it here. The
       // profile default still owns first-run seeding and profile switches (see
-      // refreshCurrentModel). Only $currentServiceTier (a live-session mirror)
-      // is cleared.
+      // refreshCurrentModel). Only the live-session mirrors ($currentServiceTier
+      // and the model/provider pair) are cleared — with no session open, the
+      // composer's own pick is what the pill should show again.
+      clearActiveSessionModel()
       setCurrentServiceTier('')
       setCurrentFallbackPolicy('')
       setYoloActive(false)

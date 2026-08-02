@@ -1264,7 +1264,20 @@ describe('createBackendSessionForSend per-session overrides', () => {
       if (method === 'session.create') {
         createParams = params
 
-        return { session_id: RUNTIME_SESSION_ID, stored_session_id: null } as never
+        // The backend echoes the session's EFFECTIVE model straight back on the
+        // create response (`info.model` is the spawn's override — see
+        // tui_gateway/server.py session.create). Stubbing that echo is what
+        // makes this suite exercise the real round trip: without it the "does
+        // not mutate the persisted composer selection" case passes vacuously,
+        // because `applyRuntimeInfo(undefined)` bails before touching anything.
+        return {
+          info: {
+            ...(typeof params?.model === 'string' ? { model: params.model } : {}),
+            ...(typeof params?.provider === 'string' ? { provider: params.provider } : {})
+          },
+          session_id: RUNTIME_SESSION_ID,
+          stored_session_id: null
+        } as never
       }
 
       return {} as never
@@ -1368,5 +1381,56 @@ describe('createBackendSessionForSend per-session overrides', () => {
     })
 
     expect(params).toMatchObject({ model: 'anthropic/claude-sonnet-4.6', provider: 'anthropic' })
+  })
+
+  // The guarantee end to end, at the layer the user actually feels it: a spawn
+  // steers ITS session, then the next chat the user starts is still on their
+  // own model. Asserting the atoms alone missed this once already — the leak
+  // rode in on session.create's `info` echo, which the earlier stub omitted.
+  it('starts the NEXT chat on the user pick after a spawn overrode one session', async () => {
+    const createCalls: Record<string, unknown>[] = []
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.create') {
+        createCalls.push(params ?? {})
+
+        return {
+          info: {
+            ...(typeof params?.model === 'string' ? { model: params.model } : {}),
+            ...(typeof params?.provider === 'string' ? { provider: params.provider } : {})
+          },
+          session_id: `${RUNTIME_SESSION_ID}-${createCalls.length}`,
+          stored_session_id: null
+        } as never
+      }
+
+      return {} as never
+    })
+
+    setCurrentCwd('')
+    setNewChatWorkspaceTarget(undefined)
+    setCurrentModel('anthropic/claude-sonnet-4.6')
+    setCurrentProvider('anthropic')
+
+    let handle: HarnessHandle | null = null
+    render(<Harness onReady={h => (handle = h)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    // `hermes desktop spawn -m deepseek-v4-flash-0731-ds4 "hi"`
+    await act(async () => {
+      await handle!.createBackendSessionForSend(null, { model: 'deepseek-v4-flash-0731-ds4', provider: 'ai-router' })
+    })
+
+    // The user hits Cmd+N and sends — no override this time.
+    await act(async () => {
+      handle!.startFreshSessionDraft()
+    })
+    await act(async () => {
+      await handle!.createBackendSessionForSend(null)
+    })
+
+    expect(createCalls).toHaveLength(2)
+    expect(createCalls[0]).toMatchObject({ model: 'deepseek-v4-flash-0731-ds4', provider: 'ai-router' })
+    expect(createCalls[1]).toMatchObject({ model: 'anthropic/claude-sonnet-4.6', provider: 'anthropic' })
   })
 })

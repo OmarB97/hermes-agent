@@ -14,7 +14,10 @@ import {
   $currentServiceTier,
   $currentUsage,
   $messages,
+  $primaryModel,
+  $primaryProvider,
   $turnStartedAt,
+  clearActiveSessionModel,
   setActiveSessionId,
   setActiveSessionStoredIdRotation,
   setCurrentFallbackPolicy,
@@ -119,6 +122,7 @@ describe('useSessionStateCache — per-session turn timer', () => {
     })
     window.localStorage.clear()
     setTurnStartedAt(null)
+    clearActiveSessionModel()
     setCurrentModel('')
     setCurrentProvider('')
     setCurrentReasoningEffort('')
@@ -132,6 +136,7 @@ describe('useSessionStateCache — per-session turn timer', () => {
     cleanup()
     vi.restoreAllMocks()
     setTurnStartedAt(null)
+    clearActiveSessionModel()
     setCurrentModel('')
     setCurrentProvider('')
     setCurrentReasoningEffort('')
@@ -211,6 +216,12 @@ describe('useSessionStateCache — per-session turn timer', () => {
   it('mirrors the focused session model metadata when switching from a cached session', () => {
     let cache!: Cache
 
+    // The composer's sticky pick — what a NEW chat would be created with. The
+    // focused session's model must paint over it on screen without overwriting
+    // it in storage.
+    setCurrentModel('anthropic/claude-sonnet-4.6')
+    setCurrentProvider('anthropic')
+
     const { rerender } = render(
       <Harness activeSessionId="fg-runtime" onReady={c => (cache = c)} selectedStoredSessionId="fg-stored" />
     )
@@ -232,7 +243,7 @@ describe('useSessionStateCache — per-session turn timer', () => {
     })
 
     // Background metadata is cached but must not bleed into the visible statusbar.
-    expect($currentModel.get()).toBe('')
+    expect($primaryModel.get()).toBe('anthropic/claude-sonnet-4.6')
     expect($currentReasoningEffort.get()).toBe('')
     expect($currentFastMode.get()).toBe(false)
     expect($currentFallbackPolicy.get()).toBe('')
@@ -246,12 +257,17 @@ describe('useSessionStateCache — per-session turn timer', () => {
       cache.syncSessionStateToView('bg-runtime', bgState!)
     })
 
-    expect($currentModel.get()).toBe('anthropic/claude-opus-4.8')
-    expect($currentProvider.get()).toBe('anthropic')
+    expect($primaryModel.get()).toBe('anthropic/claude-opus-4.8')
+    expect($primaryProvider.get()).toBe('anthropic')
     expect($currentReasoningEffort.get()).toBe('high')
     expect($currentServiceTier.get()).toBe('priority')
     expect($currentFastMode.get()).toBe(true)
     expect($currentFallbackPolicy.get()).toBe('local-only')
+
+    // ...and the composer's persisted pick is untouched, so the next new chat
+    // still starts on the model the user chose.
+    expect($currentModel.get()).toBe('anthropic/claude-sonnet-4.6')
+    expect($currentProvider.get()).toBe('anthropic')
   })
 
   it('clears stale model metadata when the newly focused session has no cached value', () => {
@@ -281,12 +297,51 @@ describe('useSessionStateCache — per-session turn timer', () => {
       cache.syncSessionStateToView('bg-runtime', bgState!)
     })
 
-    expect($currentModel.get()).toBe('')
-    expect($currentProvider.get()).toBe('')
+    // The focused session reported no model, so the display blanks (the pill's
+    // loader) rather than keeping the previous session's — but the composer's
+    // own pick survives in storage for the next new chat.
+    expect($primaryModel.get()).toBe('')
+    expect($primaryProvider.get()).toBe('')
+    expect($currentModel.get()).toBe('previous-model')
+    expect($currentProvider.get()).toBe('previous-provider')
     expect($currentReasoningEffort.get()).toBe('')
     expect($currentServiceTier.get()).toBe('')
     expect($currentFastMode.get()).toBe(false)
     expect($currentFallbackPolicy.get()).toBe('')
+  })
+
+  // The DURABLE half of the #298 leak: `state.model` is stamped from every
+  // session.info, and the backend puts `model` on every one of them. Routing
+  // that through setCurrentModel rewrote the user's persisted pick on each
+  // heartbeat, so a `hermes desktop spawn -m <model>` re-aimed every chat
+  // started afterwards — and kept re-aiming it for the session's whole life.
+  it("does not write a spawned session's model into the persisted composer pick", () => {
+    setCurrentModel('anthropic/claude-sonnet-4.6')
+    setCurrentProvider('anthropic')
+
+    let cache!: Cache
+    render(<Harness activeSessionId="spawn-runtime" onReady={c => (cache = c)} selectedStoredSessionId="spawn-stored" />)
+
+    // Three heartbeats, as a live session emits over its lifetime.
+    for (let beat = 0; beat < 3; beat += 1) {
+      act(() => {
+        cache.updateSessionState(
+          'spawn-runtime',
+          state => ({ ...state, model: 'deepseek-v4-flash-0731-ds4', provider: 'ai-router' }),
+          'spawn-stored'
+        )
+      })
+    }
+
+    // The spawned session shows its own model...
+    expect($primaryModel.get()).toBe('deepseek-v4-flash-0731-ds4')
+    expect($primaryProvider.get()).toBe('ai-router')
+
+    // ...and the next new chat still gets the user's pick, from memory and
+    // from the localStorage the composer re-seeds itself from on restart.
+    expect($currentModel.get()).toBe('anthropic/claude-sonnet-4.6')
+    expect($currentProvider.get()).toBe('anthropic')
+    expect(window.localStorage.getItem('hermes.desktop.composer.model')).toBe('anthropic/claude-sonnet-4.6')
   })
 
   it('switches the context meter immediately to the newly focused cached session', () => {

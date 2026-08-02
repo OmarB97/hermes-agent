@@ -5,10 +5,10 @@ import { ModelPickerDialog } from '@/components/model-picker'
 import type { HermesGateway } from '@/hermes'
 import {
   $activeSessionId,
-  $currentModel,
-  $currentProvider,
   $gatewayState,
   $modelPickerOpen,
+  $primaryModel,
+  $primaryProvider,
   setModelPickerOpen
 } from '@/store/session'
 import { $focusedRuntimeId, $focusedSessionState } from '@/store/session-states'
@@ -20,8 +20,8 @@ interface ModelPickerOverlayProps {
 
 export function ModelPickerOverlay({ gateway, onSelect }: ModelPickerOverlayProps) {
   const primarySessionId = useStore($activeSessionId)
-  const primaryModel = useStore($currentModel)
-  const primaryProvider = useStore($currentProvider)
+  const primaryModel = useStore($primaryModel)
+  const primaryProvider = useStore($primaryProvider)
   const focusedRuntimeId = useStore($focusedRuntimeId)
   const focusedState = useStore($focusedSessionState)
   const gatewayOpen = useStore($gatewayState) === 'open'

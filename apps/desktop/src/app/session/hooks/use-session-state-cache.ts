@@ -9,11 +9,11 @@ import { setMutableRef } from '@/lib/mutable-ref'
 import {
   $busy,
   $messages,
+  setActiveSessionModel,
+  setActiveSessionProvider,
   setCurrentFallbackPolicy,
   setCurrentFastMode,
-  setCurrentModel,
   setCurrentPersonality,
-  setCurrentProvider,
   setCurrentReasoningEffort,
   setCurrentServiceTier,
   setCurrentUsage,
@@ -56,8 +56,14 @@ interface SessionStateCacheOptions {
 }
 
 function syncRuntimeMetadataToView(state: ClientSessionState) {
-  setCurrentModel(state.model ?? '')
-  setCurrentProvider(state.provider ?? '')
+  // The runtime mirror, NOT the composer's persisted selection. `state.model`
+  // is stamped from every session.info, so writing it into $currentModel here
+  // rewrote the user's sticky pick on every heartbeat of a spawned session —
+  // the durable half of the #298 leak. gateway-event.ts refuses to call
+  // setCurrentModel on the direct path for exactly this reason; routing the
+  // same value through here was walking around its own guard.
+  setActiveSessionModel(state.model ?? '')
+  setActiveSessionProvider(state.provider ?? '')
   setCurrentFallbackPolicy(state.fallbackPolicy ?? '')
   setCurrentReasoningEffort(state.reasoningEffort ?? '')
   setCurrentServiceTier(state.serviceTier ?? '')
