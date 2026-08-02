@@ -250,6 +250,61 @@ test('a goal composes with delegated and the other overrides', () => {
   })
 })
 
+// ------------------------------------------- declared command allowlist
+
+// This is the one spawn field that WIDENS what a session may do without a
+// person: it says which commands may run when the approval classifier cannot
+// be reached and there is nobody to ask. Both halves are required together —
+// commands with no root could act anywhere on the machine, and a root with no
+// commands allowlists nothing — so accept-and-drop is not an option here.
+test('carries a declared command allowlist when both halves are given', () => {
+  const result = parseSpawnRequest({
+    prompt: 'hi',
+    allowedCommands: [' godot ', '', 'git'],
+    allowedCommandRoot: '  /Users/me/game  ',
+    delegated: true
+  })
+
+  assert.ok('request' in result)
+  assert.deepEqual(result.request, {
+    prompt: 'hi',
+    allowedCommands: ['godot', 'git'],
+    allowedCommandRoot: '/Users/me/game',
+    delegated: true
+  })
+})
+
+test('rejects a declared allowlist that is not an array of strings', () => {
+  assert.ok('error' in parseSpawnRequest({ prompt: 'hi', allowedCommands: 'git', allowedCommandRoot: '/w' }))
+  assert.ok('error' in parseSpawnRequest({ prompt: 'hi', allowedCommands: ['git', 3], allowedCommandRoot: '/w' }))
+  assert.ok('error' in parseSpawnRequest({ prompt: 'hi', allowedCommands: ['git'], allowedCommandRoot: 7 }))
+})
+
+test('rejects an allowlist that names nothing', () => {
+  for (const allowedCommands of [[], ['', '   ']]) {
+    assert.ok('error' in parseSpawnRequest({ prompt: 'hi', allowedCommands, allowedCommandRoot: '/w' }))
+  }
+})
+
+test('rejects either half of the allowlist on its own', () => {
+  assert.ok('error' in parseSpawnRequest({ prompt: 'hi', allowedCommands: ['git'] }))
+  assert.ok('error' in parseSpawnRequest({ prompt: 'hi', allowedCommandRoot: '/w' }))
+  assert.ok('error' in parseSpawnRequest({ prompt: 'hi', allowedCommands: ['git'], allowedCommandRoot: '  ' }))
+})
+
+test('an omitted allowlist leaves an ordinary, fail-closed request', () => {
+  for (const body of [
+    { prompt: 'hi' },
+    { prompt: 'hi', allowedCommands: null, allowedCommandRoot: null },
+    { prompt: 'hi', allowedCommands: undefined, allowedCommandRoot: undefined }
+  ]) {
+    const result = parseSpawnRequest(body)
+
+    assert.ok('request' in result)
+    assert.deepEqual(result.request, { prompt: 'hi' })
+  }
+})
+
 // -------------------------------------------------------------------- server
 
 test('binds loopback only, on an ephemeral port', async () => {

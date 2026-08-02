@@ -229,6 +229,15 @@ async function desktopSessionCreateParams(
     // silently being an ordinary chat that stops after one turn.
     ...(overrides?.goal ? { goal: overrides.goal } : {}),
     ...(overrides?.goal && overrides.goalMaxTurns ? { goal_max_turns: overrides.goalMaxTurns } : {}),
+    // The declared command allowlist is sent only as a pair — the backend
+    // refuses either half alone, since an unscoped command is not a scoped
+    // allowlist and a root scopes nothing on its own.
+    ...(overrides?.allowedCommands?.length && overrides.allowedCommandRoot
+      ? {
+          allowed_commands: overrides.allowedCommands,
+          allowed_command_root: overrides.allowedCommandRoot
+        }
+      : {}),
     fast: selection.fast
   }
 }

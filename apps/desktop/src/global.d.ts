@@ -211,6 +211,10 @@ declare global {
           profile?: string
           // `--toolsets`: pin this one chat's tools; validated backend-side.
           toolsets?: string[]
+          // `--allow-command` / `--allow-command-root`: what this chat may run
+          // without a human when the approval classifier is unreachable.
+          allowedCommands?: string[]
+          allowedCommandRoot?: string
           // `--delegated`: nobody is watching, so the chat must not stop to ask.
           delegated?: boolean
           delegatedTimeoutMs?: number
