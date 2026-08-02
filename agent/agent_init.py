@@ -2307,8 +2307,18 @@ def init_agent(
 
         if auxiliary_route_is_configured():
             # Give module-level auxiliary callers (smart approval, goal judge)
-            # the agent's chat-visible warning channel.
-            set_auxiliary_failure_notifier(agent._emit_auxiliary_failure)
+            # the agent's chat-visible warning channel. Weak, so a
+            # module-global sink never keeps a finished agent alive.
+            import weakref
+
+            _agent_ref = weakref.ref(agent)
+
+            def _route_failure_sink(task, exc, _ref=_agent_ref):
+                live = _ref()
+                if live is not None:
+                    live._emit_auxiliary_failure(task, exc)
+
+            set_auxiliary_failure_notifier(_route_failure_sink)
             _route_warning = preflight_auxiliary_route()
             if _route_warning:
                 logger.warning(_route_warning)
