@@ -4,7 +4,8 @@ name: Lint (ruff + ty)
 #   1. Advisory diff — ruff + ty diagnostics as a diff vs the target branch.
 #      Writes a Markdown summary to the run page. Exit zero always.
 #   2. Blocking ``ruff check .`` — enforces the explicit rules in
-#      ``[tool.ruff.lint.select]`` (currently PLW1514). Failure blocks merge.
+#      ``[tool.ruff.lint.select]`` (currently PLW1514 + F821). Failure
+#      blocks merge.
 #      Separate job so the advisory diff still runs even when enforcement
 #      fails.
 #
@@ -54,9 +55,12 @@ jobs:
       - name: Install ruff + ty
         uses: ./.github/actions/retry
         with:
-          # Pinned, not floating — and doubly so here: the HEAD scan and the
-          # base-worktree scan below must run the *same* linter, or the
-          # "new since base" diff degrades into a linter changelog.
+          # Pinned so this job is reproducible over time: rerunning an old
+          # PR shouldn't produce a different advisory diff just because ruff
+          # released. It also keeps lint_diff.py's parser off ruff's release
+          # schedule — it reads ``code``/``filename``/``location.row`` from
+          # the JSON and falls back to "unknown" if a key moves, which would
+          # go wrong quietly rather than loudly.
           command: >-
             uv tool install ruff==${{ steps.pins.outputs.ruff }} &&
             uv tool install ty==${{ steps.pins.outputs.ty }}
@@ -132,9 +136,11 @@ jobs:
     # Enforce the rules in pyproject.toml [tool.ruff.lint.select]. Currently
     # PLW1514 (unspecified-encoding) — catches bare ``open()`` /
     # ``read_text()`` / ``write_text()`` calls that default to locale
-    # encoding on Windows. Failure here blocks merge; the advisory
-    # ``lint-diff`` job above runs independently so reviewers still get
-    # the diff comment even when enforcement fails.
+    # encoding on Windows — and F821 (undefined-name), the ratchet added
+    # 2026-07-14 after a NameError shipped to main in hermes_cli/doctor.py.
+    # Failure here blocks merge; the advisory ``lint-diff`` job above runs
+    # independently so reviewers still get the diff comment even when
+    # enforcement fails.
     name: ruff enforcement (blocking)
     runs-on: ubuntu-latest
     timeout-minutes: 5
