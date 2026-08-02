@@ -262,6 +262,43 @@ def test_kill_own_subtree_passes_through():
     assert p.returncode in {-signal.SIGTERM, 128 + int(signal.SIGTERM)}
 
 
+def test_kill_pid_that_vanishes_mid_walk_passes_through(monkeypatch):
+    """A PID that dies while we inspect it is not a live foreign process.
+
+    ``psutil.Process(pid)`` still resolves for a child that has exited but
+    hasn't been reaped, and the parent walk then raises ``NoSuchProcess``
+    (``ZombieProcess`` subclasses it). Refusing that case blocks a signal
+    which by definition cannot affect anything, and made the LSP client's
+    shutdown fail whenever the server exited a moment before the SIGTERM —
+    a pure function of runner load. It stays allowed for the same reason
+    the stale-PID branch is: there is nothing left to protect.
+
+    Guard strength is unchanged for live processes: a recycled PID now
+    owned by a foreign process still walks a real parent chain and is
+    still refused (``test_os_kill_blocks_foreign_pid`` covers that).
+    """
+    import psutil
+
+    real_process = psutil.Process
+
+    def _vanishing_process(pid, *args, **kwargs):
+        proc = real_process(pid, *args, **kwargs)
+
+        def _died():
+            raise psutil.NoSuchProcess(pid)
+
+        proc.parents = _died
+        return proc
+
+    p = subprocess.Popen(["sleep", "30"])
+    try:
+        monkeypatch.setattr(psutil, "Process", _vanishing_process)
+        os.kill(p.pid, signal.SIGTERM)  # must not raise
+    finally:
+        monkeypatch.undo()
+        p.wait(timeout=5)
+
+
 def test_subprocess_pkill_with_unrelated_pattern_passes_through():
     """``pkill -f some-unrelated-pattern`` (no hermes/python) is fine."""
     # We don't actually run pkill — just verify the guard would let it

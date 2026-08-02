@@ -78,6 +78,7 @@ DIAGNOSTICS_DOCUMENT_WAIT = 5.0
 DIAGNOSTICS_FULL_WAIT = 10.0
 DIAGNOSTICS_REQUEST_TIMEOUT = 3.0
 PUSH_DEBOUNCE = 0.15
+EXIT_GRACE = 2.0  # seconds to let the server quit on its own before SIGTERM
 SHUTDOWN_GRACE = 1.0  # seconds between SIGTERM and SIGKILL
 
 # Retry policy for transient ContentModified errors.
@@ -481,6 +482,21 @@ class LSPClient:
         self._proc = None
         if proc is None:
             return
+        if proc.returncode is None:
+            # Reap before signalling.  ``returncode is None`` only means
+            # *we* have not observed an exit yet — it is not evidence the
+            # server is still alive.  After the ``exit`` notification the
+            # spec requires the server to quit on its own, and a crashed
+            # one is already gone; in both cases the process can sit as an
+            # unreaped zombie until asyncio's SIGCHLD callback runs, and
+            # on a loaded box that gap is wide.  Skipping this wait means
+            # SIGTERMing a server that is mid-cleanup (truncating its own
+            # cache flush / temp-file removal) or signalling a PID that
+            # has already exited.
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=EXIT_GRACE)
+            except (asyncio.TimeoutError, ProcessLookupError):
+                pass
         if proc.returncode is None:
             try:
                 proc.terminate()
