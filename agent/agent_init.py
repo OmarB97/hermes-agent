@@ -2291,6 +2291,31 @@ def init_agent(
     # ``run_conversation``'s preflight) runs it at most once per agent.
     agent._compression_feasibility_checked = False
 
+    # ── Auxiliary route preflight (auxiliary.route) ─────────────────────────
+    # Inert unless a route is configured: both calls below short-circuit on a
+    # single (already-cached) config read. When a route IS set, resolve it once
+    # here and say so loudly if it yields no client or only the
+    # "no-key-required" placeholder — otherwise that misconfiguration is
+    # invisible until an unattended run stalls, because tools/approval.py
+    # swallows the resulting 401 and escalates to a human prompt.
+    try:
+        from agent.auxiliary_client import (
+            auxiliary_route_is_configured,
+            preflight_auxiliary_route,
+            set_auxiliary_failure_notifier,
+        )
+
+        if auxiliary_route_is_configured():
+            # Give module-level auxiliary callers (smart approval, goal judge)
+            # the agent's chat-visible warning channel.
+            set_auxiliary_failure_notifier(agent._emit_auxiliary_failure)
+            _route_warning = preflight_auxiliary_route()
+            if _route_warning:
+                logger.warning(_route_warning)
+                agent._emit_warning(_route_warning)
+    except Exception:
+        logger.debug("auxiliary route preflight failed", exc_info=True)
+
     # Snapshot primary runtime for per-turn restoration.  When fallback
     # activates during a turn, the next turn restores these values so the
     # preferred model gets a fresh attempt each time.  Uses a single dict
