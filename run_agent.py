@@ -410,6 +410,15 @@ class AIAgent:
         "have been dropped to keep the conversation alive. See issue #15236.]"
     )
 
+    # ``__init__`` always assigns this, but the status emitters below read it on
+    # side paths (fallback activation, degraded-path warnings) that partially
+    # constructed agents also reach — notably ``AIAgent.__new__`` doubles, which
+    # is how the suite builds agents. Without a class-level default those reads
+    # raise ``AttributeError`` inside an ``except Exception`` and are reported as
+    # an unrelated failure ("Failed to activate fallback ...") rather than a
+    # missing attribute. Defaulting to None keeps the emitters no-ops instead.
+    status_callback = None
+
     @property
     def base_url(self) -> str:
         return self._base_url
