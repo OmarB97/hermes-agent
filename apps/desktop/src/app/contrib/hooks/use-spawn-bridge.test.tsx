@@ -137,6 +137,27 @@ it('sends no overrides when none were requested', async () => {
   expect(submitText.mock.calls[0][1]).toEqual({ attachments: [] })
 })
 
+// `toolsets` used to ride this payload and die here: the hook copies
+// model/provider/profile into `SessionCreateOverrides` and there is no fourth
+// field, because the gateway's `session.create` takes no toolsets parameter —
+// it resolves `enabled_toolsets` per process in `_make_agent`. The CLI flag and
+// the payload field are gone and `parseSpawnRequest` now rejects the key
+// outright, so this pins the last leg: even if a stale preload or a hand-rolled
+// IPC message smuggles one in, it must not reappear as a session override that
+// the backend would then ignore.
+it('ignores a toolsets field smuggled in by an out-of-date caller', async () => {
+  const { submitText } = mount()
+
+  await act(async () => {
+    spawnHandlers[0]({ prompt: 'go', profile: 'work', toolsets: ['browser', 'git'] })
+  })
+
+  expect(submitText).toHaveBeenCalledWith('go', {
+    attachments: [],
+    sessionOverrides: { profile: 'work' }
+  })
+})
+
 // ------------------------------------------------------------- delegated mode
 
 // The contract has to reach the model, and it has to reach it BEFORE the brief

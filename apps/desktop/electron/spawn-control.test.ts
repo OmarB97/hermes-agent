@@ -103,13 +103,12 @@ test('omitted overrides stay omitted rather than becoming empty strings', () => 
   assert.deepEqual(Object.keys(result.request), ['prompt'])
 })
 
-test('carries model, provider, profile and toolsets when given', () => {
+test('carries model, provider and profile when given', () => {
   const result = parseSpawnRequest({
     prompt: 'hi',
     model: ' deepseek-v4-flash-0731-ds4 ',
     provider: 'ai-router',
-    profile: 'work',
-    toolsets: [' skills ', '', 'git']
+    profile: 'work'
   })
 
   assert.ok('request' in result)
@@ -117,15 +116,39 @@ test('carries model, provider, profile and toolsets when given', () => {
     prompt: 'hi',
     model: 'deepseek-v4-flash-0731-ds4',
     provider: 'ai-router',
-    profile: 'work',
-    toolsets: ['skills', 'git']
+    profile: 'work'
   })
 })
 
 test('rejects wrong-typed overrides', () => {
   assert.ok('error' in parseSpawnRequest({ prompt: 'hi', model: 7 }))
-  assert.ok('error' in parseSpawnRequest({ prompt: 'hi', toolsets: 'skills' }))
-  assert.ok('error' in parseSpawnRequest({ prompt: 'hi', toolsets: ['ok', 3] }))
+})
+
+// `toolsets` was accepted here in #298 and silently dropped: the renderer only
+// ever copied model/provider/profile into its session overrides, and there was
+// nowhere further to put it — the gateway's `session.create` has no toolsets
+// parameter, and `_make_agent` resolves `enabled_toolsets` from the process env
+// + config. Refusing the key is what stops the accept-and-drop from simply
+// moving down a layer once the CLI flag is gone.
+test('rejects toolsets rather than accepting a value it would drop', () => {
+  for (const toolsets of [['skills', 'git'], [], 'skills', ['ok', 3]]) {
+    const result = parseSpawnRequest({ prompt: 'hi', toolsets })
+
+    assert.ok('error' in result, `expected toolsets: ${JSON.stringify(toolsets)} to be rejected`)
+    assert.match(result.error, /toolsets is not supported/)
+  }
+})
+
+// An absent/null key is not a caller asking for toolsets, so it must stay a
+// perfectly ordinary spawn — otherwise every request would have to stop
+// mentioning the field at all.
+test('an omitted or null toolsets key leaves an ordinary request', () => {
+  for (const body of [{ prompt: 'hi' }, { prompt: 'hi', toolsets: null }, { prompt: 'hi', toolsets: undefined }]) {
+    const result = parseSpawnRequest(body)
+
+    assert.ok('request' in result)
+    assert.deepEqual(Object.keys(result.request), ['prompt'])
+  }
 })
 
 // ------------------------------------------------------------------ delegated

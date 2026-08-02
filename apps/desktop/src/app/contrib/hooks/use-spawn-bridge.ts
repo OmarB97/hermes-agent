@@ -60,7 +60,6 @@ interface SpawnPayload {
   model?: string
   provider?: string
   profile?: string
-  toolsets?: string[]
   delegated?: boolean
   delegatedTimeoutMs?: number
 }

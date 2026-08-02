@@ -2,7 +2,8 @@
 
 Covers the CLI half of the desktop spawn control channel:
   - happy path: exact POST URL/headers/body, including omitted None keys
-    and comma-separated --toolsets normalization
+  - toolsets never reach the wire (the flag is gone; see
+    test_toolsets_never_reaches_the_wire)
   - control file missing (desktop app not running)
   - control file present but corrupt / missing required fields
   - --delegated / --delegated-timeout: wire shape and the flag combinations
@@ -40,7 +41,6 @@ def _ns(**kw):
         model=None,
         provider=None,
         profile=None,
-        toolsets=None,
         delegated=False,
         delegated_timeout=None,
     )
@@ -107,14 +107,14 @@ class TestHappyPath:
         assert captured["headers"]["X-hermes-desktop-token"] == "tok_abc"
         assert captured["headers"]["Content-type"] == "application/json"
         assert captured["timeout"] == 10.0
-        # Only `prompt` was set — model/provider/profile/toolsets must be
-        # OMITTED entirely, never sent as JSON null.
+        # Only `prompt` was set — model/provider/profile must be OMITTED
+        # entirely, never sent as JSON null.
         assert captured["body"] == {"prompt": "hello world"}
 
         out = capsys.readouterr().out
         assert "✓" in out
 
-    def test_includes_optional_fields_and_splits_toolsets(self):
+    def test_includes_optional_fields(self):
         _write_control_file(port=9999, token="tok_xyz")
         captured: dict = {}
 
@@ -129,7 +129,6 @@ class TestHappyPath:
                     model="deepseek-v4-flash-0731-ds4",
                     provider="ai-router",
                     profile="work",
-                    toolsets="browser, terminal ,, computer_use",
                 )
             )
 
@@ -138,10 +137,24 @@ class TestHappyPath:
             "model": "deepseek-v4-flash-0731-ds4",
             "provider": "ai-router",
             "profile": "work",
-            "toolsets": ["browser", "terminal", "computer_use"],
         }
 
-    def test_blank_toolsets_flag_is_omitted(self):
+    def test_toolsets_never_reaches_the_wire(self):
+        """A stray `toolsets` attribute must not be picked up into the body.
+
+        `--toolsets` shipped in #298 and was dead on arrival: the value was
+        POSTed here, validated by the control server, forwarded to the
+        renderer, and then dropped — the renderer only ever copied
+        model/provider/profile into its session overrides, and there was
+        nothing further to copy into, since the gateway's `session.create`
+        takes no toolsets parameter and `_make_agent` resolves
+        `enabled_toolsets` per process.
+
+        The flag is gone from the parser, so an args namespace can only carry
+        `toolsets` if a caller builds one by hand. Body-building must ignore it
+        rather than resurrect a field the app now rejects outright (see
+        apps/desktop/electron/spawn-control.ts).
+        """
         _write_control_file()
         captured: dict = {}
 
@@ -149,10 +162,13 @@ class TestHappyPath:
             captured["body"] = json.loads(req.data.decode())
             return _fake_http_202()
 
-        with patch.object(ds.urllib.request, "urlopen", side_effect=fake_urlopen):
-            ds.cmd_desktop_spawn(_ns(toolsets=" , ,"))
+        args = _ns(prompt="do the thing")
+        args.toolsets = "browser,terminal"
 
-        assert "toolsets" not in captured["body"]
+        with patch.object(ds.urllib.request, "urlopen", side_effect=fake_urlopen):
+            ds.cmd_desktop_spawn(args)
+
+        assert captured["body"] == {"prompt": "do the thing"}
 
 
 def _use_profile_home(monkeypatch, name="meshboard-worker"):

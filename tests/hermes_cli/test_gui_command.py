@@ -370,7 +370,6 @@ def test_desktop_spawn_parser_dispatches_to_spawn_handler_not_gui():
     assert spawn.model is None
     assert spawn.provider is None
     assert spawn.profile is None
-    assert spawn.toolsets is None
     assert spawn.delegated is False
     assert spawn.delegated_timeout is None
 
@@ -380,19 +379,40 @@ def test_desktop_spawn_parser_dispatches_to_spawn_handler_not_gui():
             "-m", "deepseek-v4-flash-0731-ds4",
             "--provider", "ai-router",
             "--profile", "work",
-            "--toolsets", "a,b",
         ]
     )
     assert full.func is cli_main.cmd_desktop_spawn
     assert full.model == "deepseek-v4-flash-0731-ds4"
     assert full.provider == "ai-router"
     assert full.profile == "work"
-    assert full.toolsets == "a,b"
 
     # The `gui` alias must carry the nested verb too.
     via_alias = parser.parse_args(["gui", "spawn", "via alias"])
     assert via_alias.func is cli_main.cmd_desktop_spawn
     assert via_alias.prompt == "via alias"
+
+
+def test_desktop_spawn_rejects_toolsets_flag():
+    """`--toolsets` must fail loudly, not be accepted and ignored.
+
+    It shipped in #298 and never did anything: the value reached the renderer
+    and was dropped, because the gateway resolves `enabled_toolsets` per
+    process (`_make_agent`) and its `session.create` takes no toolsets
+    parameter. Removing the flag makes argparse reject it (exit 2), which is
+    the honest answer; this guards against someone re-adding the flag without
+    also wiring a per-session binding for it to land in.
+    """
+    from hermes_cli.subcommands.gui import build_gui_parser
+
+    parser = argparse.ArgumentParser(prog="hermes")
+    subparsers = parser.add_subparsers(dest="command")
+    build_gui_parser(
+        subparsers, cmd_gui=cli_main.cmd_gui, cmd_desktop_spawn=cli_main.cmd_desktop_spawn
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["desktop", "spawn", "hi", "--toolsets", "browser,git"])
+    assert exc.value.code == 2
 
 
 def test_desktop_spawn_requires_prompt_argument():
