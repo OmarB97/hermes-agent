@@ -1094,6 +1094,26 @@ def _profile_home(profile: str | None) -> Path | None:
     return home if (home / "state.db").exists() or home.exists() else None
 
 
+@contextlib.contextmanager
+def _profile_home_bound(profile_home: Path | str | None):
+    """Bind a session's own HERMES_HOME for the block (no-op without one).
+
+    In app-global remote mode one backend serves every profile, so anything a
+    handler resolves *from* HERMES_HOME — ``config.yaml`` (hence the default
+    model) and the profile's own name — silently answers for the LAUNCH profile
+    unless the session's home is bound first. The per-turn binding happens on
+    the turn thread; RPC handlers run before it, so they must bind it
+    themselves. Accepts a ``Path`` or the ``str`` sessions carry in
+    ``profile_home``; falsy means "launch profile", which is already ambient.
+    """
+    token = set_hermes_home_override(profile_home) if profile_home else None
+    try:
+        yield
+    finally:
+        if token is not None:
+            reset_hermes_home_override(token)
+
+
 def _profile_scoped(handler):
     """Bind ``params['profile']``'s HERMES_HOME around a pet RPC handler.
 
@@ -1995,7 +2015,24 @@ def _ensure_session_db_row(session: dict) -> None:
     # so resume restores effort + fast too, not just the model name.
     override = session.get("model_override")
     override = override if isinstance(override, dict) else {}
-    row_model = str(override.get("model") or "").strip() or _resolve_model()
+    row_model = str(override.get("model") or "").strip()
+    # Everything below reads HERMES_HOME, and this helper runs on the RPC thread
+    # — before the per-turn binding in the turn thread. Unbound, `_resolve_model`
+    # reads the LAUNCH profile's config.yaml and stamps ITS default onto a
+    # foreign profile's row, which the same first-writer-wins COALESCE described
+    # above then makes permanent: the agent's own correct lazy-create can no
+    # longer repair it. Bind the session's own home so the fallback names the
+    # model that profile is actually configured for.
+    with _profile_home_bound(profile_home):
+        row_model = row_model or _resolve_model()
+        # Attribute the row to its profile from the start. The agent backfills
+        # this on its first turn (run_agent.py), so today an unattributed row is
+        # only briefly wrong — but a session whose turn never runs (a spawn that
+        # dies before its first prompt) keeps a NULL profile_name forever.
+        # "default" → NULL mirrors the agent's own normalization, so the two
+        # writers can't disagree under COALESCE.
+        resolved_profile = _current_profile_name()
+        row_profile_name = None if resolved_profile == "default" else resolved_profile
     model_config: dict = {}
     for src_key, cfg_key in (
         ("model", "model"),
@@ -2049,6 +2086,7 @@ def _ensure_session_db_row(session: dict) -> None:
             model_config=model_config or None,
             parent_session_id=parent_session_id,
             cwd=_session_cwd(session) if session.get("explicit_cwd") else None,
+            profile_name=row_profile_name,
         )
     except Exception:
         logger.debug("failed to persist desktop session row", exc_info=True)
@@ -3897,6 +3935,14 @@ def _session_info(agent, session: dict | None = None) -> dict:
     )
     cfg_personality = ((_load_cfg().get("display") or {}).get("personality") or "")
     personality = (session or {}).get("personality", cfg_personality)
+    # Name the session's OWN profile. Only the deferred build calls this with the
+    # profile home already bound; every other caller is on a thread where the
+    # ambient HERMES_HOME is the launch profile's, so resolving it here (rather
+    # than at 28 call sites) is what stops the client seeing profile_name flip
+    # from the launcher's name to the session's between session.create and the
+    # build's session.info.
+    with _profile_home_bound((session or {}).get("profile_home")):
+        profile_name = _current_profile_name()
     reasoning_config = getattr(agent, "reasoning_config", None)
     reasoning_effort = ""
     if isinstance(reasoning_config, dict):
@@ -3951,7 +3997,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "update_behind": None,
         "update_command": "",
         "usage": _session_usage_snapshot(session),
-        "profile_name": _current_profile_name(),
+        "profile_name": profile_name,
     }
     try:
         from hermes_cli.config import (
@@ -6671,6 +6717,15 @@ def _(rid, params: dict) -> dict:
     _schedule_agent_build(sid)
     _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
 
+    # The two HERMES_HOME-derived fields of the response below must answer for
+    # the profile this chat was created *under*. This handler runs on the RPC
+    # thread with nothing bound, so unbound they report the launch profile and
+    # the client sees both flip once the deferred build (which does bind the
+    # home) emits its session.info.
+    with _profile_home_bound(profile_home):
+        create_default_model = _resolve_model() if not session_model_override else ""
+        create_profile_name = _current_profile_name()
+
     return _ok(
         rid,
         {
@@ -6686,7 +6741,7 @@ def _(rid, params: dict) -> dict:
                 "model": (
                     session_model_override.get("model")
                     if session_model_override
-                    else _resolve_model()
+                    else create_default_model
                 ),
                 **(
                     {"provider": session_model_override["provider"]}
@@ -6700,7 +6755,7 @@ def _(rid, params: dict) -> dict:
                 "project": _project_info_for_cwd(_sessions[sid]["cwd"]),
                 "lazy": True,
                 "desktop_contract": DESKTOP_BACKEND_CONTRACT,
-                "profile_name": _current_profile_name(),
+                "profile_name": create_profile_name,
             },
         },
     )
@@ -6890,19 +6945,29 @@ def _lazy_resume_info(
     model: str = "",
     provider: str = "",
     stored_session: dict | None = None,
+    profile_home: Path | str | None = None,
 ) -> dict:
     """session.info for a not-yet-built session (the shape session.create
-    returns). tools/skills land later when the deferred build emits session.info."""
+    returns). tools/skills land later when the deferred build emits session.info.
+
+    ``profile_home`` is the resumed session's own home: without it the two
+    HERMES_HOME-derived fields (the model fallback and the profile name) answer
+    for the launch profile, so the client paints the wrong ones until the
+    deferred build's session.info corrects them.
+    """
+    with _profile_home_bound(profile_home):
+        resolved_model = model or _resolve_model()
+        profile_name = _current_profile_name()
     info = {
         "cwd": cwd,
         "branch": _git_branch_for_cwd(cwd),
         "project": _project_info_for_cwd(cwd),
-        "model": model or _resolve_model(),
+        "model": resolved_model,
         "tools": {},
         "skills": {},
         "lazy": True,
         "desktop_contract": DESKTOP_BACKEND_CONTRACT,
-        "profile_name": _current_profile_name(),
+        "profile_name": profile_name,
         "usage": _stored_session_usage(stored_session),
     }
     if provider:
@@ -7143,7 +7208,9 @@ def _(rid, params: dict) -> dict:
                 "resumed": target,
                 "message_count": len(messages),
                 "messages": messages,
-                "info": _lazy_resume_info(cwd, stored_session=found),
+                "info": _lazy_resume_info(
+                    cwd, stored_session=found, profile_home=profile_home
+                ),
                 "inflight": None,
                 "running": child_running,
                 "session_key": target,
@@ -7234,6 +7301,7 @@ def _(rid, params: dict) -> dict:
                     model=model_override.get("model") or "",
                     provider=overrides.get("provider_override") or "",
                     stored_session=found,
+                    profile_home=profile_home,
                 ),
                 "inflight": None,
                 "running": False,

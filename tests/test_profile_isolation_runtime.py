@@ -205,3 +205,170 @@ class TestThreadContextPropagation:
 
         seen = _under_override(prof_b, lambda: asyncio.run(driver()))
         assert seen == str(prof_b)
+
+
+# ---------------------------------------------------------------------------
+# M3 — RPC handlers that resolve HERMES_HOME before the per-turn binding
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def gateway_two_profiles(tmp_path, monkeypatch):
+    """A real profile root: launch profile "launcher" + foreign profile "worker".
+
+    Their ``config.yaml`` files name DIFFERENT default models, so any value that
+    leaks from the launch profile is visible in the assertion rather than
+    coincidentally equal (the reason the field-reported rows were ambiguous —
+    both real profiles happened to name the same default).
+
+    Yields ``(server, launcher_home, worker_home)`` with the gateway module
+    posed as a backend launched under "launcher": ``HERMES_HOME`` is what the
+    profile-name resolver reads, ``server._hermes_home`` the import-frozen path
+    ``_load_cfg`` falls back to when no override is bound.
+    """
+    root = tmp_path / "hermes-root"
+    launcher = root / "profiles" / "launcher"
+    worker = root / "profiles" / "worker"
+    for home, model in ((launcher, "launcher/model-A"), (worker, "worker/model-B")):
+        home.mkdir(parents=True)
+        (home / "config.yaml").write_text(
+            f'model:\n  default: "{model}"\n', encoding="utf-8"
+        )
+
+    monkeypatch.setenv("HERMES_HOME", str(launcher))
+    # _resolve_model checks these first; the host's environment must not decide
+    # the answer for a test about which config.yaml gets read.
+    monkeypatch.delenv("HERMES_MODEL", raising=False)
+    monkeypatch.delenv("HERMES_INFERENCE_MODEL", raising=False)
+
+    from tui_gateway import server
+
+    monkeypatch.setattr(server, "_hermes_home", launcher)
+    # _load_cfg caches on the resolved path; start from cold and restore after.
+    monkeypatch.setattr(server, "_cfg_cache", None)
+    monkeypatch.setattr(server, "_cfg_path", None)
+    monkeypatch.setattr(server, "_cfg_mtime", None)
+    return server, launcher, worker
+
+
+def _row(home: Path, session_key: str) -> dict | None:
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=home / "state.db")
+    try:
+        return db.get_session(session_key)
+    finally:
+        db.close()
+
+
+class TestSessionRowIdentityUsesOwnProfile:
+    """``_ensure_session_db_row`` runs on the RPC thread, before the turn thread
+    binds HERMES_HOME — so it must bind the session's home itself.
+
+    This is a permanent corruption, not a transient one: ``_insert_session_row``
+    upserts under ``model = COALESCE(sessions.model, excluded.model)``, so the
+    agent's own later (correct) lazy-create cannot repair a wrong first write.
+    """
+
+    def test_row_model_falls_back_to_the_sessions_own_profile_default(
+        self, gateway_two_profiles
+    ):
+        server, _launcher, worker = gateway_two_profiles
+
+        server._ensure_session_db_row(
+            {
+                "session_key": "s-worker",
+                "profile_home": str(worker),
+                "model_override": None,
+            }
+        )
+
+        row = _row(worker, "s-worker")
+        assert row is not None, "row must land in the worker profile's state.db"
+        assert row["model"] == "worker/model-B"
+        assert row["model"] != "launcher/model-A", "launch profile's default leaked"
+
+    def test_row_is_attributed_to_its_profile(self, gateway_two_profiles):
+        """A session whose first turn never runs keeps whatever this write left,
+        so the row has to name its profile up front rather than rely on the
+        agent's backfill."""
+        server, _launcher, worker = gateway_two_profiles
+
+        server._ensure_session_db_row(
+            {"session_key": "s-worker", "profile_home": str(worker)}
+        )
+
+        assert _row(worker, "s-worker")["profile_name"] == "worker"
+
+    def test_launch_profile_session_keeps_its_own_default(self, gateway_two_profiles):
+        """Control: binding the session's home must not mean "always foreign"."""
+        server, launcher, _worker = gateway_two_profiles
+
+        server._ensure_session_db_row(
+            {"session_key": "s-launch", "profile_home": str(launcher)}
+        )
+
+        row = _row(launcher, "s-launch")
+        assert row["model"] == "launcher/model-A"
+        assert row["profile_name"] == "launcher"
+
+    def test_explicit_composer_pick_still_wins(self, gateway_two_profiles):
+        """The anti-race intent is unchanged: an explicit pick is never
+        overwritten by any profile's default."""
+        server, _launcher, worker = gateway_two_profiles
+
+        server._ensure_session_db_row(
+            {
+                "session_key": "s-picked",
+                "profile_home": str(worker),
+                "model_override": {"model": "picked/model-C", "provider": "openrouter"},
+            }
+        )
+
+        row = _row(worker, "s-picked")
+        assert row["model"] == "picked/model-C"
+
+
+class TestSessionProfileNameDoesNotFlip:
+    """``session.create``/lazy-resume answered with the LAUNCH profile's name
+    while the deferred build — the one caller that DOES bind the home — answered
+    with the session's, so the client watched ``profile_name`` change under it.
+    """
+
+    def test_session_create_reports_the_requested_profile(
+        self, gateway_two_profiles, monkeypatch
+    ):
+        server, _launcher, _worker = gateway_two_profiles
+        # Building the agent is a separate (network-touching) concern; what is
+        # under test is the response the client paints from, sent before it.
+        monkeypatch.setattr(server, "_schedule_agent_build", lambda _sid: None)
+        monkeypatch.setattr(
+            server, "_schedule_session_cap_enforcement", lambda *a, **k: None
+        )
+
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.create",
+                "params": {"cols": 80, "profile": "worker"},
+            }
+        )
+        sid = resp["result"]["session_id"]
+        try:
+            info = resp["result"]["info"]
+            assert info["profile_name"] == "worker"
+            assert info["model"] == "worker/model-B"
+            # ...and the deferred build's session.info agrees, so nothing flips.
+            assert (
+                server._session_info(None, server._sessions[sid])["profile_name"]
+                == "worker"
+            )
+        finally:
+            server._sessions.pop(sid, None)
+
+    def test_lazy_resume_info_reports_the_sessions_profile(self, gateway_two_profiles):
+        server, _launcher, worker = gateway_two_profiles
+
+        info = server._lazy_resume_info(str(worker), profile_home=str(worker))
+
+        assert info["profile_name"] == "worker"
+        assert info["model"] == "worker/model-B"
