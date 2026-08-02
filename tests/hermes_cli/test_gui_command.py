@@ -371,6 +371,8 @@ def test_desktop_spawn_parser_dispatches_to_spawn_handler_not_gui():
     assert spawn.provider is None
     assert spawn.profile is None
     assert spawn.toolsets is None
+    assert spawn.delegated is False
+    assert spawn.delegated_timeout is None
 
     full = parser.parse_args(
         [
@@ -405,6 +407,33 @@ def test_desktop_spawn_requires_prompt_argument():
     with pytest.raises(SystemExit) as exc:
         parser.parse_args(["desktop", "spawn"])
     assert exc.value.code == 2
+
+
+def test_desktop_spawn_delegated_flags_parse():
+    """`--delegated` is a plain switch; its timeout is seconds, as a float.
+
+    Both must default to "off"/"unset" so that adding them cannot change what
+    an existing `hermes desktop spawn "..."` does.
+    """
+    from hermes_cli.subcommands.gui import build_gui_parser
+
+    parser = argparse.ArgumentParser(prog="hermes")
+    subparsers = parser.add_subparsers(dest="command")
+    build_gui_parser(
+        subparsers, cmd_gui=cli_main.cmd_gui, cmd_desktop_spawn=cli_main.cmd_desktop_spawn
+    )
+
+    delegated = parser.parse_args(
+        ["desktop", "spawn", "hi", "--delegated", "--delegated-timeout", "45.5"]
+    )
+    assert delegated.func is cli_main.cmd_desktop_spawn
+    assert delegated.delegated is True
+    assert delegated.delegated_timeout == 45.5
+
+    # The flag alone is the common case: the app supplies the default wait.
+    bare = parser.parse_args(["desktop", "spawn", "hi", "--delegated"])
+    assert bare.delegated is True
+    assert bare.delegated_timeout is None
 
 
 def test_desktop_spawn_example_model_appears_only_in_help_text():

@@ -472,6 +472,11 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         startingStoredSessionId = selectedStoredSessionIdRef.current
         startingRouteToken = getRouteToken()
 
+        // Tell the caller which chat this became, now that the drift check has
+        // confirmed it is really ours. A spawn hangs its per-session state
+        // (delegated mode) off this — it has no other way to learn the id.
+        options?.onSessionCreated?.(sessionId)
+
         seedOptimistic(sessionId)
       }
 

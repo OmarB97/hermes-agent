@@ -1940,6 +1940,7 @@ export const zh: Translations = {
       backgroundRunning: '后台任务运行中',
       handoffOrigin: platform => `从 ${platform} 转接`,
       ownedByProfile: profile => `配置档：${profile}`,
+      delegatedRun: '无人值守运行 — 自行回答问题',
       renamed: '已重命名',
       renameFailed: '重命名失败',
       renameTitle: '重命名会话',
@@ -2688,7 +2689,8 @@ export const zh: Translations = {
       placeholder: '输入你的答案…',
       skip: '跳过',
       skipped: '已跳过',
-      continueLabel: '继续'
+      continueLabel: '继续',
+      autoAnswered: wait => `${wait}内无人回答。此对话以无人值守方式启动，因此 Hermes 代为回答并让它继续运行。`
     },
     tool: {
       code: '代码',

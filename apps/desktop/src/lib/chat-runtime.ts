@@ -59,6 +59,7 @@ export function createClientSessionState(
     interrupted: false,
     interimBoundaryPending: false,
     needsInput: false,
+    delegatedTimeoutMs: null,
     turnStartedAt: null
   }
 }

@@ -1631,6 +1631,7 @@ export const zhHant = defineLocale({
       backgroundRunning: '背景任務執行中',
       handoffOrigin: platform => `從 ${platform} 轉接`,
       ownedByProfile: profile => `設定檔：${profile}`,
+      delegatedRun: '無人值守執行 — 自行回答問題',
       renamed: '已重新命名',
       renameFailed: '重新命名失敗',
       renameTitle: '重新命名工作階段',
@@ -2372,7 +2373,8 @@ export const zhHant = defineLocale({
       placeholder: '輸入您的答案…',
       skip: '略過',
       skipped: '已略過',
-      continueLabel: '繼續'
+      continueLabel: '繼續',
+      autoAnswered: wait => `${wait}內無人回答。此對話以無人值守方式啟動，因此 Hermes 代為回答並讓它繼續執行。`
     },
     tool: {
       code: '程式碼',

@@ -164,6 +164,11 @@ export interface ClientSessionState {
   /** A blocking clarify prompt is waiting on the user for this session. Drives
    *  the sidebar "needs input" indicator; cleared when the turn resumes/ends. */
   needsInput: boolean
+  /** Set when `hermes desktop spawn --delegated` started this chat: how long a
+   *  clarify prompt here may wait for a person before the app answers it and
+   *  lets the run continue. Null for an ordinary attended chat — nobody is
+   *  waiting on a human who is right there. */
+  delegatedTimeoutMs: number | null
   /** Epoch ms the current turn started, or null when idle. Per-session so a
    *  background turn's elapsed timer keeps counting while another session is
    *  focused, and switching sessions doesn't zero a still-running turn's clock.

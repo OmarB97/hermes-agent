@@ -128,6 +128,44 @@ test('rejects wrong-typed overrides', () => {
   assert.ok('error' in parseSpawnRequest({ prompt: 'hi', toolsets: ['ok', 3] }))
 })
 
+// ------------------------------------------------------------------ delegated
+
+test('carries the delegated flag and its wait', () => {
+  const result = parseSpawnRequest({ prompt: 'hi', delegated: true, delegatedTimeoutMs: 30_000 })
+
+  assert.ok('request' in result)
+  assert.equal(result.request.delegated, true)
+  assert.equal(result.request.delegatedTimeoutMs, 30_000)
+})
+
+// `delegated: false` is what an ordinary spawn sends if a caller sets it
+// explicitly; it must land as a plain attended request, not a key that later
+// code has to keep remembering to check for falseness.
+test('an explicit delegated: false leaves an ordinary request', () => {
+  const result = parseSpawnRequest({ prompt: 'hi', delegated: false })
+
+  assert.ok('request' in result)
+  assert.deepEqual(Object.keys(result.request), ['prompt'])
+})
+
+test('rejects a non-boolean delegated', () => {
+  assert.ok('error' in parseSpawnRequest({ prompt: 'hi', delegated: 'yes' }))
+  assert.ok('error' in parseSpawnRequest({ prompt: 'hi', delegated: 1 }))
+})
+
+test('rejects a wait that is not a usable number', () => {
+  for (const value of ['120', Number.NaN, Number.POSITIVE_INFINITY, 0, -5]) {
+    assert.ok('error' in parseSpawnRequest({ prompt: 'hi', delegated: true, delegatedTimeoutMs: value }), String(value))
+  }
+})
+
+// A wait with nothing to wait for means the caller meant something we are not
+// doing. Saying so beats running an attended session they think is delegated.
+test('rejects a wait on a spawn that is not delegated', () => {
+  assert.ok('error' in parseSpawnRequest({ prompt: 'hi', delegatedTimeoutMs: 30_000 }))
+  assert.ok('error' in parseSpawnRequest({ prompt: 'hi', delegated: false, delegatedTimeoutMs: 30_000 }))
+})
+
 // -------------------------------------------------------------------- server
 
 test('binds loopback only, on an ephemeral port', async () => {

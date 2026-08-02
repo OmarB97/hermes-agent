@@ -1760,6 +1760,7 @@ export const en: Translations = {
       backgroundRunning: 'Background task running',
       handoffOrigin: platform => `Handed off from ${platform}`,
       ownedByProfile: profile => `Profile: ${profile}`,
+      delegatedRun: 'Unattended run — answers its own questions',
       renamed: 'Renamed',
       renameFailed: 'Rename failed',
       renameTitle: 'Rename session',
@@ -2525,7 +2526,9 @@ export const en: Translations = {
       placeholder: 'Type your answer…',
       skip: 'Skip',
       skipped: 'Skipped',
-      continueLabel: 'Continue'
+      continueLabel: 'Continue',
+      autoAnswered: wait =>
+        `No one answered within ${wait}. This chat was started to run unattended, so Hermes answered for you and let it carry on.`
     },
     tool: {
       code: 'Code',

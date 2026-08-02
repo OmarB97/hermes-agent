@@ -1683,6 +1683,7 @@ export const ja = defineLocale({
       backgroundRunning: 'バックグラウンドタスク実行中',
       handoffOrigin: platform => `${platform} から引き継ぎ`,
       ownedByProfile: profile => `プロファイル: ${profile}`,
+      delegatedRun: '無人実行 — 質問には自動で回答します',
       renamed: '名前を変更しました',
       renameFailed: '名前の変更に失敗しました',
       renameTitle: 'セッションの名前を変更',
@@ -2444,7 +2445,9 @@ export const ja = defineLocale({
       placeholder: '回答を入力…',
       skip: 'スキップ',
       skipped: 'スキップ済み',
-      continueLabel: '続行'
+      continueLabel: '続行',
+      autoAnswered: wait =>
+        `${wait}以内に誰も回答しませんでした。このチャットは無人実行として開始されたため、Hermes が代わりに回答して続行しました。`
     },
     tool: {
       code: 'コード',
