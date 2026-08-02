@@ -894,6 +894,7 @@ export function ChatBar({
                     }
                   }}
                   onEdit={beginQueuedEdit}
+                  onRetry={id => void sendQueuedNow(id)}
                   onSendNow={id => void sendQueuedNow(id)}
                 />
               ) : null

@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import pytest
 
+from cli import starts_like_path as _real_starts_like_path
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from hermes_cli.active_sessions import active_session_registry_snapshot
 from hermes_cli.browser_connect import ChromeDebugLaunch
@@ -5936,6 +5937,7 @@ def test_image_attach_appends_local_image(monkeypatch):
     }
     fake_cli._split_path_input = lambda raw: (raw, "")
     fake_cli._resolve_attachment_path = lambda raw: Path("/tmp/cat.png")
+    fake_cli.starts_like_path = _real_starts_like_path
 
     server._sessions["sid"] = _session()
     monkeypatch.setitem(sys.modules, "cli", fake_cli)
@@ -5967,6 +5969,7 @@ def test_image_attach_accepts_unquoted_screenshot_path_with_spaces(monkeypatch):
         "2026-04-21 at 1.04.43 PM.png",
     )
     fake_cli._resolve_attachment_path = lambda raw: None
+    fake_cli.starts_like_path = _real_starts_like_path
 
     server._sessions["sid"] = _session()
     monkeypatch.setitem(sys.modules, "cli", fake_cli)
@@ -5983,6 +5986,109 @@ def test_image_attach_accepts_unquoted_screenshot_path_with_spaces(monkeypatch):
     assert resp["result"]["path"] == str(screenshot)
     assert resp["result"]["remainder"] == ""
     assert len(server._sessions["sid"]["attached_images"]) == 1
+
+
+# The four tests below exercise the real `cli` resolution chain end-to-end
+# (no `fake_cli` double) per AGENTS.md's "E2E validation, not just green unit
+# mocks" guidance — they cover the image.attach#4016 error-message regression
+# where `_split_path_input`'s first-space cut leaked into the error text.
+
+
+def test_image_attach_resolves_real_path_with_spaces(tmp_path):
+    """An existing absolute path with spaces attaches — spaces never block
+    resolution; only the error-message text was ever affected by the bug."""
+    img_path = tmp_path / "Application Support" / "Hermes Desktop" / "season poster.png"
+    img_path.parent.mkdir(parents=True)
+    img_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    server._sessions["sid"] = _session()
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "image.attach",
+                "params": {"session_id": "sid", "path": str(img_path)},
+            }
+        )
+
+        assert resp["result"]["attached"] is True
+        assert resp["result"]["path"] == str(img_path)
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_image_attach_missing_path_with_spaces_reports_full_path(tmp_path):
+    """A missing absolute path with spaces reports the FULL path in the 4016
+    error, not the prefix `_split_path_input` truncates at the first space."""
+    missing_path = tmp_path / "Application Support" / "Hermes Desktop" / "season poster.png"
+    raw = str(missing_path)  # parent dirs never created — genuinely missing
+
+    server._sessions["sid"] = _session()
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "image.attach",
+                "params": {"session_id": "sid", "path": raw},
+            }
+        )
+
+        assert resp["error"]["code"] == 4016
+        message = resp["error"]["message"]
+        assert raw in message
+        # The old bug truncated at the first space, dropping everything from
+        # "Support" onward — assert that segment survived, not just a prefix.
+        assert "Support" in message
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_image_attach_missing_windows_path_with_spaces_reports_full_path():
+    """Pre-existing `C:\\…` case (see apps/desktop/src/store/profile.ts
+    ~line 237) must keep reporting the whole path, "Foo Bar" included."""
+    raw = r"C:\Users\Foo Bar\pic.png"
+
+    server._sessions["sid"] = _session()
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "image.attach",
+                "params": {"session_id": "sid", "path": raw},
+            }
+        )
+
+        assert resp["error"]["code"] == 4016
+        message = resp["error"]["message"]
+        assert raw in message
+        assert "Foo Bar" in message
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_image_attach_path_with_spaces_and_trailing_prose_resolves(tmp_path):
+    """A real spaces-containing path followed by prose still resolves — the
+    drag-and-drop "path then text" form is unaffected by the error-text fix."""
+    img_path = tmp_path / "Application Support" / "Hermes Desktop" / "season poster.png"
+    img_path.parent.mkdir(parents=True)
+    img_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+    raw = f"{img_path} what about the season posters?"
+
+    server._sessions["sid"] = _session()
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "image.attach",
+                "params": {"session_id": "sid", "path": raw},
+            }
+        )
+
+        assert resp["result"]["attached"] is True
+        assert resp["result"]["path"] == str(img_path)
+        assert resp["result"]["remainder"] == "what about the season posters?"
+    finally:
+        server._sessions.pop("sid", None)
 
 
 def test_file_attach_uploads_remote_file_into_session_workspace(monkeypatch, tmp_path):

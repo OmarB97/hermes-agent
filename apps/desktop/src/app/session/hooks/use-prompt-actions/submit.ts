@@ -41,10 +41,7 @@ interface SubmitPromptDeps {
   activeSessionIdRef: MutableRefObject<string | null>
   busyRef: MutableRefObject<boolean>
   copy: Translations['desktop']
-  createBackendSessionForSend: (
-    preview?: string | null,
-    overrides?: SessionCreateOverrides
-  ) => Promise<string | null>
+  createBackendSessionForSend: (preview?: string | null, overrides?: SessionCreateOverrides) => Promise<string | null>
   getRoutedStoredSessionId: () => null | string
   getRuntimeIdForStoredSession: (storedSessionId: string) => null | string
   getRouteToken: () => string
@@ -159,7 +156,26 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       const targetStartedInCurrentView =
         !targetStoredSessionId || targetStoredSessionId === selectedStoredSessionIdRef.current
 
-      let sessionId: null | string = options?.sessionId ?? activeSessionIdRef.current
+      // ORIGIN PIN. A caller that names its own stored session — both queue
+      // drains do — is submitting into THAT conversation. It may never be
+      // re-homed onto whatever chat happens to be in the foreground.
+      //
+      // This is the retarget that made a June-era queued prompt replay into the
+      // currently open transcript on every launch: the drain passes
+      // `sessionId: runtimeSessionId ?? null`, meaning "I have no runtime
+      // binding, resolve one from my stored id" — and `??` collapsed that
+      // explicit null into `activeSessionIdRef.current`, the FOREGROUND runtime
+      // session. Everything downstream then faithfully targeted the wrong chat:
+      // the optimistic user bubble, prompt.submit, and the error row.
+      //
+      // Resolve from the origin's own runtime mapping instead. A miss leaves
+      // sessionId null so the stored-id resume path below rebinds the ORIGIN.
+      const originStoredSessionId = options?.storedSessionId?.trim() || null
+      const originPinned = Boolean(originStoredSessionId)
+
+      let sessionId: null | string = originPinned
+        ? (options?.sessionId ?? getRuntimeIdForStoredSession(originStoredSessionId!))
+        : (options?.sessionId ?? activeSessionIdRef.current)
 
       // Pin the foreground session context for the whole async submit pipeline.
       // Without this, a fast session switch during session.resume / file.attach
@@ -308,7 +324,10 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       // outranks a stale render-time runtime id (often from the previous
       // profile): force the full routed resume path below. An explicit queued
       // runtime id (background drain) is authoritative and is left untouched.
-      if (!options?.sessionId && routedSessionNeedsResume) {
+      // The routed session is a fact about the FOREGROUND view, so it says
+      // nothing about an origin-pinned submit — and acting on it would re-home
+      // the pinned send to the foreground, the same retarget by another door.
+      if (!originPinned && !options?.sessionId && routedSessionNeedsResume) {
         sessionId = null
       }
 
@@ -318,7 +337,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         scope.setMessages(current => [...current, buildUserMessage()])
       }
 
-      if (!sessionId && routedStoredSessionId && routedSessionNeedsResume) {
+      if (!originPinned && !sessionId && routedStoredSessionId && routedSessionNeedsResume) {
         // The URL still names a durable conversation, but a profile
         // swap/reconnect left its volatile session binding incomplete or
         // cross-wired. Run the full profile-aware resume path. Creating here
@@ -374,13 +393,23 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
               activeSessionIdRef.current = sessionId
             }
           }
-        } catch {
+        } catch (resumeErr) {
           // A target stored conversation is not a new-chat draft. If its
           // runtime cannot be rebound, stop here rather than silently replacing
           // it with a contextless session (#55578). For a background/queued
           // drain this abort is a no-op on foreground state (both helpers are
           // targetIsCurrentView-guarded) and simply drops the queued send.
-          return abortForSessionSwitch(null)
+          dropOptimistic(null)
+          releaseBusy()
+
+          // A queued drain gets the reason, not just a silent false, so the
+          // entry can carry "the origin conversation could not be resolved"
+          // into the queue panel instead of retrying blind.
+          if (options?.fromQueue) {
+            throw resumeErr
+          }
+
+          return false
         }
 
         if (sessionContextDrifted()) {
@@ -531,6 +560,20 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         }
 
         const message = inlineErrorMessage(err, copy.promptFailed)
+
+        // A failed queue drain must leave NO transcript residue. The entry is
+        // still queued and the drainer owns the retry budget, so painting an
+        // optimistic user bubble plus an error row PER ATTEMPT is pure
+        // duplication — that is where the four identical user bubbles and the
+        // stack of red "image not found" rows came from, once per launch,
+        // forever. Roll the optimistic message back and hand the reason to the
+        // drainer, which records it on the entry and surfaces it in the queue
+        // panel exactly once.
+        if (options?.fromQueue) {
+          dropOptimistic(sessionId)
+
+          throw new Error(message || copy.promptFailed)
+        }
 
         updateSessionState(
           sessionId,

@@ -2038,8 +2038,15 @@ export const zh: Translations = {
     queueSendNext: '下一个',
     queueSend: '发送',
     queueDelete: '删除',
+    queueRetry: '重试',
     queueStuckTitle: '排队消息未发送',
-    queueStuckBody: '排队的对话多次发送失败。它仍在队列中，请重试发送。',
+    queueStuckBody: '排队的回合不再尝试发送。它仍在队列中，可以重试或删除。',
+    queueStuckReason: {
+      'attachment-missing': '附件文件已不存在',
+      'drain-failed': '多次发送失败',
+      expired: '排队时间过长，无法自动发送',
+      'origin-unresolved': '无法打开原始对话'
+    },
     previewUnavailable: '预览不可用',
     previewLabel: label => `预览 ${label}`,
     couldNotPreview: label => `无法预览 ${label}`,

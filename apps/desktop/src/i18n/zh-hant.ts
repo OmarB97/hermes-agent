@@ -1728,8 +1728,15 @@ export const zhHant = defineLocale({
     queueSendNext: '下一個',
     queueSend: '傳送',
     queueDelete: '刪除',
+    queueRetry: '重試',
     queueStuckTitle: '佇列訊息未送出',
-    queueStuckBody: '佇列中的對話多次傳送失敗。它仍在佇列中，請重試傳送。',
+    queueStuckBody: '排隊的回合不再嘗試傳送。它仍在佇列中，可以重試或刪除。',
+    queueStuckReason: {
+      'attachment-missing': '附件檔案已不存在',
+      'drain-failed': '多次傳送失敗',
+      expired: '排隊時間過長，無法自動傳送',
+      'origin-unresolved': '無法開啟原始聊天'
+    },
     previewUnavailable: '預覽不可用',
     previewLabel: label => `預覽 ${label}`,
     couldNotPreview: label => `無法預覽 ${label}`,

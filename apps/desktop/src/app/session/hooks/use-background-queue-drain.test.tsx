@@ -3,25 +3,40 @@ import type { MutableRefObject } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { createClientSessionState } from '@/lib/chat-runtime'
-import { $queuedPromptsBySession, enqueueQueuedPrompt, getQueuedPrompts } from '@/store/composer-queue'
+import type { PathProbe } from '@/lib/queued-attachment-preflight'
+import type { ComposerAttachment } from '@/store/composer'
+import {
+  $queuedPromptsBySession,
+  enqueueQueuedPrompt,
+  getQueuedPrompts,
+  isQueuedPromptStuck,
+  MAX_AUTO_DRAIN_ATTEMPTS,
+  normalizeLoadedQueueState
+} from '@/store/composer-queue'
+import { $notifications } from '@/store/notifications'
 import { clearAllSessionStates, publishSessionState } from '@/store/session-states'
 
 import { useBackgroundQueueDrain } from './use-background-queue-drain'
 import type { SubmitTextOptions } from './use-prompt-actions/utils'
 
+const QUEUE_STORAGE_KEY = 'hermes.desktop.composerQueue.v1'
+
 function Harness({
   enabled = true,
+  pathProbe,
   runtimeMap,
   selectedStoredSessionId = 'stored-session-b',
   submitText
 }: {
   enabled?: boolean
+  pathProbe?: PathProbe
   runtimeMap: MutableRefObject<Map<string, string>>
   selectedStoredSessionId?: string | null
   submitText: (text: string, options?: SubmitTextOptions) => Promise<boolean> | boolean
 }) {
   useBackgroundQueueDrain({
     enabled,
+    pathProbe,
     runtimeIdByStoredSessionIdRef: runtimeMap,
     selectedStoredSessionId,
     submitText
@@ -30,10 +45,26 @@ function Harness({
   return null
 }
 
+const imageAttachment = (path: string): ComposerAttachment => ({
+  id: `att-${path}`,
+  kind: 'image',
+  label: 'screenshot.png',
+  path
+})
+
+/** Throw away everything in memory and rebuild the store from what actually
+ *  persisted — i.e. relaunch the app. */
+function restartApp() {
+  const raw = window.localStorage.getItem(QUEUE_STORAGE_KEY)
+  $queuedPromptsBySession.set(normalizeLoadedQueueState(raw ? JSON.parse(raw) : null))
+}
+
 describe('useBackgroundQueueDrain', () => {
   beforeEach(() => {
     vi.useRealTimers()
     clearAllSessionStates()
+    window.localStorage.removeItem(QUEUE_STORAGE_KEY)
+    $notifications.set([])
   })
 
   afterEach(() => {
@@ -41,6 +72,8 @@ describe('useBackgroundQueueDrain', () => {
     vi.restoreAllMocks()
     vi.useRealTimers()
     $queuedPromptsBySession.set({})
+    window.localStorage.removeItem(QUEUE_STORAGE_KEY)
+    $notifications.set([])
     clearAllSessionStates()
   })
 
@@ -138,5 +171,132 @@ describe('useBackgroundQueueDrain', () => {
 
     expect(submitText).toHaveBeenCalledTimes(2)
     expect(getQueuedPrompts('stored-session-a')).toHaveLength(0)
+  })
+
+  it('stops retrying after the attempt budget and NEVER picks the entry up again after a restart', async () => {
+    vi.useFakeTimers()
+
+    const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
+    const submitText = vi.fn(async () => false)
+
+    enqueueQueuedPrompt('stored-session-a', { text: 'poison', attachments: [] })
+
+    const view = render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
+
+    // Burn the whole budget: one attempt, then one per scheduled retry.
+    for (let tick = 0; tick < MAX_AUTO_DRAIN_ATTEMPTS; tick += 1) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(750)
+        await Promise.resolve()
+      })
+    }
+
+    expect(submitText).toHaveBeenCalledTimes(MAX_AUTO_DRAIN_ATTEMPTS)
+    expect(isQueuedPromptStuck(getQueuedPrompts('stored-session-a')[0]!)).toBe(true)
+
+    // Toast fires on the transition, once — not once per attempt.
+    expect($notifications.get().filter(n => n.id.startsWith('composer-background-queue-stuck'))).toHaveLength(1)
+
+    // THE REGRESSION. Relaunch the app: with the ledger in a useRef this entry
+    // gets a fresh budget and replays its four failed sends on every single
+    // start, forever. It must stay dead-lettered instead.
+    view.unmount()
+    submitText.mockClear()
+    restartApp()
+
+    render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000)
+      await Promise.resolve()
+    })
+
+    expect(submitText).not.toHaveBeenCalled()
+    expect(getQueuedPrompts('stored-session-a')).toHaveLength(1)
+  })
+
+  it('dead-letters an entry whose attachment is gone without ever submitting it', async () => {
+    const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
+    const submitText = vi.fn(async () => true)
+    const missing = '/Users/me/Library/Application Support/Hermes/images/clip_20260614.png'
+    const pathProbe = vi.fn(async () => false)
+
+    enqueueQueuedPrompt('stored-session-a', {
+      text: 'there is no title anymore. also what about the season posters?',
+      attachments: [imageAttachment(missing)]
+    })
+
+    render(<Harness pathProbe={pathProbe} runtimeMap={runtimeMap} submitText={submitText} />)
+
+    await waitFor(() => expect(isQueuedPromptStuck(getQueuedPrompts('stored-session-a')[0]!)).toBe(true))
+
+    // The preflight runs BEFORE the send, so the submit pipeline never gets to
+    // paint (and then have to roll back) an optimistic bubble.
+    expect(submitText).not.toHaveBeenCalled()
+    expect(pathProbe).toHaveBeenCalledWith(missing)
+
+    const entry = getQueuedPrompts('stored-session-a')[0]!
+    expect(entry.stuckReason).toBe('attachment-missing')
+    // Untruncated: the whole path, spaces and all.
+    expect(entry.lastError).toBe(missing)
+  })
+
+  it('still drains an entry whose attachments are all present', async () => {
+    const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
+    const submitText = vi.fn(async () => true)
+
+    enqueueQueuedPrompt('stored-session-a', {
+      text: 'with a live screenshot',
+      attachments: [imageAttachment('/tmp/Screen Shot.png')]
+    })
+
+    render(<Harness pathProbe={async () => true} runtimeMap={runtimeMap} submitText={submitText} />)
+
+    await waitFor(() => expect(getQueuedPrompts('stored-session-a')).toHaveLength(0))
+    expect(submitText).toHaveBeenCalledWith(
+      'with a live screenshot',
+      expect.objectContaining({ fromQueue: true, sessionId: 'rt-session-a', storedSessionId: 'stored-session-a' })
+    )
+  })
+
+  it('keeps draining the entries behind a dead-lettered one', async () => {
+    const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
+    const submitText = vi.fn(async () => true)
+
+    enqueueQueuedPrompt('stored-session-a', { text: 'poison', attachments: [imageAttachment('/gone.png')] })
+    enqueueQueuedPrompt('stored-session-a', { text: 'still good', attachments: [] })
+
+    render(<Harness pathProbe={async path => path !== '/gone.png'} runtimeMap={runtimeMap} submitText={submitText} />)
+
+    await waitFor(() => expect(submitText).toHaveBeenCalledTimes(1))
+    expect(submitText).toHaveBeenCalledWith('still good', expect.objectContaining({ fromQueue: true }))
+
+    const remaining = getQueuedPrompts('stored-session-a')
+    expect(remaining).toHaveLength(1)
+    expect(remaining[0]!.text).toBe('poison')
+    expect(isQueuedPromptStuck(remaining[0]!)).toBe(true)
+  })
+
+  it('records the failure reason a rejected drain reports', async () => {
+    vi.useFakeTimers()
+
+    const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
+
+    const submitText = vi.fn(async () => {
+      throw new Error('image not found: /Users/me/Library/Application Support/Hermes/x.png')
+    })
+
+    enqueueQueuedPrompt('stored-session-a', { text: 'boom', attachments: [] })
+
+    render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
+
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(getQueuedPrompts('stored-session-a')[0]!.lastError).toBe(
+      'image not found: /Users/me/Library/Application Support/Hermes/x.png'
+    )
   })
 })

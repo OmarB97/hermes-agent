@@ -707,11 +707,146 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect($busy.get()).toBe(false)
   })
 
-  it('a rejected fromQueue drain returns false (entry stays queued) and a later retry sends it', async () => {
-    // A stale-session 404 must not strand the queued entry: submitPrompt returns
-    // false on failure so the composer keeps it, and the edge-independent
-    // auto-drain re-attempts once the session is idle again. storedSessionId is
-    // null so the session.resume recovery path is skipped and the error surfaces.
+  it('a null-runtime queue drain resumes its ORIGIN session instead of hijacking the foreground one', async () => {
+    // The poison-replay bug. A background drain passes `sessionId: null` to say
+    // "I have no runtime binding — resolve one from my stored id". `??` treated
+    // that explicit null exactly like an absent option and substituted
+    // activeSessionIdRef (the chat the user is LOOKING AT), so a prompt queued
+    // in a long-dead session replayed into the open transcript on every launch.
+    $busy.set(false)
+
+    const updates: { sessionId: string; storedSessionId: null | string | undefined }[] = []
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.resume') {
+        expect(params?.session_id).toBe('stored-session-june')
+
+        return { session_id: 'rt-session-june' } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        activeSessionId="rt-foreground"
+        onReady={h => (handle = h)}
+        onUpdateState={(sessionId, storedSessionId) => updates.push({ sessionId, storedSessionId })}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId="stored-session-foreground"
+      />
+    )
+
+    const accepted = await handle!.submitText('what about the season posters?', {
+      fromQueue: true,
+      sessionId: null,
+      storedSessionId: 'stored-session-june'
+    })
+
+    expect(accepted).toBe(true)
+
+    // Rebound its OWN conversation, and submitted there.
+    expect(requestGateway).toHaveBeenCalledWith('session.resume', {
+      session_id: 'stored-session-june',
+      source: 'desktop'
+    })
+    expect(requestGateway).toHaveBeenCalledWith(
+      'prompt.submit',
+      { session_id: 'rt-session-june', text: 'what about the season posters?' },
+      1_800_000
+    )
+
+    // Nothing was ever written into the session the user is looking at.
+    expect(requestGateway).not.toHaveBeenCalledWith('prompt.submit', { session_id: 'rt-foreground' }, expect.anything())
+    expect(updates.every(update => update.sessionId !== 'rt-foreground')).toBe(true)
+    expect(updates.every(update => update.storedSessionId !== 'stored-session-foreground')).toBe(true)
+    expect($busy.get()).toBe(false)
+  })
+
+  it('a null-runtime queue drain never falls through to the ROUTED foreground session either', async () => {
+    // Same retarget by the other door: when the foreground route needs a
+    // resume, the routed-resume branch would rebind the FOREGROUND stored
+    // session and hand its runtime id to the pinned drain.
+    $busy.set(false)
+
+    const resumed: string[] = []
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.resume') {
+        resumed.push(String(params?.session_id))
+
+        return { session_id: 'rt-session-june' } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        activeSessionId={null}
+        getRoutedStoredSessionId={() => 'stored-session-foreground'}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId="stored-session-foreground"
+      />
+    )
+
+    await handle!.submitText('queued in june', {
+      fromQueue: true,
+      sessionId: null,
+      storedSessionId: 'stored-session-june'
+    })
+
+    // Only the origin was resumed — the routed/foreground session was not.
+    expect(resumed).toEqual(['stored-session-june'])
+  })
+
+  it('a failed fromQueue drain leaves no transcript residue and reports the reason', async () => {
+    // Every retry used to append an optimistic user bubble AND a red error row
+    // to whichever transcript it landed in — four duplicate bubbles and a stack
+    // of errors per launch. A queued send that fails must leave the transcript
+    // exactly as it found it, and hand the reason back to the drainer instead.
+    const messagesAfterEachUpdate: unknown[][] = []
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'prompt.submit') {
+        throw new Error('image not found: /Users/me/Library/Application Support/Hermes/images/clip_1.png')
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        onSeedState={state => messagesAfterEachUpdate.push([...((state.messages as unknown[]) ?? [])])}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId={null}
+      />
+    )
+
+    await expect(handle!.submitText('poison', { fromQueue: true })).rejects.toThrow(/image not found/)
+
+    // Whatever it painted mid-flight, the transcript ends empty: no leftover
+    // user bubble, and no assistant error row.
+    const finalMessages = messagesAfterEachUpdate.at(-1) ?? []
+    expect(finalMessages).toHaveLength(0)
+  })
+
+  it('a failed fromQueue drain surfaces its reason and never strands the entry (a later retry sends it)', async () => {
+    // A stale-session 404 must not strand the queued entry: the drainer keeps
+    // it and the edge-independent auto-drain re-attempts once the session is
+    // idle again. The failure REJECTS with the reason (rather than resolving
+    // false) so the drainer can record it on the entry and show it in the queue
+    // panel; the drainers absorb the rejection, so no caller ever sees one.
+    // storedSessionId is null so the session.resume recovery path is skipped
+    // and the error surfaces.
     let attempt = 0
 
     const requestGateway = vi.fn(async (method: string) => {
@@ -736,8 +871,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
       />
     )
 
-    const first = await handle!.submitText('please send me', { fromQueue: true })
-    expect(first).toBe(false)
+    await expect(handle!.submitText('please send me', { fromQueue: true })).rejects.toThrow(/Session not found/)
 
     const second = await handle!.submitText('please send me', { fromQueue: true })
     expect(second).toBe(true)

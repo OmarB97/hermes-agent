@@ -2,12 +2,16 @@ import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef, useState } from 'react'
 
 import { useI18n } from '@/i18n'
+import { desktopPathProbe, firstMissingAttachmentPath, type PathProbe } from '@/lib/queued-attachment-preflight'
 import { resetBrowseState } from '@/store/composer-input-history'
 import {
   $queuedPromptsBySession,
+  drainableQueuedPromptCount,
   getQueuedPrompts,
-  MAX_AUTO_DRAIN_ATTEMPTS,
+  markQueuedPromptStuck,
+  nextDrainableQueuedPrompt,
   type QueuedPromptEntry,
+  recordDrainFailure,
   removeQueuedPrompt,
   shouldAutoDrain
 } from '@/store/composer-queue'
@@ -23,9 +27,18 @@ interface BackgroundQueueDrainOptions {
   runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>>
   selectedStoredSessionId: string | null
   submitText: SubmitQueuedPrompt
+  /** Local file-existence probe for the attachment preflight. Defaults to the
+   *  desktop bridge; injectable for tests. */
+  pathProbe?: PathProbe
 }
 
 const BACKGROUND_DRAIN_RETRY_MS = 750
+
+const errorDetail = (error: unknown): string => {
+  const message = error instanceof Error ? error.message : String(error ?? '')
+
+  return message.trim()
+}
 
 /**
  * Drain queued prompts for sessions that are not currently rendered by ChatBar.
@@ -34,21 +47,28 @@ const BACKGROUND_DRAIN_RETRY_MS = 750
  * Without this background drain, a prompt queued in Session A can sit forever
  * after the user switches to Session B: the only auto-drain effect lives inside
  * the mounted ChatBar, so Session A's queue is not observed when A is offscreen.
+ *
+ * The retry ledger lives ON THE PERSISTED ENTRY, not in a ref. A ref is reset by
+ * every app launch, so an entry that can never succeed (its attachment was
+ * deleted months ago) spends its whole retry budget again on every single
+ * start — forever. Entries that exhaust the budget are dead-lettered in
+ * localStorage and skipped from then on, until the user retries or deletes them
+ * from the queue panel.
  */
 export function useBackgroundQueueDrain({
   enabled,
+  pathProbe = desktopPathProbe(),
   runtimeIdByStoredSessionIdRef,
   selectedStoredSessionId,
   submitText
 }: BackgroundQueueDrainOptions) {
   const { t } = useI18n()
   const queuedPromptsBySession = useStore($queuedPromptsBySession)
-  const workingSessionIds = useStore($workingSessionIds)
   const submitTextRef = useRef(submitText)
   const drainingSessionIdsRef = useRef(new Set<string>())
-  const drainFailuresRef = useRef(new Map<string, number>())
   const retryTimersRef = useRef<number[]>([])
   const [retryTick, setRetryTick] = useState(0)
+  const workingSessionIds = useStore($workingSessionIds)
 
   useEffect(() => {
     submitTextRef.current = submitText
@@ -78,6 +98,21 @@ export function useBackgroundQueueDrain({
     []
   )
 
+  // One toast per entry that transitions into the dead-letter box — never one
+  // per launch. The notification id is the entry id, so a re-notify for the
+  // same entry replaces rather than stacks.
+  const notifyStuck = useCallback(
+    (entry: QueuedPromptEntry) => {
+      notify({
+        id: `composer-background-queue-stuck-${entry.id}`,
+        kind: 'error',
+        title: t.composer.queueStuckTitle,
+        message: t.composer.queueStuckBody
+      })
+    },
+    [t]
+  )
+
   const drainSessionQueue = useCallback(
     (sessionKey: string, entry: QueuedPromptEntry) => {
       if (drainingSessionIdsRef.current.has(sessionKey)) {
@@ -86,22 +121,12 @@ export function useBackgroundQueueDrain({
 
       drainingSessionIdsRef.current.add(sessionKey)
 
-      const onFail = () => {
-        const failures = (drainFailuresRef.current.get(entry.id) ?? 0) + 1
-        drainFailuresRef.current.set(entry.id, failures)
-
-        if (failures >= MAX_AUTO_DRAIN_ATTEMPTS) {
-          notify({
-            id: `composer-background-queue-stuck-${sessionKey}`,
-            kind: 'error',
-            title: t.composer.queueStuckTitle,
-            message: t.composer.queueStuckBody
-          })
-
-          return
+      // Book the attempt on the persisted entry. Retrying is the `finally`
+      // block's job, so this only records — and toasts once, on the edge.
+      const onFail = (error: unknown) => {
+        if (recordDrainFailure(sessionKey, entry.id, errorDetail(error) || undefined)?.becameStuck) {
+          notifyStuck(entry)
         }
-
-        scheduleRetry()
       }
 
       void Promise.resolve()
@@ -109,6 +134,21 @@ export function useBackgroundQueueDrain({
           const liveEntry = getQueuedPrompts(sessionKey).find(candidate => candidate.id === entry.id)
 
           if (!liveEntry) {
+            return true
+          }
+
+          // Preflight BEFORE submitting: the submit pipeline paints its
+          // optimistic bubble as soon as it has a session id, so a dead
+          // attachment discovered mid-send is what leaves transcript residue.
+          // A vanished file is permanent — dead-letter it now with the full,
+          // untruncated path rather than burning the retry budget on it.
+          const missingPath = await firstMissingAttachmentPath(liveEntry.attachments, pathProbe)
+
+          if (missingPath) {
+            if (markQueuedPromptStuck(sessionKey, liveEntry.id, 'attachment-missing', missingPath)) {
+              notifyStuck(liveEntry)
+            }
+
             return true
           }
 
@@ -127,7 +167,6 @@ export function useBackgroundQueueDrain({
             return false
           }
 
-          drainFailuresRef.current.delete(liveEntry.id)
           removeQueuedPrompt(sessionKey, liveEntry.id)
           resetBrowseState(runtimeSessionId)
 
@@ -135,15 +174,25 @@ export function useBackgroundQueueDrain({
         })
         .then(accepted => {
           if (!accepted) {
-            onFail()
+            onFail(null)
           }
         })
         .catch(onFail)
         .finally(() => {
           drainingSessionIdsRef.current.delete(sessionKey)
+
+          // Re-poll if this session still has sendable work. The store write
+          // that ends a drain (entry removed, or dead-lettered) can re-run the
+          // effect while this lock is still held, and nothing schedules another
+          // pass once it clears — which strands every entry queued behind the
+          // one we just finished. One bounded tick per completed drain: it
+          // either makes progress or finds nothing drainable and stops.
+          if (nextDrainableQueuedPrompt(getQueuedPrompts(sessionKey))) {
+            scheduleRetry()
+          }
         })
     },
-    [runtimeIdByStoredSessionIdRef, scheduleRetry, t]
+    [notifyStuck, pathProbe, runtimeIdByStoredSessionIdRef, scheduleRetry]
   )
 
   useEffect(() => {
@@ -154,17 +203,19 @@ export function useBackgroundQueueDrain({
     const working = new Set(workingSessionIds)
 
     for (const [sessionKey, entries] of Object.entries(queuedPromptsBySession)) {
-      if (
-        sessionKey === selectedStoredSessionId ||
-        drainingSessionIdsRef.current.has(sessionKey) ||
-        !shouldAutoDrain({ isBusy: working.has(sessionKey), queueLength: entries.length })
-      ) {
+      if (sessionKey === selectedStoredSessionId || drainingSessionIdsRef.current.has(sessionKey)) {
         continue
       }
 
-      const entry = entries[0]
+      const entry = nextDrainableQueuedPrompt(entries)
 
-      if (!entry || (drainFailuresRef.current.get(entry.id) ?? 0) >= MAX_AUTO_DRAIN_ATTEMPTS) {
+      if (
+        !entry ||
+        !shouldAutoDrain({
+          isBusy: working.has(sessionKey),
+          queueLength: drainableQueuedPromptCount(entries)
+        })
+      ) {
         continue
       }
 

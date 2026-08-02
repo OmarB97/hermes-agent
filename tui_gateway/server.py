@@ -11254,6 +11254,7 @@ def _(rid, params: dict) -> dict:
             _detect_file_drop,
             _resolve_attachment_path,
             _split_path_input,
+            starts_like_path,
         )
 
         dropped = _detect_file_drop(raw)
@@ -11264,7 +11265,21 @@ def _(rid, params: dict) -> dict:
             path_token, remainder = _split_path_input(raw)
             image_path = _resolve_attachment_path(path_token)
             if image_path is None:
-                return _err(rid, 4016, f"image not found: {path_token}")
+                # Report the path the CALLER asked for, not the whitespace-split
+                # first token. `_split_path_input` cuts at the first unescaped
+                # space so a bare path + trailing prose still resolves, which
+                # means a plain absolute path containing spaces
+                # ("/Users/me/Library/Application Support/…/shot.png") shrinks to
+                # "/Users/me/Library/Application" in the error text. Resolution
+                # itself is fine — `_detect_file_drop` tries the whole string
+                # first and walks back space-by-space — so a truncated token here
+                # only ever means the file is genuinely missing, and it names a
+                # path the user never typed. That sent one desktop bug hunting a
+                # tokenizer for a deleted screenshot. Fall back to the token only
+                # when it is all we were given (input that never looked like a
+                # path at all).
+                missing = raw if starts_like_path(raw) else (path_token or raw)
+                return _err(rid, 4016, f"image not found: {missing}")
         if image_path.suffix.lower() not in _IMAGE_EXTENSIONS:
             return _err(rid, 4016, f"unsupported image: {image_path.name}")
         session.setdefault("attached_images", []).append(str(image_path))
