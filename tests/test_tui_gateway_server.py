@@ -492,11 +492,37 @@ def test_prompt_submit_golden_transcript_matches_flag_off_and_on(monkeypatch):
         monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}})
 
         class _FakeSupervisor:
+            # Stands in for the compute-host child, which proxies prompt.submit
+            # back into server.handle_request() — so it emits exactly what the
+            # in-process path emits, including the #270 turn id and the
+            # terminal turn.outcome. Keep this sequence in step with the
+            # in-process path or the parity this test guards is not tested.
             def submit_turn(self, frame, *, on_complete=None):
                 sid = frame["sid"]
-                server._emit("message.start", sid)
+                turn_id = "fake-turn-id"
+                server._emit("session.info", sid, dict(fixed_info))
+                server._emit("message.start", sid, {"turn_id": turn_id})
                 server._emit("message.delta", sid, {"text": "hi"})
-                server._emit("message.complete", sid, {"text": "hi", "usage": usage, "status": "complete"})
+                server._emit("message.complete", sid, {
+                    "text": "hi",
+                    "usage": usage,
+                    "status": "complete",
+                    "turn_id": turn_id,
+                })
+                server._emit("turn.outcome", sid, {
+                    "model": "gold-model",
+                    "provider": "gold-provider",
+                    "reason": "response delivered",
+                    "status": "completed",
+                    "id": turn_id,
+                    "started_at": 0.0,
+                    "completed_at": 0.0,
+                    "user_ordinal": 0,
+                    "text": (
+                        "turn:completed · gold-provider/gold-model · "
+                        "response delivered"
+                    ),
+                })
                 server._emit("session.info", sid, dict(fixed_info))
                 if on_complete is not None:
                     on_complete(
@@ -531,7 +557,27 @@ def test_prompt_submit_golden_transcript_matches_flag_off_and_on(monkeypatch):
         finally:
             server._sessions.pop("sid", None)
 
-    assert run_flag_on() == run_flag_off()
+    def _normalize(events):
+        """Blank per-run volatile values so the transcripts are comparable.
+
+        Since #270 the transcript carries a fresh turn uuid and wall-clock
+        started_at/completed_at, so the two runs can never be byte-equal. The
+        parity this test guards is the event sequence and every stable field.
+        """
+        normalized = []
+        for event, sid, payload in events:
+            if isinstance(payload, dict):
+                payload = dict(payload)
+                for key in ("turn_id", "id"):
+                    if key in payload:
+                        payload[key] = "<turn-id>"
+                for key in ("started_at", "completed_at"):
+                    if key in payload:
+                        payload[key] = "<timestamp>"
+            normalized.append((event, sid, payload))
+        return normalized
+
+    assert _normalize(run_flag_on()) == _normalize(run_flag_off())
 
 
 def test_session_context_explicit_cwd_for_ephemeral_task(monkeypatch, tmp_path):
@@ -8280,7 +8326,7 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
     monkeypatch.setattr(server, "_get_db", lambda: None)
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(server, "_session_info", lambda agent, *_a: {"model": agent.model})
 
     def _emit(event, sid, payload=None):
         if event == "message.complete":
@@ -8308,7 +8354,11 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
         )
 
         inflight = resp["result"].get("inflight")
-        assert inflight == {
+        # #270 stamps the in-flight turn id so the client can correlate the
+        # partial with the turn.outcome that closes it. It is a fresh uuid per
+        # turn, so pin its shape and compare the stable fields exactly.
+        assert isinstance(inflight.get("turn_id"), str) and inflight["turn_id"]
+        assert {k: v for k, v in inflight.items() if k != "turn_id"} == {
             "assistant": "partial answer",
             "streaming": True,
             "user": "write a long answer",
@@ -8343,7 +8393,7 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
     that copy without leaking the transport object.
     """
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(server, "_session_info", lambda agent, *_a: {"model": agent.model})
     agent = types.SimpleNamespace(model="model-live")
     session = _session(
         agent=agent,
@@ -8376,7 +8426,7 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
 
 
 def test_session_activate_switches_live_session_without_closing_siblings(monkeypatch):
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(server, "_session_info", lambda agent, *_a: {"model": agent.model})
     server._sessions["sid-a"] = _session(
         agent=types.SimpleNamespace(model="model-a"),
         history=[{"role": "user", "content": "old"}],
