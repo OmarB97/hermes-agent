@@ -19,6 +19,12 @@ def _make_agent_with_compressor() -> AIAgent:
     agent.client = MagicMock()
     agent.quiet_mode = True
 
+    # The fallback path emits structured status through _emit_fallback_status,
+    # which reads self.status_callback directly.  __init__ is skipped here, so
+    # set it explicitly or the emit raises AttributeError, gets swallowed by
+    # try_activate_fallback's except, and silently walks the whole chain.
+    agent.status_callback = None
+
     # Fallback config
     agent._fallback_activated = False
     agent._fallback_model = {
