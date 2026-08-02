@@ -2120,6 +2120,26 @@ approvals:
 
 Patterns are case-insensitive fnmatch globs and must be quoted in YAML (a bare leading `*` is a parse error). See [Security — User-Defined Deny Rules](/user-guide/security#user-defined-deny-rules-approvalsdeny) for details.
 
+### Declared command allowlists
+
+Smart mode's classifier fails *closed*: if it cannot be reached at all, the answer becomes "ask a human". In an unattended run there is nobody to ask, so each flagged command waits out `approvals.timeout` and is then blocked. `approvals.delegated_allowlist` is how you declare, in advance, what such a run may do instead:
+
+```yaml
+approvals:
+  delegated_allowlist:
+    commands: ["godot", "git"]
+    root: "/Users/me/Workspaces/game"     # required — an unscoped command is not a scoped allowlist
+```
+
+Empty (the default) means nothing changes. A working classifier is never overridden, interactive sessions still prompt, and the hardline blocklist and `deny` rules still apply. A single unattended session can declare its own instead of using this default:
+
+```bash
+hermes desktop spawn --delegated --allow-command godot \
+  --allow-command-root /Users/me/Workspaces/game "Export the build"
+```
+
+See [Security — Declared Command Allowlists](/user-guide/security#declared-command-allowlists-approvalsdelegated_allowlist) for how a command is matched and which evasions are refused.
+
 ## Checkpoints
 
 Automatic filesystem snapshots before destructive file operations. See the [Checkpoints & Rollback](/user-guide/checkpoints-and-rollback) for details.

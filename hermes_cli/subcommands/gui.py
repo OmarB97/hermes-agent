@@ -162,6 +162,32 @@ def build_gui_parser(
         ),
     )
     spawn_parser.add_argument(
+        "--allow-command",
+        action="append",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Let this session run NAME without asking a human when the "
+            "approval classifier is unreachable — the failure that otherwise "
+            "leaves an unattended run waiting on an approval nobody answers. "
+            "Repeatable. Requires --allow-command-root, which is the only "
+            "directory the command may act in. Everything else keeps asking. "
+            "Commands that run whatever their arguments name (sh, python, "
+            "sudo, env, ssh, docker, xargs, ...) are refused."
+        ),
+    )
+    spawn_parser.add_argument(
+        "--allow-command-root",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Absolute directory the --allow-command entries are scoped to, "
+            "e.g. the worktree this session works in. A command that would "
+            "run elsewhere, or that names a path (or a symlink) leading "
+            "outside it, is not covered."
+        ),
+    )
+    spawn_parser.add_argument(
         "--delegated-timeout",
         type=float,
         default=None,

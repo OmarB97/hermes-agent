@@ -51,6 +51,8 @@ def _ns(**kw):
         delegated_timeout=None,
         goal=None,
         goal_turns=None,
+        allow_command=None,
+        allow_command_root=None,
     )
     defaults.update(kw)
     return argparse.Namespace(**defaults)
@@ -737,6 +739,91 @@ class TestDelegated:
         out = capsys.readouterr().out
         assert "✓" in out
         assert "delegated" in out
+
+
+class TestDeclaredCommandAllowlist:
+    """`--allow-command` / `--allow-command-root`: what an unattended run may
+    do when the approval classifier is unreachable.
+
+    The classifier fails CLOSED — any error reaching it means "ask a human" —
+    so a delegated run whose auxiliary lane is down spends `approvals.timeout`
+    per flagged command and is then blocked, with nobody there to answer. The
+    declaration is how an operator replaces that stall with a policy. Both
+    halves are mandatory together: an unscoped `git` could act on any
+    repository on the machine, and a root alone allowlists nothing.
+    """
+
+    def _body_for(self, **kw) -> dict:
+        _write_control_file()
+        captured: dict = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["body"] = json.loads(req.data.decode())
+            return _fake_http_202()
+
+        with patch.object(ds.urllib.request, "urlopen", side_effect=fake_urlopen):
+            ds.cmd_desktop_spawn(_ns(**kw))
+        return captured["body"]
+
+    def _fails(self, capsys, **kw) -> str:
+        _write_control_file()
+        with patch.object(ds.urllib.request, "urlopen") as urlopen:
+            with pytest.raises(SystemExit) as exc:
+                ds.cmd_desktop_spawn(_ns(**kw))
+        assert exc.value.code == 1
+        urlopen.assert_not_called()
+        return capsys.readouterr().out
+
+    def test_plain_spawn_declares_nothing(self):
+        # An ordinary spawn stays fully fail-closed; the wire must not grow a
+        # key that widens what any other session may do.
+        assert self._body_for(prompt="hi") == {"prompt": "hi"}
+
+    def test_commands_and_root_travel_together(self):
+        body = self._body_for(
+            prompt="hi",
+            delegated=True,
+            allow_command=["godot", " git "],
+            allow_command_root="/Users/me/game",
+        )
+        assert body == {
+            "prompt": "hi",
+            "allowedCommands": ["godot", "git"],
+            "allowedCommandRoot": "/Users/me/game",
+            "delegated": True,
+        }
+
+    def test_commands_without_a_root_fail_loud(self, capsys):
+        # Sending them anyway would ask the backend to allowlist `git`
+        # everywhere. The refusal is here because this is the layer that can
+        # still say something — the POST is answered with an unconditional 202.
+        out = self._fails(capsys, allow_command=["git"])
+        assert "--allow-command-root" in out
+
+    def test_a_root_without_commands_fails_loud(self, capsys):
+        out = self._fails(capsys, allow_command_root="/Users/me/game")
+        assert "--allow-command" in out
+
+    def test_a_relative_root_fails_loud(self, capsys):
+        # A relative scope would mean whichever directory the app was launched
+        # in, which is not something the caller can see from here.
+        out = self._fails(capsys, allow_command=["git"], allow_command_root="game")
+        assert "absolute path" in out
+
+    def test_blank_command_names_are_dropped_not_sent(self, capsys):
+        out = self._fails(capsys, allow_command=["  ", ""], allow_command_root="/w")
+        assert "--allow-command" in out
+
+    def test_success_line_names_what_may_run_unasked(self, capsys):
+        self._body_for(
+            prompt="hi",
+            delegated=True,
+            allow_command=["godot"],
+            allow_command_root="/Users/me/game",
+        )
+        out = capsys.readouterr().out
+        assert "godot" in out
+        assert "/Users/me/game" in out
 
 
 class TestGoal:

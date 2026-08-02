@@ -63,6 +63,8 @@ interface SpawnPayload {
   toolsets?: string[]
   goal?: string
   goalMaxTurns?: number
+  allowedCommands?: string[]
+  allowedCommandRoot?: string
   delegated?: boolean
   delegatedTimeoutMs?: number
 }
@@ -155,6 +157,16 @@ export function useSpawnBridge({ startFreshSession, submitText, updateSessionSta
         if (payload.goalMaxTurns) {
           overrides.goalMaxTurns = payload.goalMaxTurns
         }
+      }
+
+      // The declared command allowlist is a per-session override for the same
+      // reason the model is: it is a statement about THIS delegation, and
+      // writing it into config would widen what the user's next chat may do.
+      // Root and commands travel together — the backend refuses one without
+      // the other, because an unscoped command is not a scoped allowlist.
+      if (payload.allowedCommands?.length && payload.allowedCommandRoot) {
+        overrides.allowedCommands = payload.allowedCommands
+        overrides.allowedCommandRoot = payload.allowedCommandRoot
       }
 
       // The contract goes in the prompt itself so the model reads it before it

@@ -279,11 +279,19 @@ def _docker_has_host_access(config: Dict[str, Any]) -> bool:
 
 
 def _check_all_guards(command: str, env_type: str,
-                      has_host_access: bool = False) -> dict:
-    """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
+                      has_host_access: bool = False,
+                      cwd: Optional[str] = None) -> dict:
+    """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback.
+
+    ``cwd`` is the directory the command is about to run in, resolved the same
+    way execution resolves it. The guard needs it to enforce a declared command
+    allowlist's worktree scope; passing the wrong one (or none) can only make a
+    scoped rule fail to match, never match wrongly.
+    """
     return _check_all_guards_impl(command, env_type,
                                   approval_callback=_get_approval_callback(),
-                                  has_host_access=has_host_access)
+                                  has_host_access=has_host_access,
+                                  cwd=cwd)
 
 
 # Allowlist: characters that can legitimately appear in directory paths.
@@ -2371,6 +2379,15 @@ def terminal_tool(
                     "status": "error",
                 }, ensure_ascii=False)
 
+        # The session key that drives cwd records: get_current_session_key()'s
+        # contextvar doesn't cross tool-worker threads, so fall back to the raw
+        # task_id (which IS the session_key for the top-level agent) — a
+        # stable, thread-safe anchor.  Resolved before the approval guard
+        # because the guard needs the same cwd the command will run in.
+        from tools.approval import get_current_session_key
+
+        session_key = get_current_session_key(default="") or (task_id or "")
+
         # Pre-exec security checks (tirith + dangerous command detection)
         # Skip check if force=True (user has confirmed they want to run it)
         approval_note = None
@@ -2380,9 +2397,20 @@ def terminal_tool(
         # the approval-wait (see clear_current_thread_interrupt).
         _approved_run = bool(force)
         if not force:
+            # Resolve the run directory the same way execution does, BEFORE the
+            # guard rather than after it (see the _resolve_command_cwd calls
+            # below). A declared command allowlist is scoped to a worktree, so
+            # judging it against the session default while an explicit
+            # `workdir=` sends the command somewhere else would be judging the
+            # wrong directory.
             approval = _check_all_guards(
                 command, env_type,
                 has_host_access=_docker_has_host_access(config),
+                cwd=_resolve_command_cwd(
+                    workdir=workdir,
+                    default_cwd=cwd,
+                    session_key=session_key,
+                ),
             )
             if not approval["approved"]:
                 # Check if this is an approval_required (gateway ask mode)
@@ -2419,6 +2447,16 @@ def terminal_tool(
             elif approval.get("smart_approved"):
                 desc = approval.get("description", "flagged as dangerous")
                 approval_note = f"Command was flagged ({desc}) and auto-approved by smart approval."
+            elif approval.get("policy_approved"):
+                # Say WHY in the transcript, not just that it happened: this is
+                # the one approval nobody saw and nobody answered, so the record
+                # of it has to stand on its own.
+                desc = approval.get("description", "flagged as dangerous")
+                approval_note = (
+                    f"Command was flagged ({desc}) and auto-approved by this "
+                    "session's declared command allowlist because the approval "
+                    "classifier was unavailable."
+                )
 
         # Validate workdir against shell injection
         if workdir:
@@ -2445,13 +2483,8 @@ def terminal_tool(
                 "EOF."
             )
 
-        # The session key that drives cwd records: get_current_session_key()'s
-        # contextvar doesn't cross tool-worker threads, so fall back to the raw
-        # task_id (which IS the session_key for the top-level agent) — a
-        # stable, thread-safe anchor.
-        from tools.approval import get_current_session_key
-
-        session_key = get_current_session_key(default="") or (task_id or "")
+        # session_key was resolved above the approval guard, which needs the
+        # same value to resolve the command's run directory.
 
         if background:
             # Spawn a tracked background process via the process registry.

@@ -39,3 +39,18 @@ it('is true when only goal is set', () => {
 it('does not count goalMaxTurns alone as an override', () => {
   expect(hasSessionOverrides({ goalMaxTurns: 40 })).toBe(false)
 })
+
+// A declared command allowlist that never reaches session.create is the whole
+// bug this predicate exists to prevent, with a worse consequence than a wrong
+// toolset: the session was spawned unattended precisely so it would not stall
+// on an approval, and it would stall anyway.
+it('is true when a declared command allowlist is set', () => {
+  expect(hasSessionOverrides({ allowedCommands: ['godot'], allowedCommandRoot: '/w' })).toBe(true)
+})
+
+// An empty list declares nothing, and a root scopes nothing on its own — the
+// backend refuses both, so neither is worth a create call.
+it('does not count an empty allowlist or a bare root as an override', () => {
+  expect(hasSessionOverrides({ allowedCommands: [] })).toBe(false)
+  expect(hasSessionOverrides({ allowedCommandRoot: '/w' })).toBe(false)
+})

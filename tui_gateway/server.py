@@ -760,10 +760,17 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
         return
     _finalize_session(session, end_reason=end_reason)
     try:
-        from tools.approval import unregister_gateway_notify
+        from tools.approval import (
+            clear_session_command_allowlist,
+            unregister_gateway_notify,
+        )
 
         if key := session.get("session_key"):
             unregister_gateway_notify(key)
+            # A declaration belongs to the delegation that made it. Session keys
+            # are fresh per create, but dropping it here keeps a long-lived
+            # gateway from accumulating dead policy.
+            clear_session_command_allowlist(key)
     except Exception:
         pass
     try:
@@ -6724,6 +6731,76 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 4028, "goal_max_turns requires goal")
         create_goal_max_turns = raw_goal_turns
 
+    # ``allowed_commands`` + ``allowed_command_root`` (declared command
+    # allowlist): what this ONE session may run without a human when the
+    # smart-approval classifier cannot be reached. It is a property of the
+    # delegation, not of the profile, so it is bound here exactly like the
+    # toolset and goal pins above and never written to config — spawning one
+    # unattended session must not widen what the user's next chat may do.
+    #
+    # The root is mandatory and validated here rather than left to the
+    # approval layer, for the same reason a bad toolset name fails the create:
+    # a caller who declared an allowlist cared which commands, so handing back
+    # a session that quietly has none is worse than an error.
+    create_allowed_commands: list[str] = []
+    create_allowed_command_root = ""
+    if (raw_allowed := params.get("allowed_commands")) is not None:
+        if not isinstance(raw_allowed, list) or any(
+            not isinstance(name, str) for name in raw_allowed
+        ):
+            return _err(rid, 4029, "allowed_commands must be an array of strings")
+        create_allowed_commands = [name.strip() for name in raw_allowed if name.strip()]
+        if not create_allowed_commands:
+            return _err(
+                rid,
+                4029,
+                "allowed_commands was empty — omit it to leave this session "
+                "fully fail-closed",
+            )
+    if (raw_allowed_root := params.get("allowed_command_root")) is not None:
+        if not isinstance(raw_allowed_root, str):
+            return _err(rid, 4029, "allowed_command_root must be a string")
+        create_allowed_command_root = raw_allowed_root.strip()
+    if create_allowed_commands and not create_allowed_command_root:
+        return _err(
+            rid,
+            4029,
+            "allowed_commands requires allowed_command_root — an unscoped "
+            "allowlist would let those commands act anywhere on this machine",
+        )
+    if create_allowed_command_root and not create_allowed_commands:
+        return _err(
+            rid, 4029, "allowed_command_root requires allowed_commands"
+        )
+    if create_allowed_command_root and not os.path.isabs(
+        os.path.expanduser(create_allowed_command_root)
+    ):
+        return _err(
+            rid,
+            4029,
+            "allowed_command_root must be an absolute path, so the scope does "
+            "not depend on where the gateway was started",
+        )
+    if create_allowed_commands:
+        # Build it once here purely to reject a bad declaration before anything
+        # exists to clean up. The real registration happens after the session
+        # dict does, and builds again from the same inputs.
+        from tools.declared_allowlist import build_declared_allowlist
+
+        if build_declared_allowlist(
+            create_allowed_commands,
+            create_allowed_command_root,
+            source="session.create",
+        ) is None:
+            return _err(
+                rid,
+                4029,
+                "allowed_commands named nothing that can be allowlisted. "
+                "Program-bearing commands (sh, python, sudo, env, ssh, docker, "
+                "xargs, …) are refused, because they run whatever program "
+                "their arguments name.",
+            )
+
     ready = threading.Event()
     now = time.time()
     lease, limit_message = _claim_active_session_slot(
@@ -6795,6 +6872,24 @@ def _(rid, params: dict) -> dict:
             print(
                 f"[tui_gateway] session.create could not set goal for {key}: "
                 f"{type(_goal_set_exc).__name__}: {_goal_set_exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    # Bind the declared allowlist to the approval session key — the same key
+    # the command guards read back via get_current_session_key(). Already
+    # validated above, so this cannot fail silently; it is logged loudly if it
+    # somehow does, because a "declared" session that has no declaration would
+    # stall exactly the way the caller was trying to avoid.
+    if create_allowed_commands:
+        from tools.approval import set_session_command_allowlist
+
+        if not set_session_command_allowlist(
+            key, create_allowed_commands, create_allowed_command_root
+        ):
+            print(
+                f"[tui_gateway] session.create could not store the declared "
+                f"command allowlist for {key}; it will fail closed.",
                 file=sys.stderr,
                 flush=True,
             )

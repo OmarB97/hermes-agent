@@ -36,6 +36,9 @@ approvals:
   cron_mode: deny                 # deny | approve — what cron jobs do when they hit a dangerous command
   mcp_reload_confirm: true        # /reload-mcp asks before invalidating the MCP tool cache
   destructive_slash_confirm: true # /clear, /new, /reset, /undo prompt before discarding state
+  delegated_allowlist:            # what an unattended run may do if the classifier is unreachable
+    commands: []                  # empty (the default) = nothing changes
+    root: ""
 ```
 
 The full set of keys:
@@ -46,6 +49,7 @@ The full set of keys:
 | `timeout` | `60` | Seconds Hermes waits for an approval reply before timing out. |
 | `cron_mode` | `deny` | How [cron jobs](./features/cron.md) behave headlessly when they trigger a dangerous-command prompt. `deny` blocks the command (the agent must find another path); `approve` auto-approves everything in cron context. |
 | `mcp_reload_confirm` | `true` | When true, `/reload-mcp` asks before rebuilding the MCP tool set. Rebuilding invalidates the provider prompt cache (tool schemas live in the system prompt), so the next message re-sends full input tokens. Users who click **Always Approve** flip this key to `false`. |
+| `delegated_allowlist` | empty | Commands an **unattended** run may execute without a human when the smart-approval classifier cannot be reached, scoped to a directory. Empty means nothing changes. See [Declared Command Allowlists](#declared-command-allowlists-approvalsdelegated_allowlist). |
 | `destructive_slash_confirm` | `true` | When true, destructive session slash commands (`/clear`, `/new`, `/reset`, `/undo`) prompt before discarding conversation state. Three-option dialog (Approve Once / Always Approve / Cancel) routed through native yes/no buttons on Telegram, Discord, and Slack; text fallback elsewhere. Users who click **Always Approve** flip this key to `false`. TUI uses its own modal overlay (set `HERMES_TUI_NO_CONFIRM=1` to opt out there). |
 
 | Mode | Behavior |
@@ -135,6 +139,58 @@ Like the rest of the approval config, changes take effect immediately (the confi
 
 :::note Threat model
 Deny rules are a guardrail against an honest-but-wrong agent, the same threat model as the dangerous-pattern detector. They are not a sandbox against a deliberately adversarial process — for that, use an isolated backend (Docker, Modal) or an egress-restricted environment.
+:::
+
+### Declared Command Allowlists (`approvals.delegated_allowlist`)
+
+Deny rules narrow what an agent may do. This is the one setting that widens it, and only in a single, specific failure.
+
+Under `mode: smart`, Hermes asks an auxiliary LLM whether a flagged command is safe. That classifier fails **closed**: if it cannot be reached at all — no API key on the auxiliary lane, a misconfigured route, a timeout — the answer becomes "ask a human". With a human present that is exactly right. In an unattended run (`hermes desktop spawn --delegated`, a gateway session nobody is watching) there is nobody to ask, so every flagged command waits out `approvals.timeout` and is then blocked. The run stalls without ever making a decision.
+
+A declared allowlist replaces that stall with a policy you wrote in advance:
+
+```yaml
+approvals:
+  delegated_allowlist:
+    commands: ["godot", "git"]
+    root: "/Users/me/Workspaces/game"
+```
+
+Read it as: *if the approval classifier is unreachable, `godot` and `git` may run inside that worktree without asking. Everything else still asks.*
+
+This config key is **profile-wide**: it covers every non-interactive session in the profile (gateway, messaging, desktop), not only spawned ones. Use it when the whole profile is an unattended box. For a single run, prefer the per-session form below.
+
+A single delegated session can declare its own instead, which wins over the config default and is never written to disk:
+
+```bash
+hermes desktop spawn --delegated \
+  --allow-command godot --allow-command git \
+  --allow-command-root /Users/me/Workspaces/game \
+  "Run the export and report what broke"
+```
+
+What it does **not** change:
+
+- **Nothing is widened by default.** The shipped value is empty, and an empty declaration behaves exactly as Hermes does today.
+- **A working classifier is never overridden.** Only unreachability qualifies. A classifier that answers ESCALATE is uncertain, not absent, and still wants a human; a DENY still denies.
+- **Interactive sessions still prompt.** At a terminal the prompt reaches someone immediately, so there is nothing to degrade from.
+- **The hardline blocklist and `approvals.deny` still apply.** Both run long before this, and neither is bypassable.
+- **Only local execution.** A declared root names a directory on this machine; the same string means something else inside a container or on the far end of SSH, so SSH/Docker sessions keep failing closed.
+
+How a command is matched — deliberately strict, because the command text is written by a model that may itself be prompt-injected:
+
+- **A root is mandatory.** An unscoped `git` could act on any repository on the machine.
+- **Shell syntax disqualifies a command outright.** Chaining (`;`, `&&`, `||`), pipes, redirection, command substitution (`$(…)`, backticks), brace/parameter expansion, globbing, `~`, backslash escapes and newlines are all refused before anything is parsed. `godot --headless ; rm -rf ~` never gets as far as being judged on its first word.
+- **The decision is made on parsed `argv` plus the resolved working directory**, never on a substring or regex over the raw command string — quoting alone defeats those.
+- **Every argument must resolve inside the root**, and resolution follows symlinks. A link that sits inside the worktree but points at `/etc` is judged on where it leads, not on its name. So is the working directory itself.
+- **`git` means `git`.** `/usr/bin/git` and `./git` are different declarations; name the exact form you want.
+- **Program-bearing commands are refused** — `sh`, `bash`, `python`, `sudo`, `env`, `ssh`, `docker`, `xargs`, `timeout` and friends. They run whatever program their arguments name, so allowlisting one would allowlist every command there is. The same names are refused as *arguments* too, wherever they appear: `git -c core.pager=/bin/sh status` runs a shell, and the allowlist said `git`.
+- **Both halves of a `key=value` argument are checked** — the whole token and the part after the first `=` — so a value pointing outside the root cannot hide behind an innocent-looking relative name.
+
+Every policy approval is written to `errors.log` at WARNING with the command and the reason, and appears in the transcript as an approval note. Nobody watched it happen, so the record has to stand on its own.
+
+:::note Declaring a command is trusting that command
+Path scoping constrains arguments and the working directory, and arguments naming a shell or interpreter are refused. What it cannot constrain is a program's own escape hatches — a build tool that runs scripts from the repo, or a config flag that writes outside the tree. Declare commands you would be comfortable letting the agent run unsupervised in that directory.
 :::
 
 ### Approval Timeout

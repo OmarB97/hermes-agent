@@ -2742,6 +2742,30 @@ DEFAULT_CONFIG = {
         # false.  TUI has its own modal overlay (HERMES_TUI_NO_CONFIRM=1 to
         # opt out there).
         "destructive_slash_confirm": True,
+        # Commands an UNATTENDED run may execute without a human when the
+        # smart-approval classifier (mode: smart) cannot be reached at all —
+        # no key, no route, or a timeout.  Today that failure escalates to a
+        # human prompt, which in a delegated run nobody answers: the command
+        # burns `timeout` above and is then blocked.  Declaring an allowlist
+        # replaces that stall with a policy for the commands you named, in the
+        # directory you named.  Everything else keeps escalating.
+        #
+        # Empty (the default) means nothing changes.  `root` is REQUIRED —
+        # an unscoped `git` could act on any repository on the machine — and
+        # program-bearing commands (sh, python, sudo, env, ssh, docker …) are
+        # refused, because allowlisting one allowlists everything it runs.
+        # Matching is on parsed argv plus the resolved working directory, so a
+        # chained/substituted/redirected command never qualifies. Example:
+        #   delegated_allowlist:
+        #     commands: ["godot", "git"]
+        #     root: "/Users/me/Workspaces/game"
+        # A single delegated session can declare its own instead, which wins
+        # over this: `hermes desktop spawn --delegated --allow-command godot
+        # --allow-command-root /path/to/worktree`.
+        "delegated_allowlist": {
+            "commands": [],
+            "root": "",
+        },
     },
 
     # Permanently allowed dangerous command patterns (added via "always" approval)

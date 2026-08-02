@@ -21,8 +21,11 @@ import tempfile
 import threading
 import time
 import unicodedata
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 from hermes_cli.config import cfg_get
+
+if TYPE_CHECKING:  # pragma: no cover -- typing only, keeps the import lazy
+    from tools.declared_allowlist import DeclaredAllowlist
 
 from tools.interrupt import is_interrupted
 from utils import env_var_enabled, is_truthy_value
@@ -2017,6 +2020,10 @@ _pending: dict[str, dict] = {}
 _session_approved: dict[str, set] = {}
 _session_yolo: set[str] = set()
 _permanent_approved: set = set()
+# session_key → DeclaredAllowlist, from a delegation brief. Unlike the two
+# above this grants nothing on its own: it is only ever consulted after the
+# smart-approval classifier turned out to be unreachable.
+_session_command_allowlists: "dict[str, DeclaredAllowlist]" = {}
 
 # =========================================================================
 # Blocking gateway approval (mirrors CLI's synchronous input() flow)
@@ -2147,6 +2154,7 @@ def clear_session(session_key: str) -> None:
     with _lock:
         _session_approved.pop(session_key, None)
         _session_yolo.discard(session_key)
+        _session_command_allowlists.pop(session_key, None)
         _pending.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
     for entry in entries:
@@ -2154,6 +2162,87 @@ def clear_session(session_key: str) -> None:
         # immediately so the old run can unwind instead of idling until timeout.
         entry.result = "deny"
         entry.event.set()
+
+
+def set_session_command_allowlist(session_key: str, commands, root: str) -> bool:
+    """Declare, for one session, which commands may run without a human.
+
+    Called at session creation from a delegation brief (``session.create``'s
+    ``allowed_commands`` / ``allowed_command_root``, which is what ``hermes
+    desktop spawn --allow-command`` lands in). This is a per-delegation
+    declaration, so it is deliberately NOT written to config — spawning one
+    unattended session must not widen what the operator's next chat may do.
+
+    Returns True when a usable allowlist was stored. A declaration that names
+    nothing, names no root, or names a program-bearing wrapper stores nothing
+    and returns False; :func:`tools.declared_allowlist.build_declared_allowlist`
+    logs exactly which part was refused.
+    """
+    if not session_key:
+        return False
+
+    from tools.declared_allowlist import build_declared_allowlist
+
+    allowlist = build_declared_allowlist(
+        commands, root, source=f"session {session_key}"
+    )
+    with _lock:
+        if allowlist is None:
+            _session_command_allowlists.pop(session_key, None)
+        else:
+            _session_command_allowlists[session_key] = allowlist
+    return allowlist is not None
+
+
+def clear_session_command_allowlist(session_key: str) -> None:
+    """Drop a session's declared allowlist (session teardown)."""
+    if not session_key:
+        return
+    with _lock:
+        _session_command_allowlists.pop(session_key, None)
+
+
+def _config_declared_allowlist():
+    """Build the profile-wide default from ``approvals.delegated_allowlist``.
+
+    The config default exists for operators who run a whole profile unattended
+    (a cron/gateway box). It is empty out of the box, so reading it changes
+    nothing until someone writes one.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        declared = cfg_get(
+            load_config(), "approvals", "delegated_allowlist", default=None
+        )
+    except Exception:
+        return None
+    if not isinstance(declared, dict):
+        return None
+
+    from tools.declared_allowlist import build_declared_allowlist
+
+    return build_declared_allowlist(
+        declared.get("commands"),
+        declared.get("root"),
+        source="config approvals.delegated_allowlist",
+    )
+
+
+def _declared_allowlist_for_session(session_key: str):
+    """Return the allowlist governing *session_key*, or None if none is declared.
+
+    A session's own declaration wins outright over the config default rather
+    than merging with it: a brief that names two commands in one worktree is a
+    statement about that run, and quietly unioning it with a profile-wide list
+    would hand the run more than its brief asked for.
+    """
+    if session_key:
+        with _lock:
+            declared = _session_command_allowlists.get(session_key)
+        if declared is not None:
+            return declared
+    return _config_declared_allowlist()
 
 
 def is_session_yolo_enabled(session_key: str) -> bool:
@@ -2557,6 +2646,34 @@ def _strip_line_comment(line: str) -> str:
     return line
 
 
+# Per-thread record of whether the LAST _smart_approve call on this thread
+# actually reached the classifier.  The verdict alphabet ("approve" / "deny" /
+# "escalate") is a fixed contract that plugins, the observer hooks and a dozen
+# tests key off, so "the classifier was never consulted" — which is a different
+# fact from "the classifier said it was unsure" — travels beside the verdict
+# rather than inside it.  Thread-local because approvals run on per-session
+# agent threads, and reset by the CALLER immediately before each call so a
+# stubbed _smart_approve (every existing test) always reports "available" and
+# keeps today's behaviour exactly.
+_smart_approval_local = threading.local()
+
+
+def _begin_smart_approval() -> None:
+    """Clear this thread's classifier-availability record before a verdict."""
+    _smart_approval_local.unavailable = False
+
+
+def _smart_approval_was_unavailable() -> bool:
+    """True when the last :func:`_smart_approve` call never reached the classifier.
+
+    Distinguishes an infrastructure failure (no key, no route, timeout, the
+    auxiliary lane self-contending with the session's own turn) from a real
+    ESCALATE verdict.  Only the first is something a declared policy may stand
+    in for; a working classifier that says "I am unsure" still wants a human.
+    """
+    return bool(getattr(_smart_approval_local, "unavailable", False))
+
+
 def _smart_approve(command: str, description: str) -> str:
     """Use the auxiliary LLM to assess risk and decide approval.
 
@@ -2576,6 +2693,7 @@ def _smart_approve(command: str, description: str) -> str:
     Inspired by OpenAI Codex's Smart Approvals guardian subagent
     (openai/codex#13860).
     """
+    _begin_smart_approval()
     try:
         from agent.auxiliary_client import call_llm
 
@@ -2636,6 +2754,12 @@ def _smart_approve(command: str, description: str) -> str:
         # full ``approvals.timeout`` before it is blocked or left pending, and
         # at debug level there is nothing in errors.log to explain why. The
         # operator must be able to see that the approval LLM is the problem.
+        #
+        # The verdict stays "escalate" — that contract is unchanged, and a
+        # session with no declared allowlist is still asked about. The flag is
+        # what lets a session that HAS one degrade to its declared policy
+        # instead of stalling; see _declared_allowlist_result.
+        _smart_approval_local.unavailable = True
         logger.warning(
             "Smart approvals: LLM call failed (%s: %s) — escalating to a human "
             "prompt. Check auxiliary.approval / auxiliary.route in config.yaml.",
@@ -3064,6 +3188,66 @@ def _format_tirith_description(tirith_result: dict) -> str:
     return "Security scan — " + "; ".join(parts)
 
 
+def _declared_allowlist_result(
+    command: str,
+    *,
+    env_type: str,
+    cwd: str | None,
+    session_key: str,
+    description: str,
+) -> dict | None:
+    """Approve *command* by declared policy, or return None to keep escalating.
+
+    This is the ONLY thing that changes when the smart-approval classifier is
+    unreachable, and it changes it in exactly one direction: a session that has
+    declared an allowlist can run the commands it declared, in the directory it
+    declared them for, instead of waiting out ``approvals.timeout`` for a human
+    who is not there. Everything else — no declaration, a command that is not on
+    it, a command that reaches outside the root — comes back None and takes the
+    existing fail-closed path.
+
+    Non-local backends never match: a declared root is a path on THIS machine,
+    and the same string means a different directory inside a container or on the
+    far end of an SSH connection.
+    """
+    allowlist = _declared_allowlist_for_session(session_key)
+    if allowlist is None:
+        return None
+
+    if env_type != "local":
+        logger.warning(
+            "Declared command allowlist not applied to a %s backend: the "
+            "declared root %s describes this machine, not the remote/sandbox "
+            "filesystem. Escalating as usual.",
+            env_type, allowlist.root,
+        )
+        return None
+
+    from tools.declared_allowlist import match_declared_command
+
+    decision = match_declared_command(command, allowlist, cwd)
+    if not decision.allowed:
+        logger.warning(
+            "Approval classifier unavailable and the declared command "
+            "allowlist (%s) does not cover %r — %s. Escalating as usual.",
+            allowlist.describe(), command[:200], decision.reason,
+        )
+        return None
+
+    logger.warning(
+        "AUTO-APPROVED by declared command allowlist: %r (%s). The approval "
+        "classifier was unavailable, and %s.",
+        command[:200], description, decision.reason,
+    )
+    return {
+        "approved": True,
+        "message": None,
+        "policy_approved": True,
+        "policy_reason": decision.reason,
+        "description": description,
+    }
+
+
 def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
                             *, surface: str = "gateway") -> dict:
     """Enqueue *approval_data*, notify the user, and block the calling agent
@@ -3181,7 +3365,8 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
 
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
-                             has_host_access: bool = False) -> dict:
+                             has_host_access: bool = False,
+                             cwd: str | None = None) -> dict:
     """Run all pre-exec security checks and return a single approval decision.
 
     Gathers findings from tirith and dangerous-command detection, then
@@ -3192,6 +3377,13 @@ def check_all_command_guards(command: str, env_type: str,
     ``has_host_access`` is True when a Docker sandbox bind-mounts host paths;
     such a session is no longer isolated, so it goes through the normal flow
     instead of the container fast-path.
+
+    ``cwd`` is the directory this command will actually run in (the caller's
+    resolved ``workdir`` / session cwd). It is read by exactly one thing — the
+    declared command allowlist, which scopes a session's allowed commands to a
+    named worktree — and only when the smart-approval classifier turned out to
+    be unreachable. Omitted means "unknown", which makes a path-scoped
+    declaration unenforceable and therefore unmatchable.
     """
     # Skip isolated container backends for both checks. Docker stops skipping
     # once host paths are bind-mounted into the sandbox.
@@ -3396,6 +3588,7 @@ def check_all_command_guards(command: str, env_type: str,
             pattern_keys=[key for key, _, _ in warnings],
             session_key=session_key,
         )
+        _begin_smart_approval()
         verdict = _smart_approve(command, combined_desc_for_llm)
         _observe_smart_approval_verdict(observer_payload, verdict)
         if verdict == "approve":
@@ -3407,7 +3600,27 @@ def check_all_command_guards(command: str, env_type: str,
             return {"approved": True, "message": None,
                     "smart_approved": True,
                     "description": combined_desc_for_llm}
-        elif verdict == "deny" and not (is_cli or is_gateway or is_ask):
+
+        # The classifier could not be reached at all. With no declaration that
+        # degrades to "ask a human", and in an unattended run that is a stall
+        # rather than a decision: ``approvals.timeout`` elapses and the command
+        # is BLOCKED, or a ``pending_approval`` comes straight back and halts
+        # the operation. A session that DID declare an allowlist gets its own
+        # policy instead. Interactive CLI is excluded on purpose — there the
+        # prompt reaches someone immediately, so there is nothing to degrade
+        # from.
+        if not is_cli and _smart_approval_was_unavailable():
+            policy_result = _declared_allowlist_result(
+                command,
+                env_type=env_type,
+                cwd=cwd,
+                session_key=session_key,
+                description=combined_desc_for_llm,
+            )
+            if policy_result is not None:
+                return policy_result
+
+        if verdict == "deny" and not (is_cli or is_gateway or is_ask):
             return {
                 "approved": False,
                 "message": f"BLOCKED by smart approval: {combined_desc_for_llm}. "
@@ -3715,6 +3928,12 @@ def check_execute_code_guard(code: str, env_type: str,
             pattern_keys=[pattern_key],
             session_key=session_key,
         )
+        # No declared-allowlist degradation here, by design: an allowlist names
+        # executables and a worktree, and an execute_code payload is a Python
+        # script that can call subprocess/ctypes with no argv to judge. There is
+        # nothing for the matcher to hold, so this path stays fail-closed. The
+        # reset keeps a stale flag from an earlier command from leaking in.
+        _begin_smart_approval()
         verdict = _smart_approve(command, description)
         _observe_smart_approval_verdict(observer_payload, verdict)
         if verdict == "approve":

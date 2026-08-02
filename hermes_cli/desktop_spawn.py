@@ -27,6 +27,14 @@ nobody is there to answer — belongs to the app
 (``apps/desktop/src/lib/delegated-spawn.ts``); this side only carries the
 flag and, optionally, how long to wait.
 
+``--allow-command`` declares what an unattended session may run without a
+human, scoped to ``--allow-command-root``. It exists because the smart-approval
+classifier fails CLOSED — any error reaching it means "ask a human", and in a
+delegated run nobody is there, so each flagged command burns the approval
+timeout and is then blocked. A declaration replaces that stall with a policy
+for the commands you named, in the directory you named; everything else keeps
+failing closed. See :mod:`tools.declared_allowlist`.
+
 ``--goal`` gives the session a standing objective instead of a single errand.
 The loop that pursues it already exists (``hermes_cli/goals.py``) and has
 always been reachable as ``/goal <text>``; what this flag adds is setting it at
@@ -39,6 +47,7 @@ unattended goal session is the case this was built for.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
@@ -324,6 +333,38 @@ def _spawn_request_body(args) -> dict:
             )
         body["toolsets"] = toolsets
 
+    # ``--allow-command`` / ``--allow-command-root``: the declared command
+    # allowlist for this one session. It is what the session may run without a
+    # human when the smart-approval classifier cannot be reached — the failure
+    # that otherwise costs `approvals.timeout` per flagged command and then
+    # blocks, with nobody there to answer. Both halves are required together:
+    # an unscoped `git` could act on any repository on the machine, and a root
+    # with no commands allowlists nothing.
+    allow_commands = [
+        name.strip()
+        for name in (getattr(args, "allow_command", None) or [])
+        if name.strip()
+    ]
+    allow_root = (getattr(args, "allow_command_root", None) or "").strip()
+    if allow_commands and not allow_root:
+        raise RuntimeError(
+            "--allow-command needs --allow-command-root: an allowlist without "
+            "a directory would let those commands act anywhere on this machine."
+        )
+    if allow_root and not allow_commands:
+        raise RuntimeError(
+            "--allow-command-root only means something with --allow-command. "
+            "Name the commands it scopes, or drop the root."
+        )
+    if allow_root and not os.path.isabs(os.path.expanduser(allow_root)):
+        raise RuntimeError(
+            f"--allow-command-root must be an absolute path (got {allow_root!r}). "
+            "A relative scope would mean whichever directory the app was started in."
+        )
+    if allow_commands:
+        body["allowedCommands"] = allow_commands
+        body["allowedCommandRoot"] = allow_root
+
     delegated = bool(getattr(args, "delegated", False))
     timeout_seconds = getattr(args, "delegated_timeout", None)
 
@@ -452,6 +493,11 @@ def cmd_desktop_spawn(args) -> int:
         notes.append(
             "goal — it keeps taking the next step on its own"
             + (f", up to {budget} turns" if budget else "")
+        )
+    if allowed := body.get("allowedCommands"):
+        notes.append(
+            f"{', '.join(allowed)} may run unasked in "
+            f"{body.get('allowedCommandRoot')} if the approval classifier is down"
         )
     suffix = f" ({'; '.join(notes)})" if notes else ""
     print(f"✓ Sent prompt to the Hermes desktop app{where}{suffix}.")

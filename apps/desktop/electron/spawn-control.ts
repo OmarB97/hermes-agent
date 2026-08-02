@@ -49,6 +49,11 @@ export interface SpawnRequest {
   /** How many turns the goal may spend before it pauses. Omitted means the
    *  backend's configured default. */
   goalMaxTurns?: number
+  /** Commands this session may run without a human when the approval
+   *  classifier is unreachable. Meaningless without `allowedCommandRoot`. */
+  allowedCommands?: string[]
+  /** Absolute directory `allowedCommands` are scoped to. */
+  allowedCommandRoot?: string
   /** Unattended run: nobody is watching, so the session must not stop to ask. */
   delegated?: boolean
   /** How long a delegated session waits for a person before answering its own
@@ -155,6 +160,46 @@ export function parseSpawnRequest(raw: unknown): { error: string } | { request: 
     }
 
     request.goal = goal
+  }
+
+  // The declared command allowlist: what this session may run without a human
+  // when the approval classifier cannot be reached. Shape and pairing only —
+  // which names are actually allowlistable, and whether the root scopes them,
+  // is the gateway's call. Both halves are required together: an unscoped
+  // command could act anywhere on the machine, and a root alone allowlists
+  // nothing.
+  if (body.allowedCommands !== undefined && body.allowedCommands !== null) {
+    if (!Array.isArray(body.allowedCommands) || body.allowedCommands.some(entry => typeof entry !== 'string')) {
+      return { error: 'allowedCommands must be an array of strings' }
+    }
+
+    const allowedCommands = (body.allowedCommands as string[]).map(entry => entry.trim()).filter(Boolean)
+
+    if (!allowedCommands.length) {
+      return { error: 'allowedCommands named nothing; omit it to leave this session fail-closed' }
+    }
+
+    request.allowedCommands = allowedCommands
+  }
+
+  if (body.allowedCommandRoot !== undefined && body.allowedCommandRoot !== null) {
+    if (typeof body.allowedCommandRoot !== 'string') {
+      return { error: 'allowedCommandRoot must be a string' }
+    }
+
+    const allowedCommandRoot = body.allowedCommandRoot.trim()
+
+    if (allowedCommandRoot) {
+      request.allowedCommandRoot = allowedCommandRoot
+    }
+  }
+
+  if (request.allowedCommands && !request.allowedCommandRoot) {
+    return { error: 'allowedCommands requires allowedCommandRoot' }
+  }
+
+  if (request.allowedCommandRoot && !request.allowedCommands) {
+    return { error: 'allowedCommandRoot requires allowedCommands' }
   }
 
   if (body.goalMaxTurns !== undefined && body.goalMaxTurns !== null) {
