@@ -61,6 +61,12 @@ _BUNDLE_MULTI_HYPHEN = re.compile(r"-{2,}")
 
 _bundles_cache: Dict[str, Dict[str, Any]] = {}
 _bundles_cache_mtime: Optional[float] = None
+# The directory the cached snapshot was scanned from. Part of the cache key:
+# mtime alone does not identify a profile. A backend serving several profiles
+# resolves _bundles_dir() to a different home per request, and two homes whose
+# newest bundle file happens to share an mtime would otherwise hit the cache
+# and serve one profile's bundles to another. See _bundles_dir().
+_bundles_cache_dir: Optional[str] = None
 
 
 def _bundles_dir() -> Path:
@@ -172,7 +178,7 @@ def scan_bundles() -> Dict[str, Dict[str, Any]]:
     bundle info dict. Later bundles with a duplicate slug are skipped with
     a warning (first wins, alphabetical order).
     """
-    global _bundles_cache, _bundles_cache_mtime
+    global _bundles_cache, _bundles_cache_mtime, _bundles_cache_dir
     files = _iter_bundle_files()
     out: Dict[str, Dict[str, Any]] = {}
     for f in files:
@@ -189,18 +195,29 @@ def scan_bundles() -> Dict[str, Dict[str, Any]]:
         out[key] = info
     _bundles_cache = out
     _bundles_cache_mtime = _max_mtime(files)
+    _bundles_cache_dir = str(_bundles_dir())
     return out
 
 
 def get_skill_bundles() -> Dict[str, Dict[str, Any]]:
     """Return the current bundle mapping, rescanning when disk changed.
 
-    Cheap to call repeatedly: only rescans when the bundles directory or
-    any bundle file's mtime is newer than the cached snapshot.
+    Cheap to call repeatedly: only rescans when the resolved bundles directory
+    changes, or when that directory or any bundle file's mtime is newer than
+    the cached snapshot.
+
+    A profile switch always rescans, since the directory is part of the key —
+    correctness over a cache hit, and a rescan is a glob plus a few small YAML
+    parses.
     """
+    base = str(_bundles_dir())
     files = _iter_bundle_files()
     current_mtime = _max_mtime(files)
-    if not _bundles_cache or _bundles_cache_mtime != current_mtime:
+    if (
+        not _bundles_cache
+        or _bundles_cache_mtime != current_mtime
+        or _bundles_cache_dir != base
+    ):
         scan_bundles()
     return _bundles_cache
 
