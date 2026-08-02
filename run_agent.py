@@ -621,6 +621,18 @@ class AIAgent:
             getattr(self, "_session_telemetry_hydrated_session_id", None)
             != self.session_id
         )
+        # Only a row that ALREADY existed is authoritative for cumulative
+        # counters. A row this call creates is all-zero, and hydrating it would
+        # project those zeros over telemetry the live turn has accumulated.
+        # That is reachable: when an earlier _ensure_db_session hit a transient
+        # create failure it returned below WITHOUT binding, so the retry fires
+        # mid-turn (from _flush_messages_to_session_db), creates the row fresh,
+        # and a first-bind hydration erases the turn's tokens, cost, api-call
+        # count and compression_count. Nothing had been persisted to fall back
+        # on either — with no row, record_canonical_usage's UPDATE matched
+        # nothing. Assume pre-existing on any probe failure so an unreadable
+        # row keeps the safer restore behavior.
+        row_pre_existed = True
         if not self._session_db_created:
             source = _session_source_for_agent(self.platform)
             try:
@@ -632,6 +644,12 @@ class AIAgent:
                         profile_for_session = None
                 except Exception:
                     profile_for_session = None
+                try:
+                    row_pre_existed = bool(
+                        self._session_db.get_session(self.session_id)
+                    )
+                except Exception:
+                    row_pre_existed = True
                 self._session_db.create_session(
                     session_id=self.session_id,
                     source=source,
@@ -656,9 +674,15 @@ class AIAgent:
         # snapshots. Hydrate before turn_context's early JSON persistence can
         # project the reset_session_state() zeros over that durable truth.
         try:
-            from agent.session_telemetry import hydrate_agent_session_telemetry
+            from agent.session_telemetry import (
+                hydrate_agent_session_telemetry,
+                mark_session_telemetry_bound,
+            )
 
-            hydrate_agent_session_telemetry(self)
+            if row_pre_existed:
+                hydrate_agent_session_telemetry(self)
+            else:
+                mark_session_telemetry_bound(self)
         except Exception:
             logger.debug(
                 "Session telemetry hydration failed (session=%s)",
