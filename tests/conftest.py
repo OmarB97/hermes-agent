@@ -431,6 +431,65 @@ def _isolate_hermes_home(_hermetic_environment):
 
 
 @pytest.fixture()
+def reap_notification_pollers(monkeypatch):
+    """Stop every TUI notification poller a test starts before the next one runs.
+
+    Opt in per module with::
+
+        pytestmark = pytest.mark.usefixtures("reap_notification_pollers")
+
+    ``server._start_notification_poller`` spawns a daemon thread that loops
+    until its session is finalized. A test that registers a session straight
+    into ``server._sessions`` and pops it again — instead of closing it through
+    ``_teardown_session`` — never sets ``_finalized`` and never fires
+    ``_notif_stop``, so the thread outlives the test and keeps polling for the
+    rest of the pytest process. (Production has no such path: every
+    ``_pop_session_by_id`` is paired with ``_teardown_popped_session``.)
+
+    That matters because ``process_registry.completion_queue`` is process-wide
+    and the loop re-reads the attribute on every iteration. When a later test
+    monkeypatches an isolated ``Queue`` in, the leaked pollers see it too and
+    compete for its events: one is dropped as unowned, or bounced out and
+    re-queued 0.1s later, or held past the test's deadline. Those are the
+    load-dependent failures in ``test_run_prompt_submit_requeues_*`` and
+    ``test_notification_poller_live_loop_*``.
+
+    Uses the shared ``monkeypatch`` so a test that patches the same attribute
+    unwinds in the right order and can't leave the wrapper installed.
+    """
+    import threading
+
+    from tui_gateway import server
+
+    started: list = []
+    real_start = server._start_notification_poller
+
+    def _tracked(sid, session):
+        before = {t.ident for t in threading.enumerate()}
+        stop = real_start(sid, session)
+        started.append(
+            (stop, session, [t for t in threading.enumerate() if t.ident not in before])
+        )
+        return stop
+
+    monkeypatch.setattr(server, "_start_notification_poller", _tracked)
+    try:
+        yield
+    finally:
+        for stop, session, threads in started:
+            # The loop breaks on either brake — set both, then wait for it to
+            # actually leave the ``queue.get(timeout=0.5)`` it is parked in.
+            # Setting the event alone still leaves a window where it can take
+            # one more event off the next test's queue.
+            session["_finalized"] = True
+            stop.set()
+            for thread in threads:
+                thread.join(timeout=5)
+        alive = [t.name for _s, _sess, ts in started for t in ts if t.is_alive()]
+        assert not alive, f"notification poller thread(s) still running: {alive}"
+
+
+@pytest.fixture()
 def tmp_dir(tmp_path):
     """Provide a temporary directory that is cleaned up automatically."""
     return tmp_path

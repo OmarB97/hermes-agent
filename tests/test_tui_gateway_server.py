@@ -17,6 +17,14 @@ from hermes_cli.active_sessions import active_session_registry_snapshot
 from hermes_cli.browser_connect import ChromeDebugLaunch
 from tui_gateway import server
 
+# Four tests here (``session.resume``, ``session.create`` ×2, ``_init_session``)
+# start a real notification poller and then drop the session without closing
+# it, so the thread outlives them and competes for the process-wide completion
+# queue that the ``requeues_*`` tests below monkeypatch. Reap them per test —
+# same class of leak as ``_neuter_agent_prewarm_timer``, one test's background
+# thread landing in the next test's assertions.
+pytestmark = pytest.mark.usefixtures("reap_notification_pollers")
+
 
 @pytest.fixture(autouse=True)
 def _neuter_agent_prewarm_timer(request, monkeypatch):
@@ -3310,6 +3318,27 @@ class _RecordingAgent:
         return {"final_response": "", "messages": []}
 
 
+def test_a_started_notification_poller_does_not_outlive_its_test():
+    """Deliberately leak a poller the way ``session.create`` / ``_init_session``
+    do, so the reaper's own machinery is exercised on every run.
+
+    ``reap_notification_pollers`` (module ``pytestmark``) asserts in teardown
+    that every poller it started has actually exited. If reaping regresses,
+    this test fails there — loudly and by name — instead of the failure landing
+    later as a load-dependent flake in the requeue tests below, where a leaked
+    poller competes for the process-wide ``completion_queue`` they monkeypatch.
+    """
+    session = _session(session_key="reaper-guard")
+    server._sessions["reaper-guard-sid"] = session
+    try:
+        stop = server._start_notification_poller("reaper-guard-sid", session)
+    finally:
+        # Exactly the leak shape: dropped from the registry without going
+        # through _teardown_session, so nothing sets _finalized or fires stop.
+        server._sessions.pop("reaper-guard-sid", None)
+    assert not stop.is_set()
+
+
 @pytest.mark.parametrize("exit_code", [0, 7])
 def test_run_prompt_submit_requeues_foreign_completion(
     monkeypatch, tmp_path, exit_code
@@ -3453,14 +3482,17 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
         assert nested_started.wait(timeout=5)
         threads[0].join(timeout=5)
         assert not threads[0].is_alive()
-        # Membership, not order: the completion_queue is process-global, and
-        # notification pollers leaked by earlier session.init tests in this
-        # file legitimately steal-and-requeue foreign-session events (see
-        # _notification_poller_loop's belongs-elsewhere branch), rotating the
-        # queue. The requeue contract is that batch_2 and batch_3 both remain
-        # queued (never consumed) while batch_1's turn is in flight — so drain
-        # with a deadline (an event may be transiently held by a poller
-        # mid-cycle) and assert exactly {batch_2, batch_3} come back.
+        # Membership, not order: the requeue contract is that batch_2 and
+        # batch_3 both remain queued (never consumed) while batch_1's turn is
+        # in flight, and drain_notifications re-queues them in one pass after
+        # the drain loop, so their order relative to each other is not part of
+        # the contract. Drain with a deadline because that requeue happens on
+        # the turn thread, not this one.
+        #
+        # This used to also have to tolerate notification pollers leaked by
+        # earlier tests in this file steal-and-requeueing these events — that
+        # leak is gone (see the reap_notification_pollers pytestmark at the top
+        # of the module), so anything competing for this queue now is a bug.
         queued: dict = {}
         deadline = time.time() + 5.0
         while time.time() < deadline and set(queued) != {
