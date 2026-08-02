@@ -23,7 +23,14 @@ Why drop xdist entirely?
     the job.
 
 Usage:
-    python scripts/run_tests_parallel.py [pytest_args...]
+    python scripts/run_tests_parallel.py [targets...] [pytest_args...]
+
+    Targets are directories (``tests/agent/``), files
+    (``tests/agent/test_foo.py``), or pytest node ids
+    (``tests/agent/test_foo.py::test_x``,
+    ``tests/agent/test_foo.py::SomeClass::test_x``). A node id is split on
+    ``::``: the path part schedules the per-file subprocess, the full node
+    id is what that subprocess hands to pytest.
 
     Common pytest args pass through to each per-file pytest invocation
     (e.g. ``-q``, ``-v``, ``-x``, ``--tb=long``, ``-k 'pattern'``, ``--lf``)
@@ -33,8 +40,15 @@ Usage:
 Environment:
     HERMES_TEST_WORKERS  Override worker count (default: os.cpu_count())
     HERMES_TEST_PATHS    Override discovery roots (colon-sep, default: 'tests')
+                         Cannot carry node ids — the ``:`` separator is
+                         ambiguous with ``::``. Use a positional target.
 
-Exit code: 0 if every file's pytest exited 0; 1 otherwise.
+Exit codes:
+    0  every file's pytest exited 0, and at least one test was collected
+    1  a file failed, no test files were found, or the run collected no
+       tests at all (e.g. a ``-k`` expression that matches nothing — a run
+       that verified nothing must never report green)
+    2  a named target selected nothing (typo, moved file, malformed node id)
 """
 
 from __future__ import annotations
@@ -123,6 +137,25 @@ def _approximately_count_tests(
         results[path] = contents.count("def test_")
 
     return results
+
+
+def _split_target(arg: str) -> Tuple[str, str | None]:
+    """Split a positional target into ``(path, node_id_selector)``.
+
+    A target is either a plain filesystem path (``tests/agent/``,
+    ``tests/agent/test_foo.py``) or a pytest node id
+    (``tests/agent/test_foo.py::test_x``, or the three-part
+    ``tests/agent/test_foo.py::SomeClass::test_x``). Only the part before
+    the FIRST ``::`` names something on disk — which is why the old
+    ``Path(arg).exists()`` treatment dropped every node id on the floor.
+
+    A plain path returns ``(arg, None)``. A Windows drive letter
+    (``C:\\foo``) has a single colon and is never mistaken for a node id.
+    """
+    path_part, sep, selector = arg.partition("::")
+    if not sep:
+        return arg, None
+    return path_part, selector
 
 
 def _discover_files(roots: List[Path]) -> List[Path]:
@@ -236,8 +269,15 @@ def _run_one_file(
     repo_root: Path,
     file_timeout: float,
     retries: int = 0,
+    targets: List[str] | None = None,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Run ``python -m pytest <file> <pytest_args>`` in a fresh subprocess.
+
+    ``targets`` narrows the invocation to specific pytest node ids within
+    ``file`` (e.g. ``[".../test_foo.py::test_x"]``). The scheduling unit
+    stays the FILE — one subprocess, all of that file's node ids on one
+    command line — so per-file isolation, the timeout, and the retry are
+    unchanged. ``None`` runs the whole file.
 
     Returns (file, returncode, captured_combined_output, summary_counts, subprocess_wall_seconds).
 
@@ -270,14 +310,14 @@ def _run_one_file(
     bound a pathologically slow or hung file as a whole.
     """
     file, rc, output, summary, subproc_wall = _run_one_file_once(
-        file, pytest_args, repo_root, file_timeout
+        file, pytest_args, repo_root, file_timeout, targets
     )
     attempt = 0
     while rc != 0 and attempt < retries:
         attempt += 1
         first_output = output
         file, rc, output, summary, subproc_wall2 = _run_one_file_once(
-            file, pytest_args, repo_root, file_timeout
+            file, pytest_args, repo_root, file_timeout, targets
         )
         subproc_wall += subproc_wall2
         if rc == 0:
@@ -299,15 +339,23 @@ def _run_one_file(
 _FLAKY_RESULTS: List[Tuple[Path, str]] = []
 _flaky_lock = threading.Lock()
 
+# Files whose pytest exited 5 — "no tests collected". Per file that is a
+# legitimate pass (marker filtering can empty a whole file), so it is
+# counted rather than failed. If it holds for EVERY file in the run, the
+# run verified nothing and must not be green — see the check in main().
+_NO_TESTS_COLLECTED = 0
+_collected_lock = threading.Lock()
+
 
 def _run_one_file_once(
     file: Path,
     pytest_args: List[str],
     repo_root: Path,
     file_timeout: float,
+    targets: List[str] | None = None,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
-    cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
+    cmd = [sys.executable, "-m", "pytest", *(targets or [str(file)]), *pytest_args]
     
     subproc_start = time.monotonic()
     # launch the pytest process
@@ -365,7 +413,12 @@ def _run_one_file_once(
     if rc == 5:
         # No tests collected — every test in the file was filtered out.
         # Treat as a pass; surface info in a slightly distinct status
-        # so the operator can spot it.
+        # so the operator can spot it. Tallied so main() can tell a
+        # partially-filtered run (fine) from one that collected nothing
+        # at all (a green run that tested nothing — not fine).
+        global _NO_TESTS_COLLECTED  # noqa: PLW0603 — cross-thread tally
+        with _collected_lock:
+            _NO_TESTS_COLLECTED += 1
         rc = 0
     summary = _parse_pytest_summary(output)
     subproc_wall = time.monotonic() - subproc_start
@@ -494,17 +547,31 @@ def _print_progress(
 
 
 def _print_inline_failure(
-    file: Path, output: str, repo_root: Path, pytest_passthrough: List[str]
+    file: Path,
+    output: str,
+    repo_root: Path,
+    pytest_passthrough: List[str],
+    targets: List[str] | None = None,
 ) -> None:
     """Print a compact failure summary immediately when a file fails.
 
     Shows the tail of the pytest output (the failure section with stack
     traces) and a ready-to-run repro command, so the developer doesn't
     have to wait for the full run to finish before seeing what broke.
+
+    When the file was narrowed to specific node ids, the repro carries
+    them too — a repro that re-runs 200 tests to show the 1 that failed
+    is not a repro.
     """
     rel = _format_file(file, repo_root)
     # Build a repro command the developer can copy-paste.
     passthrough_str = " ".join(pytest_passthrough) if pytest_passthrough else ""
+    if targets:
+        rel = " ".join(
+            f"{_format_file(Path(t.split('::', 1)[0]), repo_root)}"
+            f"::{t.split('::', 1)[1]}"
+            for t in targets
+        )
     repro = f"python -m pytest {rel}"
     if passthrough_str:
         repro += f" {passthrough_str}"
@@ -829,6 +896,16 @@ def main() -> int:
 
     repo_root = Path(__file__).resolve().parent.parent
 
+    # Node-id selectors keyed by the test file they narrow, e.g.
+    # ``{Path('tests/agent/test_ssl.py'): ['/abs/tests/agent/test_ssl.py::test_x']}``.
+    # Empty for any run that names no node ids (the overwhelmingly common
+    # case, including the full suite), which keeps discovery, scheduling,
+    # and duration caching on exactly their old path.
+    selectors: Dict[Path, List[str]] = {}
+    # Each root's spelling as the user typed it, for the "Discovered ...
+    # under" line and the rejected-target report.
+    root_labels: Dict[Path, str] = {}
+
     # --files: explicit file list from the CI generate job — skip discovery.
     if args.files:
         files = [repo_root / f for f in args.files.split(":") if f.strip()]
@@ -836,10 +913,45 @@ def main() -> int:
     else:
         # Resolve discovery roots: positional path args override --paths if any
         # were supplied, otherwise --paths (which itself defaults to 'tests').
+        #
+        # A positional may be a pytest node id (``file.py::test_x``). Only
+        # its path part names something on disk, so split first and keep the
+        # selector aside — the path drives per-file scheduling, the full node
+        # id becomes that file's pytest target.
+        rejected: List[Tuple[str, str]] = []
+        node_id_targets: Dict[Path, List[str]] = {}
+        broad_roots: List[Path] = []
+        roots = []
         if args.paths_positional:
-            roots = [repo_root / p for p in args.paths_positional]
+            parsed: List[Tuple[str, Path, str | None]] = []
+            for raw in args.paths_positional:
+                path_part, selector = _split_target(raw)
+                if selector is not None and not (path_part and selector):
+                    rejected.append(
+                        (raw, "malformed node id — expected <file>::<test>")
+                    )
+                    continue
+                parsed.append((raw, repo_root / path_part, selector))
+            for raw, path, selector in parsed:
+                if path not in root_labels:
+                    roots.append(path)
+                    root_labels[path] = raw
+                elif selector is None:
+                    # A bare spelling of an already-seen path wins the label:
+                    # the whole file is going to run, so say so.
+                    root_labels[path] = raw
+                if selector is None:
+                    broad_roots.append(path)
+                else:
+                    node_id_targets.setdefault(path.resolve(), []).append(
+                        f"{path}::{selector}"
+                    )
         else:
+            # --paths is colon-separated, so it cannot carry node ids
+            # (``a.py::test_x`` would split into three roots). Node ids are
+            # a positional-only form.
             roots = [repo_root / p for p in args.paths.split(":") if p]
+            broad_roots = list(roots)
 
         if args.include_integration:
             # Caller takes responsibility — typically used via explicit -k filter.
@@ -847,6 +959,42 @@ def main() -> int:
             _SKIP_PARTS = set()
 
         files = _discover_files(roots)
+
+        # Every named target must select at least one test file. Dropping one
+        # silently — a typo, a moved file, a node id an older runner couldn't
+        # parse — is how a run reports green having verified nothing.
+        for root in roots:
+            label = root_labels.get(root) or _format_file(root, repo_root)
+            if not root.exists():
+                rejected.append((label, "no such file or directory"))
+                continue
+            real = root.resolve()
+            if not any(
+                f.resolve() == real or f.resolve().is_relative_to(real)
+                for f in files
+            ):
+                rejected.append((label, "matched no test files"))
+        if rejected:
+            for label, why in rejected:
+                print(f"error: test target {label!r}: {why}", file=sys.stderr)
+            print(
+                f"error: {len(rejected)} test target(s) selected nothing — "
+                "refusing to exit green on a run that tested them.",
+                file=sys.stderr,
+            )
+            return 2
+
+        if node_id_targets:
+            # A file ALSO reached by a plain path or a directory root runs
+            # whole, matching what pytest does with
+            # ``pytest tests/ tests/x.py::test_y``. Gated on node ids being
+            # present so the full-suite run never pays for this second walk.
+            broad_files = {f.resolve() for f in _discover_files(broad_roots)}
+            for f in files:
+                real = f.resolve()
+                ids = node_id_targets.get(real)
+                if ids and real not in broad_files:
+                    selectors[f] = ids
 
     if not files:
         print("No test files to run", file=sys.stderr)
@@ -873,6 +1021,12 @@ def main() -> int:
 
     # Count individual tests per file
     test_counts = _approximately_count_tests(files, repo_root)
+    # A narrowed file runs only its named node ids, not every ``def test_``
+    # in the file — keep the progress denominator honest. (A ``::SomeClass``
+    # selector can hold several tests; one-per-selector still beats counting
+    # the whole file.)
+    for narrowed, ids in selectors.items():
+        test_counts[narrowed] = len(ids)
     approx_total_tests = sum(test_counts.values())
 
     # Apply slicing if requested — distribute files across CI jobs by
@@ -885,7 +1039,11 @@ def main() -> int:
         approx_total_tests = sum(test_counts.values())
 
     if roots:
-        roots_str = [str(r.relative_to(repo_root)) if r.is_relative_to(repo_root) else str(r) for r in roots]
+        roots_str = [
+            root_labels.get(r)
+            or (str(r.relative_to(repo_root)) if r.is_relative_to(repo_root) else str(r))
+            for r in roots
+        ]
         print(
             f"Discovered {len(files)} test files (~{approx_total_tests} tests) under "
             f"{roots_str}; running with -j {args.jobs}",
@@ -951,7 +1109,10 @@ def main() -> int:
                 subproc_wall=subproc_wall,
             )
             if rc != 0:
-                _print_inline_failure(fpath, output, repo_root, pytest_passthrough)
+                _print_inline_failure(
+                    fpath, output, repo_root, pytest_passthrough,
+                    selectors.get(fpath),
+                )
 
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futures: List[Future] = []
@@ -959,7 +1120,7 @@ def main() -> int:
             t0 = time.monotonic()
             fut = pool.submit(
                 _run_one_file, file, pytest_passthrough, repo_root,
-                args.file_timeout, args.file_retries,
+                args.file_timeout, args.file_retries, selectors.get(file),
             )
             fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))
             futures.append(fut)
@@ -987,9 +1148,33 @@ def main() -> int:
     # partial test_durations.json; a CI merge step joins them later.
     # Locally, _save_durations merges with any existing cache so entries
     # from previous runs aren't lost.
-    if file_times:
-        _save_durations(file_times, repo_root)
-        print(f"  Durations cached to {_DURATIONS_FILE} ({len(file_times)} files)")
+    #
+    # Node-id-narrowed files are excluded: their subprocess measured ONE
+    # test, but the cache is keyed by file path, so writing it would tell
+    # a later ``--slice`` that a 90s file costs 0.3s and pile the whole
+    # slow tail into one CI job.
+    narrowed_rel = {_format_file(f, repo_root) for f in selectors}
+    cacheable = [
+        (f, t) for f, t in file_times
+        if _format_file(f, repo_root) not in narrowed_rel
+    ]
+    if cacheable:
+        _save_durations(cacheable, repo_root)
+        note = ""
+        if len(cacheable) != len(file_times):
+            note = (
+                f", {len(file_times) - len(cacheable)} skipped "
+                "(node-id run — partial timing)"
+            )
+        print(
+            f"  Durations cached to {_DURATIONS_FILE} "
+            f"({len(cacheable)} files{note})"
+        )
+    elif file_times:
+        print(
+            "  Durations NOT cached: every file was narrowed to node ids "
+            "(partial timing would poison --slice)"
+        )
 
     # Per-file time distribution (throwaway diagnostic — shows how
     # subprocess time is distributed so we can see if startup dominates).
@@ -1045,6 +1230,28 @@ def main() -> int:
             print(f"=== {len(no_tests_ran)} file{'s' if len(no_tests_ran) != 1 else ''} where no tests ran (collection/import error, timeout before collection, etc.) ===")
             for file, s in no_tests_ran:
                 print(f"  {_format_file(file, repo_root)}")
+        return 1
+
+    # Every file collected zero tests. Per file that is a legitimate pass
+    # (marker filtering can empty one out), but when it holds for the whole
+    # run nothing was verified — usually a ``-k`` expression that matches no
+    # test name. Exiting 0 here is the most convincing false green there is:
+    # instant, clean, and indistinguishable from a real pass.
+    #
+    # Keyed on pytest's own exit code 5, not on scraping the summary line,
+    # so output-only modes (``--collect-only``) can't trip it.
+    if files and _NO_TESTS_COLLECTED >= len(files):
+        print()
+        print(
+            f"error: no tests were collected in any of the {len(files)} "
+            "file(s) selected — this run verified nothing.",
+            file=sys.stderr,
+        )
+        if pytest_passthrough:
+            print(
+                f"       check the pytest args: {' '.join(pytest_passthrough)}",
+                file=sys.stderr,
+            )
         return 1
 
     return 0

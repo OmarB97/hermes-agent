@@ -1291,9 +1291,27 @@ that have caused multiple "works locally, fails in CI" incidents (and the revers
 ```bash
 scripts/run_tests.sh                                  # full suite, CI-parity
 scripts/run_tests.sh tests/gateway/                   # one directory
+scripts/run_tests.sh tests/agent/test_foo.py          # one file
 scripts/run_tests.sh tests/agent/test_foo.py::test_x  # one test
+scripts/run_tests.sh tests/agent/test_foo.py::Cls::test_x  # one test in a class
 scripts/run_tests.sh -v --tb=long                     # pass-through pytest flags
 ```
+
+**A green exit means tests actually ran.** The runner refuses to report success
+on a run that verified nothing — the most convincing false green there is,
+because it is instant and clean:
+
+- A target that selects nothing — typo'd path, moved file, malformed node id —
+  is named on stderr and exits **2**. It is never dropped silently, not even
+  when other targets in the same command resolve fine.
+- A run that collects **zero** tests overall (usually a `-k` expression
+  matching no test name) exits **1**, not 0. Per file, "no tests collected" is
+  still a legitimate pass — marker filtering empties individual files — but
+  when it holds for every file, nothing was checked.
+
+So `echo $?` after `run_tests.sh` is trustworthy: 0 means tests ran and passed.
+The summary line (`=== Summary: N files, N tests passed ===`) still tells you
+*how many*, which is worth reading when you expected a specific count.
 
 **Flake policy:** the runner auto-retries a failing test FILE once in a fresh
 subprocess (`--file-retries`, default 1; `HERMES_TEST_FILE_RETRIES=0` to
