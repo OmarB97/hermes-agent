@@ -26,7 +26,11 @@ import uuid
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
-from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
+from hermes_cli.timeouts import (
+    get_provider_first_chunk_timeout,
+    get_provider_request_timeout,
+    get_provider_stale_timeout,
+)
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
 from agent.errors import EmptyStreamError
@@ -367,6 +371,47 @@ def _dflash_context_timeout_default(api_payload: Any) -> float:
     return float(round(min(max(budget, _DFLASH_LOCAL_TIMEOUT_DEFAULT_S), ceiling)))
 
 
+def _dflash_prefill_scaled_timeout(api_payload: Any, base: float) -> float:
+    """Widen *base* by this request's context-scaled prefill cost.
+
+    This is the portable half of :func:`_dflash_context_timeout_default`. That
+    function's budget has two terms with very different provenance:
+
+      * the PER-1K PREFILL TERM, which is just arithmetic — a bigger prompt
+        takes proportionally longer to prefill on any backend. Nothing about it
+        is specific to one lane;
+      * the COLD-START ALLOWANCE, which encodes a measurement of one specific
+        deployment (llama-swap model load on taro, 138.5s). Handing that to an
+        arbitrary local server would inflate its deadline on the strength of a
+        number that says nothing about it.
+
+    So only the first term generalizes. Every local DFlash route gets context
+    scaling; the cold-start allowance and the managed-W2 floor stay gated to
+    the route they were measured on.
+
+    Widen-only: the result is never below *base*. It is NOT idempotent —
+    ``f(payload, f(payload, base))`` adds the prefill term twice — so *base*
+    must always be a fixed starting point (a constant or a configured value),
+    never a figure this function already produced. Bounded by the same ceiling
+    as the full budget so a wedged backend is still bounded.
+    """
+    if base == float("inf"):
+        return base
+    est_tokens = estimate_request_context_tokens(api_payload)
+    per_1k = _env_float(
+        "HERMES_DFLASH_PREFILL_SECONDS_PER_1K",
+        _DFLASH_PREFILL_SECONDS_PER_1K_DEFAULT,
+    )
+    ceiling = _env_float(
+        "HERMES_DFLASH_FIRST_CHUNK_CEILING",
+        _DFLASH_FIRST_CHUNK_CEILING_DEFAULT_S,
+    )
+    budget = base + per_1k * (est_tokens / 1000.0)
+    # Rounded to whole seconds — a watchdog deadline carrying float noise
+    # (180.032s) is just noise.
+    return float(round(max(base, min(budget, ceiling))))
+
+
 def _gate_status_url(base_url: Any) -> str | None:
     """Map a local provider base_url to its ai-gate status endpoint.
 
@@ -497,19 +542,17 @@ def _dflash_local_stale_timeout(api_payload: Any, model: Any) -> float | None:
     if timeout == float("inf"):
         return timeout
 
-    # Preserve the established legacy-override semantics while giving the
-    # implicit 180s default the same 240s/300s large-context protection as the
-    # first-chunk guard.
-    est_tokens = estimate_request_context_tokens(api_payload)
-    if est_tokens > 100_000:
-        return max(timeout, 300.0)
-    if est_tokens > 50_000:
-        return max(timeout, 240.0)
-    if est_tokens > 25_000:
-        return max(timeout, 150.0)
-    if est_tokens > 10_000:
-        return max(timeout, 90.0)
-    return timeout
+    # Was a step ladder (>100k -> 300s, >50k -> 240s, >25k -> 150s, >10k -> 90s)
+    # capped at 300s. It killed healthy work in production: a local DFlash lane
+    # serving a ~95k-token turn landed in the 240s bucket and had the connection
+    # killed mid-prefill, repeatedly, while the server was still working. 300s
+    # was also the budget for a 200k-token turn on a 262k-window model, so the
+    # cap removed exactly the headroom the largest requests need most.
+    #
+    # Now continuous: base + per-1k prefill cost, widen-only over the legacy
+    # override. The cold-start allowance is deliberately NOT applied here — see
+    # _dflash_prefill_scaled_timeout for why only the prefill term generalizes.
+    return _dflash_prefill_scaled_timeout(api_payload, timeout)
 
 
 def _dflash_local_first_chunk_timeout(api_payload: Any, model: Any) -> float | None:
@@ -538,6 +581,7 @@ def resolve_stream_stale_timeout(agent, api_kwargs: dict) -> float:
     configured_timeout = get_provider_stale_timeout(
         agent.provider,
         effective_model,
+        base_url=getattr(agent, "base_url", None),
     )
     if configured_timeout is not None:
         stale_timeout_base = configured_timeout
@@ -585,14 +629,19 @@ def resolve_dflash_local_first_chunk_timeout(
 ) -> float | None:
     """Resolve the local DFlash pre-first-chunk watchdog.
 
-    Provider/model ``stale_timeout_seconds`` is the canonical behavioral
-    configuration and controls both the pre-first-chunk and post-chunk stale
-    phases. Legacy first-chunk environment overrides remain compatible only
-    when config.yaml does not specify a value. Without either, the first-chunk
-    guard reuses the already-resolved stream timeout, including the 240s/300s
-    long-context floors. Managed local W2 routes have a bounded 360s floor
-    because their healthy gate-admission plus cold-prefill path can exceed the
-    generic DFlash family's 180s deadline.
+    Precedence, highest first:
+
+    1. ``first_chunk_timeout_seconds`` (per-model, then per-provider). The
+       dedicated knob for THIS phase — an operator who pins it gets exactly it.
+    2. ``stale_timeout_seconds`` (per-model, then per-provider), which governs
+       both stream phases when the dedicated knob is absent.
+    3. The legacy ``HERMES_DFLASH_FIRST_CHUNK_TIMEOUT`` /
+       ``HERMES_DFLASH_TTFB_TIMEOUT`` environment overrides.
+    4. The already-resolved stream stale timeout, widened by this request's
+       context-scaled prefill cost. Managed local W2 routes additionally get a
+       bounded 360s floor plus the cold-start allowance, because their healthy
+       gate-admission plus cold-prefill path can exceed the generic DFlash
+       family's 180s deadline.
     """
     effective_model = api_kwargs.get("model") or agent.model
     if not (
@@ -602,9 +651,23 @@ def resolve_dflash_local_first_chunk_timeout(
     ):
         return None
 
+    # The dedicated knob outranks everything, including stale_timeout_seconds:
+    # waiting for the FIRST chunk is queue admission + model load + prefill of
+    # the whole prompt, while the stale timeout measures the gap between chunks
+    # once generation is under way. A lane can legitimately want minutes for one
+    # and seconds for the other, so declaring both must not be contradictory.
+    configured_first_chunk = get_provider_first_chunk_timeout(
+        agent.provider,
+        effective_model,
+        base_url=getattr(agent, "base_url", None),
+    )
+    if configured_first_chunk is not None:
+        return configured_first_chunk
+
     configured_timeout = get_provider_stale_timeout(
         agent.provider,
         effective_model,
+        base_url=getattr(agent, "base_url", None),
     )
     if configured_timeout is not None:
         if resolved_stream_stale_timeout is None:
@@ -628,12 +691,36 @@ def resolve_dflash_local_first_chunk_timeout(
         )
 
     if not _is_managed_local_w2_route(agent, effective_model):
-        # Generic DFlash routes keep the existing policy untouched. The
-        # context-scaled budget below is calibrated on ONE lane (W2 behind
-        # llama-swap on taro); applying its cold-start allowance to an arbitrary
-        # local DFlash provider would inflate that provider's deadline on the
-        # strength of a measurement that says nothing about it.
-        return resolved_stream_stale_timeout
+        # SUPERSEDES the previous rule here, which was "generic DFlash routes
+        # keep the existing policy untouched" because the context-scaled budget
+        # below is calibrated on ONE lane (W2 behind llama-swap on taro), and
+        # applying its cold-start allowance to an arbitrary local DFlash
+        # provider would inflate that provider's deadline on the strength of a
+        # measurement that says nothing about it.
+        #
+        # That reasoning was right about the cold-start allowance and wrong to
+        # take the whole budget with it. Production evidence from a non-W2 local
+        # lane (deepseek-v4-flash-0731-ds4): three healthy prefills killed at
+        # their thresholds — 240s at ~95k tokens, 240s at ~89k, 180s at ~33k —
+        # on a lane whose real prefill at that size runs into minutes. A generic
+        # route was getting NO context scaling at all, which is indefensible:
+        # prefill cost scaling with prompt size is arithmetic, not a property of
+        # one deployment.
+        #
+        # So the split is by provenance: the per-1k prefill term generalizes to
+        # every local DFlash route, while the cold-start allowance (a measured
+        # llama-swap load time) and the 360s floor stay gated to the W2 lane
+        # below. Tradeoff, stated plainly: a wedged non-W2 local server now
+        # takes proportionally longer to trip on a large prompt (still bounded
+        # by HERMES_DFLASH_FIRST_CHUNK_CEILING, 1800s), and in exchange we stop
+        # killing prefills that are healthy. An operator who wants a tighter
+        # deadline declares first_chunk_timeout_seconds, which wins outright.
+        return max(
+            resolved_stream_stale_timeout,
+            _dflash_prefill_scaled_timeout(
+                api_kwargs, _DFLASH_LOCAL_TIMEOUT_DEFAULT_S
+            ),
+        )
 
     floor = max(resolved_stream_stale_timeout, _MANAGED_W2_FIRST_CHUNK_TIMEOUT_DEFAULT_S)
     if floor == float("inf"):
@@ -708,7 +795,9 @@ def _derive_stream_stale_timeout(agent, api_kwargs: dict) -> float:
     watchdog shares the exact same patience budget as the OpenAI/Anthropic
     stale-stream detector below.
     """
-    _cfg_stale = get_provider_stale_timeout(agent.provider, agent.model)
+    _cfg_stale = get_provider_stale_timeout(
+        agent.provider, agent.model, base_url=getattr(agent, "base_url", None)
+    )
     if _cfg_stale is not None:
         _base = _cfg_stale
     else:
@@ -2309,7 +2398,9 @@ def try_activate_fallback(
         # Honor per-provider / per-model request_timeout_seconds for the
         # fallback target (same knob the primary client uses).  None = use
         # SDK default.
-        _fb_timeout = get_provider_request_timeout(fb_provider, fb_model)
+        _fb_timeout = get_provider_request_timeout(
+            fb_provider, fb_model, base_url=fb_base_url
+        )
 
         if fb_api_mode == "anthropic_messages":
             # Build native Anthropic client instead of using OpenAI client
@@ -3139,7 +3230,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         import httpx as _httpx
         # Per-provider / per-model request_timeout_seconds (from config.yaml)
         # wins over the HERMES_API_TIMEOUT env default if the user set it.
-        _provider_timeout_cfg = get_provider_request_timeout(agent.provider, agent.model)
+        _provider_timeout_cfg = get_provider_request_timeout(
+            agent.provider, agent.model, base_url=getattr(agent, "base_url", None)
+        )
         _base_timeout = (
             _provider_timeout_cfg
             if _provider_timeout_cfg is not None

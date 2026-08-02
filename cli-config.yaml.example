@@ -122,6 +122,19 @@ model:
 # implicit non-stream stale detector is auto-disabled for local endpoints
 # and can scale upward for very large contexts.
 #
+# ``first_chunk_timeout_seconds`` bounds the wait BEFORE the first streamed
+# chunk, which is a different cost from the gap between chunks: queue
+# admission, a possible model load, and prefill of the whole prompt. A local
+# lane can legitimately need minutes there while still wanting a tight
+# inter-chunk watchdog, so this outranks ``stale_timeout_seconds`` for that
+# phase. Unset, the pre-first-chunk budget scales with the request's context
+# size instead of using a fixed deadline.
+#
+# All three are read under the provider entry that owns the endpoint. A session
+# running on a user-declared provider reports its runtime provider as the bare
+# billing class "custom", so these are matched back to your ``providers:``
+# entry by its base_url — declare them under the named entry, not "custom".
+#
 # Not currently wired for AWS Bedrock (bedrock_converse + AnthropicBedrock
 # SDK paths) — those use boto3 with its own timeout configuration.
 #
@@ -138,6 +151,10 @@ model:
 #     models:
 #       gpt-5.4:
 #         stale_timeout_seconds: 1800  # Longer non-stream stale timeout for slow large-context turns
+#   my-local-lane:
+#     api: http://10.0.0.5:8000/v1
+#     first_chunk_timeout_seconds: 900  # Deep-context prefill can run many minutes
+#     stale_timeout_seconds: 120        # But once tokens flow, 2min of silence is a stall
 
 # =============================================================================
 # OpenRouter Provider Routing (only applies when using OpenRouter)
