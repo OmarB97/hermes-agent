@@ -217,6 +217,11 @@ async function desktopSessionCreateParams(
       ? { model: selection.model, ...(selection.provider ? { provider: selection.provider } : {}) }
       : {}),
     ...(selection.effort ? { reasoning_effort: selection.effort } : {}),
+    // Toolsets have no composer selection to fall back on — the backend
+    // resolves them per process — so this key exists only when a caller pinned
+    // one. Omitted is the normal path and means "whatever the backend
+    // resolved", which is what every typed chat sends.
+    ...(overrides?.toolsets?.length ? { toolsets: overrides.toolsets } : {}),
     fast: selection.fast
   }
 }

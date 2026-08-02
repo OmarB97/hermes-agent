@@ -102,13 +102,17 @@ def build_gui_parser(
         default=None,
         help="Hermes profile to run the session under. Omit to use the app's active profile.",
     )
-    # No --toolsets here on purpose. The gateway's `session.create` has no
-    # toolsets parameter and `_make_agent` resolves `enabled_toolsets` from the
-    # process env + config, so there is nothing a per-spawn toolset list could
-    # bind to — the flag shipped in #298 was validated, transported to the
-    # renderer, and then dropped on the floor. `hermes tools` changes them for
-    # real (it writes config); a flag that quietly does nothing is worse than
-    # no flag at all.
+    spawn_parser.add_argument(
+        "--toolsets",
+        default=None,
+        help=(
+            "Comma-separated toolsets to enable for this session only, e.g. "
+            "'file,terminal' or 'all'. Accepts built-in toolsets, plugin "
+            "toolsets and enabled MCP server names. Scoped to this one chat — "
+            "it does not change what your next chat gets (use `hermes tools` "
+            "for that). Omit to inherit the app's current toolsets."
+        ),
+    )
     spawn_parser.add_argument(
         "--delegated",
         action="store_true",

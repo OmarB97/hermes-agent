@@ -40,6 +40,9 @@ export interface SpawnRequest {
   model?: string
   provider?: string
   profile?: string
+  /** Toolsets to pin for this one session. Names are checked by the gateway
+   *  (`session.create`), which owns the vocabulary; this side only shapes it. */
+  toolsets?: string[]
   /** Unattended run: nobody is watching, so the session must not stop to ask. */
   delegated?: boolean
   /** How long a delegated session waits for a person before answering its own
@@ -110,17 +113,24 @@ export function parseSpawnRequest(raw: unknown): { error: string } | { request: 
     }
   }
 
-  // `toolsets` was accepted here in #298 and then dropped: the renderer never
-  // read it, and it had nowhere to land anyway — the gateway's `session.create`
-  // takes no toolsets parameter and `_make_agent` resolves `enabled_toolsets`
-  // from the process env + config, so toolsets are per-process, not per-session.
-  // Say so instead of taking a value we cannot honor, the same way an attended
-  // `delegatedTimeoutMs` is refused below.
+  // Shape only — whether these NAME anything real is the gateway's call, since
+  // the vocabulary (built-ins, plugin toolsets, enabled MCP servers) lives on
+  // the Python side and varies by profile. An all-blank list is a typo rather
+  // than a request to inherit, so it is refused here instead of quietly
+  // becoming "keep the app's toolsets" — that silent drop is what made this
+  // flag a no-op for its entire first life (#298, removed in #315).
   if (body.toolsets !== undefined && body.toolsets !== null) {
-    return {
-      error:
-        'toolsets is not supported: this app cannot bind toolsets to a single session. Use `hermes tools` to change the enabled toolsets.'
+    if (!Array.isArray(body.toolsets) || body.toolsets.some(entry => typeof entry !== 'string')) {
+      return { error: 'toolsets must be an array of strings' }
     }
+
+    const toolsets = (body.toolsets as string[]).map(entry => entry.trim()).filter(Boolean)
+
+    if (!toolsets.length) {
+      return { error: 'toolsets named nothing; omit it to inherit the current toolsets' }
+    }
+
+    request.toolsets = toolsets
   }
 
   if (body.delegated !== undefined && body.delegated !== null) {

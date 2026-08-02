@@ -1256,7 +1256,7 @@ describe('createBackendSessionForSend per-session overrides', () => {
 
   async function createWithOverrides(
     setup: () => void,
-    overrides?: { model?: string; profile?: string; provider?: string }
+    overrides?: { model?: string; profile?: string; provider?: string; toolsets?: string[] }
   ): Promise<Record<string, unknown> | undefined> {
     let createParams: Record<string, unknown> | undefined
 
@@ -1308,6 +1308,31 @@ describe('createBackendSessionForSend per-session overrides', () => {
 
     expect($currentModel.get()).toBe('anthropic/claude-sonnet-4.6')
     expect($currentProvider.get()).toBe('anthropic')
+  })
+
+  // The leg that was missing for this flag's whole first life: `--toolsets`
+  // reached the renderer and stopped, because nothing put it into the
+  // session.create params. Unlike model/provider/profile there is no composer
+  // selection behind it — the backend resolves toolsets per process — so the
+  // key must appear ONLY when a caller pinned one.
+  it('sends pinned toolsets through to session.create', async () => {
+    const params = await createWithOverrides(() => {}, { toolsets: ['file', 'terminal'] })
+
+    expect(params).toMatchObject({ toolsets: ['file', 'terminal'] })
+  })
+
+  it('omits toolsets entirely for an ordinary chat', async () => {
+    const params = await createWithOverrides(() => {})
+
+    expect(params).not.toHaveProperty('toolsets')
+  })
+
+  // `toolsets: []` would be refused by the gateway, so an empty pin must not
+  // reach the wire as one.
+  it('omits an empty toolsets pin rather than sending it', async () => {
+    const params = await createWithOverrides(() => {}, { toolsets: [] })
+
+    expect(params).not.toHaveProperty('toolsets')
   })
 
   it('routes an overridden profile', async () => {

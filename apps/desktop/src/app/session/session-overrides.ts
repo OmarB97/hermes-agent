@@ -16,9 +16,16 @@ export interface SessionCreateOverrides {
   model?: string
   provider?: string
   profile?: string
+  /** Toolsets to pin for this session only. The gateway validates the names and
+   *  fails the create if any does not resolve, so a pinned session either has
+   *  the tools that were asked for or does not exist. */
+  toolsets?: string[]
 }
 
 /** True when at least one override is actually set (empty objects are noise). */
 export function hasSessionOverrides(overrides: null | SessionCreateOverrides | undefined): boolean {
-  return Boolean(overrides && (overrides.model || overrides.provider || overrides.profile))
+  return Boolean(
+    overrides &&
+      (overrides.model || overrides.provider || overrides.profile || overrides.toolsets?.length)
+  )
 }

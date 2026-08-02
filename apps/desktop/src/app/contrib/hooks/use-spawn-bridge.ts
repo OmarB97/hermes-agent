@@ -5,7 +5,7 @@ import { $freshDraftReady } from '@/store/session'
 import { isSecondaryWindow } from '@/store/windows'
 
 import type { SubmitTextOptions } from '../../session/hooks/use-prompt-actions/utils'
-import type { SessionCreateOverrides } from '../../session/session-overrides'
+import { hasSessionOverrides, type SessionCreateOverrides } from '../../session/session-overrides'
 import type { ClientSessionState } from '../../types'
 
 /** How long to wait for a new-chat draft to settle before submitting anyway. */
@@ -60,6 +60,7 @@ interface SpawnPayload {
   model?: string
   provider?: string
   profile?: string
+  toolsets?: string[]
   delegated?: boolean
   delegatedTimeoutMs?: number
 }
@@ -87,9 +88,10 @@ interface SpawnBridgeParams {
  * means the transcript, tool cards, titles and sidebar all behave exactly as
  * they do for a typed message, with no parallel streaming path to maintain.
  *
- * Model/provider/profile ride along as per-session overrides rather than being
- * written into the composer's selection stores, which persist — a spawn must
- * not silently change the model the user gets on their next chat.
+ * Model/provider/profile/toolsets ride along as per-session overrides rather
+ * than being written into the composer's selection stores (or, for toolsets,
+ * into config via `tools.configure`) — all of which persist. A spawn must not
+ * silently change the model or the tools the user gets on their next chat.
  *
  * A `--delegated` spawn additionally gets the unattended contract prepended to
  * its prompt, and its session is marked so `useDelegatedClarify` will answer a
@@ -136,6 +138,10 @@ export function useSpawnBridge({ startFreshSession, submitText, updateSessionSta
         overrides.profile = payload.profile
       }
 
+      if (payload.toolsets?.length) {
+        overrides.toolsets = payload.toolsets
+      }
+
       // The contract goes in the prompt itself so the model reads it before it
       // does anything; the timeout is hung on the session so the auto-answer
       // still fires if it ignores the contract and asks anyway.
@@ -171,7 +177,10 @@ export function useSpawnBridge({ startFreshSession, submitText, updateSessionSta
 
           await submitTextRef.current(text, {
             attachments: [],
-            ...(overrides.model || overrides.provider || overrides.profile ? { sessionOverrides: overrides } : {}),
+            // `hasSessionOverrides`, not a hand-rolled field list: this gate
+            // silently drops any override it has not been taught about, which
+            // is precisely how `--toolsets` reached the renderer and died.
+            ...(hasSessionOverrides(overrides) ? { sessionOverrides: overrides } : {}),
             ...(delegatedTimeoutMs !== null
               ? {
                   onSessionCreated: (sessionId: string) =>

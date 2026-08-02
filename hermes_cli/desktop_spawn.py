@@ -135,15 +135,12 @@ def _read_control_file(path: Path) -> dict:
 def _spawn_request_body(args) -> dict:
     """Build the JSON body for POST /spawn, omitting unset optional fields.
 
-    Only carries what the renderer can actually bind to a new session:
-    model/provider/profile become per-session overrides on ``session.create``.
-    Toolsets deliberately do NOT belong here — the gateway resolves
-    ``enabled_toolsets`` per process, not per session, so the app would have to
-    drop the value (see the note in ``hermes_cli/subcommands/gui.py``). The
-    control server rejects a ``toolsets`` key outright rather than take one it
-    cannot honor.
+    Everything here is bound per-session by ``session.create`` on the gateway:
+    model/provider/profile/toolsets steer this one chat and never write config,
+    so a spawn cannot change what the user's next chat gets.
 
-    Raises RuntimeError for flag combinations argparse cannot express.
+    Raises RuntimeError for flag combinations argparse cannot express, and for
+    a ``--toolsets`` value that resolves to nothing.
     """
     body: dict = {"prompt": args.prompt}
     for key in ("model", "provider"):
@@ -154,6 +151,22 @@ def _spawn_request_body(args) -> dict:
     profile = _requested_profile(args)
     if profile:
         body["profile"] = profile
+
+    # Split here rather than shipping the raw string: the wire contract is a
+    # list of names, and the gateway validates them against the same vocabulary
+    # HERMES_TUI_TOOLSETS accepts. A value that is all separators is a typo, not
+    # a request to inherit — say so instead of silently spawning with the app's
+    # toolsets, which is the failure this flag already had once (#315).
+    raw_toolsets = getattr(args, "toolsets", None)
+    if raw_toolsets is not None:
+        toolsets = [t.strip() for t in str(raw_toolsets).split(",") if t.strip()]
+        if not toolsets:
+            raise RuntimeError(
+                f"--toolsets got no usable names (got {raw_toolsets!r}). Pass a "
+                "comma-separated list like 'file,terminal', or drop the flag to "
+                "inherit the app's toolsets."
+            )
+        body["toolsets"] = toolsets
 
     delegated = bool(getattr(args, "delegated", False))
     timeout_seconds = getattr(args, "delegated_timeout", None)
