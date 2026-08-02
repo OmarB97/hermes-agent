@@ -24,6 +24,14 @@ that — the contract prepended to the prompt, and answering a clarify prompt
 nobody is there to answer — belongs to the app
 (``apps/desktop/src/lib/delegated-spawn.ts``); this side only carries the
 flag and, optionally, how long to wait.
+
+``--goal`` gives the session a standing objective instead of a single errand.
+The loop that pursues it already exists (``hermes_cli/goals.py``) and has
+always been reachable as ``/goal <text>``; what this flag adds is setting it at
+session creation, so the goal is a property of the session rather than of its
+first message. The gateway binds it in ``session.create``, exactly as it binds
+model and toolsets. Composes with ``--delegated`` and ``--profile``: an
+unattended goal session is the case this was built for.
 """
 
 from __future__ import annotations
@@ -142,7 +150,40 @@ def _spawn_request_body(args) -> dict:
     Raises RuntimeError for flag combinations argparse cannot express, and for
     a ``--toolsets`` value that resolves to nothing.
     """
-    body: dict = {"prompt": args.prompt}
+    goal = (getattr(args, "goal", None) or "").strip()
+    prompt = (getattr(args, "prompt", None) or "").strip()
+
+    # The objective is already a statement of what to do, so a goal spawn does
+    # not need a separate opening prompt — this mirrors `/goal <text>`, which
+    # sets the goal and then submits that same text as the kickoff turn. A
+    # caller who wants a different first move can still pass both.
+    if goal and not prompt:
+        prompt = goal
+    if not prompt:
+        raise RuntimeError(
+            "nothing to send: pass a prompt, or --goal with the objective to "
+            "work toward."
+        )
+
+    body: dict = {"prompt": prompt}
+    if goal:
+        body["goal"] = goal
+
+    goal_turns = getattr(args, "goal_turns", None)
+    # A turn budget with no goal would be read by nobody. Say so rather than
+    # accepting the flag and quietly running an ordinary one-shot session.
+    if goal_turns is not None and not goal:
+        raise RuntimeError(
+            "--goal-turns only applies to a goal spawn. Add --goal, or drop "
+            "the turn budget."
+        )
+    if goal_turns is not None:
+        if goal_turns < 1:
+            raise RuntimeError(
+                f"--goal-turns must be at least 1 (got {goal_turns})."
+            )
+        body["goalMaxTurns"] = goal_turns
+
     for key in ("model", "provider"):
         value = getattr(args, key, None)
         if value:
@@ -277,11 +318,15 @@ def cmd_desktop_spawn(args) -> int:
     # running app's window whichever profile it runs under, so the transcript
     # is the only other place that distinction shows up.
     where = f" (profile: {body['profile']})" if body.get("profile") else ""
+    notes = []
     if body.get("delegated"):
-        print(
-            f"✓ Sent prompt to the Hermes desktop app{where} "
-            "(delegated — it will not stop to ask)."
+        notes.append("delegated — it will not stop to ask")
+    if body.get("goal"):
+        budget = body.get("goalMaxTurns")
+        notes.append(
+            "goal — it keeps taking the next step on its own"
+            + (f", up to {budget} turns" if budget else "")
         )
-    else:
-        print(f"✓ Sent prompt to the Hermes desktop app{where}.")
+    suffix = f" ({'; '.join(notes)})" if notes else ""
+    print(f"✓ Sent prompt to the Hermes desktop app{where}{suffix}.")
     return 0

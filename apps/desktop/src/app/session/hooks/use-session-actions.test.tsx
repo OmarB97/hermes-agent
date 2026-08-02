@@ -1256,7 +1256,14 @@ describe('createBackendSessionForSend per-session overrides', () => {
 
   async function createWithOverrides(
     setup: () => void,
-    overrides?: { model?: string; profile?: string; provider?: string; toolsets?: string[] }
+    overrides?: {
+      goal?: string
+      goalMaxTurns?: number
+      model?: string
+      profile?: string
+      provider?: string
+      toolsets?: string[]
+    }
   ): Promise<Record<string, unknown> | undefined> {
     let createParams: Record<string, unknown> | undefined
 
@@ -1346,6 +1353,30 @@ describe('createBackendSessionForSend per-session overrides', () => {
     const params = await createWithOverrides(() => {}, { toolsets: [] })
 
     expect(params).not.toHaveProperty('toolsets')
+  })
+
+  // Same shape as toolsets: no composer selection backs a goal, so the key
+  // must appear ONLY when a caller asked for one.
+  it('sends the overridden goal through to session.create', async () => {
+    const params = await createWithOverrides(() => {}, { goal: 'ship the release' })
+
+    expect(params).toMatchObject({ goal: 'ship the release' })
+  })
+
+  // The gateway is Python and reads snake_case; goalMaxTurns is the override
+  // field's (camelCase) name, but the wire key it must land under is
+  // goal_max_turns.
+  it('sends goalMaxTurns through to session.create as goal_max_turns', async () => {
+    const params = await createWithOverrides(() => {}, { goal: 'ship the release', goalMaxTurns: 40 })
+
+    expect(params).toMatchObject({ goal_max_turns: 40 })
+  })
+
+  it('omits goal and goal_max_turns entirely for an ordinary chat', async () => {
+    const params = await createWithOverrides(() => {})
+
+    expect(params).not.toHaveProperty('goal')
+    expect(params).not.toHaveProperty('goal_max_turns')
   })
 
   it('routes an overridden profile', async () => {

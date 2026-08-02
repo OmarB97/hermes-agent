@@ -43,6 +43,12 @@ export interface SpawnRequest {
   /** Toolsets to pin for this one session. Names are checked by the gateway
    *  (`session.create`), which owns the vocabulary; this side only shapes it. */
   toolsets?: string[]
+  /** Standing objective for this session. The gateway binds it to the session's
+   *  goal loop in `session.create`, so the very first turn is judged against it. */
+  goal?: string
+  /** How many turns the goal may spend before it pauses. Omitted means the
+   *  backend's configured default. */
+  goalMaxTurns?: number
   /** Unattended run: nobody is watching, so the session must not stop to ask. */
   delegated?: boolean
   /** How long a delegated session waits for a person before answering its own
@@ -131,6 +137,41 @@ export function parseSpawnRequest(raw: unknown): { error: string } | { request: 
     }
 
     request.toolsets = toolsets
+  }
+
+  // A goal is what the session is FOR, so a blank one is a caller that meant to
+  // set an objective and sent nothing — refused here rather than quietly
+  // starting an ordinary one-shot chat that looks like a goal session until it
+  // stops after one turn.
+  if (body.goal !== undefined && body.goal !== null) {
+    if (typeof body.goal !== 'string') {
+      return { error: 'goal must be a string' }
+    }
+
+    const goal = body.goal.trim()
+
+    if (!goal) {
+      return { error: 'goal was empty; omit it to start a session with no goal' }
+    }
+
+    request.goal = goal
+  }
+
+  if (body.goalMaxTurns !== undefined && body.goalMaxTurns !== null) {
+    if (typeof body.goalMaxTurns !== 'number' || !Number.isInteger(body.goalMaxTurns)) {
+      return { error: 'goalMaxTurns must be an integer' }
+    }
+
+    if (body.goalMaxTurns < 1) {
+      return { error: 'goalMaxTurns must be at least 1' }
+    }
+
+    // A turn budget on a session with no goal would be read by nobody.
+    if (!request.goal) {
+      return { error: 'goalMaxTurns requires goal' }
+    }
+
+    request.goalMaxTurns = body.goalMaxTurns
   }
 
   if (body.delegated !== undefined && body.delegated !== null) {

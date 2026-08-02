@@ -190,6 +190,66 @@ test('rejects a wait on a spawn that is not delegated', () => {
   assert.ok('error' in parseSpawnRequest({ prompt: 'hi', delegated: false, delegatedTimeoutMs: 30_000 }))
 })
 
+// ---------------------------------------------------------------------- goal
+
+test('carries a goal and its turn budget when given', () => {
+  const result = parseSpawnRequest({ prompt: 'hi', goal: '  ship the parser  ', goalMaxTurns: 40 })
+
+  assert.ok('request' in result)
+  assert.deepEqual(result.request, { prompt: 'hi', goal: 'ship the parser', goalMaxTurns: 40 })
+})
+
+test('a spawn with no goal keeps no goal keys at all', () => {
+  const result = parseSpawnRequest({ prompt: 'hi', goal: null, goalMaxTurns: null })
+
+  assert.ok('request' in result)
+  assert.deepEqual(Object.keys(result.request), ['prompt'])
+})
+
+// A blank goal is a caller that meant to set an objective and sent nothing.
+// Accepting it would start a chat that looks like a goal session right up until
+// it stops after one turn — the same accept-and-drop that killed --toolsets.
+test('rejects a goal that names nothing', () => {
+  assert.ok('error' in parseSpawnRequest({ prompt: 'hi', goal: '   ' }))
+  assert.ok('error' in parseSpawnRequest({ prompt: 'hi', goal: 7 }))
+})
+
+test('rejects a turn budget that is not a usable count', () => {
+  for (const value of ['40', 1.5, Number.NaN, 0, -1]) {
+    assert.ok(
+      'error' in parseSpawnRequest({ prompt: 'hi', goal: 'ship it', goalMaxTurns: value }),
+      String(value)
+    )
+  }
+})
+
+// A budget with no goal to spend it on means the caller meant something we are
+// not doing.
+test('rejects a turn budget on a spawn with no goal', () => {
+  assert.ok('error' in parseSpawnRequest({ prompt: 'hi', goalMaxTurns: 40 }))
+})
+
+test('a goal composes with delegated and the other overrides', () => {
+  const result = parseSpawnRequest({
+    prompt: 'hi',
+    goal: 'ship the parser',
+    goalMaxTurns: 40,
+    delegated: true,
+    model: 'deepseek-v4-flash-0731-ds4',
+    profile: 'work'
+  })
+
+  assert.ok('request' in result)
+  assert.deepEqual(result.request, {
+    prompt: 'hi',
+    goal: 'ship the parser',
+    goalMaxTurns: 40,
+    delegated: true,
+    model: 'deepseek-v4-flash-0731-ds4',
+    profile: 'work'
+  })
+})
+
 // -------------------------------------------------------------------- server
 
 test('binds loopback only, on an ephemeral port', async () => {

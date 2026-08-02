@@ -6551,6 +6551,37 @@ def _(rid, params: dict) -> dict:
 
         create_toolsets_override = resolution.enabled
 
+    # ``goal`` (standing objective): bind the Ralph goal loop at creation rather
+    # than making the caller send "/goal <text>" as the first prompt. The slash
+    # command works — it sets the goal and re-sends the text as the kickoff turn
+    # — but it means a programmatic caller has to know the composer's command
+    # vocabulary to ask for a goal, and the goal exists only after a turn has
+    # already been submitted. Binding here makes it a property of the session,
+    # set before the first turn, exactly like the model and toolset pins above.
+    #
+    # Validated here, applied after the session dict exists so a create that
+    # fails later leaves no goal row behind.
+    create_goal = ""
+    create_goal_max_turns = None
+    if (raw_goal := params.get("goal")) is not None:
+        if not isinstance(raw_goal, str):
+            return _err(rid, 4028, "goal must be a string")
+        create_goal = raw_goal.strip()
+        if not create_goal:
+            return _err(
+                rid, 4028, "goal was empty — omit it to start a session with no goal"
+            )
+    if (raw_goal_turns := params.get("goal_max_turns")) is not None:
+        if isinstance(raw_goal_turns, bool) or not isinstance(raw_goal_turns, int):
+            return _err(rid, 4028, "goal_max_turns must be an integer")
+        if raw_goal_turns < 1:
+            return _err(rid, 4028, "goal_max_turns must be at least 1")
+        # A budget with no goal would be read by nobody. Say so rather than
+        # accept a request whose caller clearly meant to set a goal too.
+        if not create_goal:
+            return _err(rid, 4028, "goal_max_turns requires goal")
+        create_goal_max_turns = raw_goal_turns
+
     ready = threading.Event()
     now = time.time()
     lease, limit_message = _claim_active_session_slot(
@@ -6595,6 +6626,36 @@ def _(rid, params: dict) -> dict:
             "transport": current_transport() or _stdio_transport,
         }
         _register_session_cwd(_sessions[sid])
+
+    # Apply the standing goal now that the session exists. Keyed by `key` —
+    # the same session_key the post-turn hook in _run_prompt_submit reads, so
+    # the very first turn is already judged against the goal.
+    #
+    # A goal that cannot be stored must not fail the create: the session is
+    # perfectly usable without one, and refusing to open a chat because
+    # SessionDB hiccuped would be a worse outcome than a chat with no loop. It
+    # is logged loudly instead, because a silently goal-less "goal session"
+    # would look identical to a working one right up until it stopped.
+    if create_goal:
+        try:
+            from hermes_cli.goals import GoalManager
+
+            try:
+                _goals_cfg = _load_cfg().get("goals") or {}
+                _goal_default_turns = int(_goals_cfg.get("max_turns", 20) or 20)
+            except Exception:
+                _goal_default_turns = 20
+            GoalManager(
+                session_id=key,
+                default_max_turns=_goal_default_turns,
+            ).set(create_goal, max_turns=create_goal_max_turns)
+        except Exception as _goal_set_exc:
+            print(
+                f"[tui_gateway] session.create could not set goal for {key}: "
+                f"{type(_goal_set_exc).__name__}: {_goal_set_exc}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     # NOTE: we intentionally do NOT persist a DB row here. Every TUI/desktop
     # launch (and every "New agent" / draft) opens a session here just to paint
@@ -11119,7 +11180,22 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             # ("✓ Goal achieved" / "⏸ budget exhausted") is surfaced as
             # a system line so the user sees progress regardless of
             # outcome. Mirrors gateway/run._post_turn_goal_continuation.
-            if status == "complete" and isinstance(raw, str) and raw.strip():
+            #
+            # A turn that produced no response still has to reach the goal.
+            # `status` here is already the remapped message.complete value, so a
+            # turn classified `timed_out` or `failed` upstream arrives as
+            # "error" (see the remap above). Those used to fall outside this
+            # block entirely: the goal stayed `active`, no continuation was ever
+            # queued, and the loop was stranded — the session looked alive while
+            # nothing was driving it. They now go to `record_turn_failure`,
+            # which retries once and then stalls the goal visibly.
+            #
+            # "interrupted" is deliberately NOT routed here. That is the user
+            # pressing Stop, and a goal loop that re-poked the agent straight
+            # after would make Stop mean nothing.
+            _goal_turn_ok = status == "complete" and isinstance(raw, str) and bool(raw.strip())
+            _goal_turn_failed = status == "error"
+            if _goal_turn_ok or _goal_turn_failed:
                 try:
                     from hermes_cli.goals import GoalManager
 
@@ -11135,16 +11211,30 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                             default_max_turns=goal_max_turns,
                         )
                         if goal_mgr.is_active():
-                            try:
-                                from hermes_cli.goals import gather_background_processes as _gather_bg
-                                _bg_procs = _gather_bg()
-                            except Exception:
-                                _bg_procs = None
-                            decision = goal_mgr.evaluate_after_turn(
-                                raw,
-                                user_initiated=True,
-                                background_processes=_bg_procs,
-                            )
+                            if _goal_turn_ok:
+                                try:
+                                    from hermes_cli.goals import gather_background_processes as _gather_bg
+                                    _bg_procs = _gather_bg()
+                                except Exception:
+                                    _bg_procs = None
+                                decision = goal_mgr.evaluate_after_turn(
+                                    raw,
+                                    user_initiated=True,
+                                    background_processes=_bg_procs,
+                                )
+                            else:
+                                # The frozen outcome is the only place that
+                                # still distinguishes a timeout from a plain
+                                # failure — `status` collapsed both to "error".
+                                _outcome = frozen_outcome or {}
+                                decision = goal_mgr.record_turn_failure(
+                                    kind=(
+                                        "timeout"
+                                        if _outcome.get("status") == "timed_out"
+                                        else "failed"
+                                    ),
+                                    detail=str(_outcome.get("reason") or ""),
+                                )
                             verdict_msg = decision.get("message") or ""
                             if verdict_msg:
                                 _emit(

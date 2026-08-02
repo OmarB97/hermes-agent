@@ -27,3 +27,15 @@ it('is true for any single override, including toolsets alone', () => {
 it('does not count an empty toolsets array as an override', () => {
   expect(hasSessionOverrides({ toolsets: [] })).toBe(false)
 })
+
+// A goal has nothing else it depends on to matter — a spawn naming only a
+// goal must still reach session.create, or the backend never starts the loop.
+it('is true when only goal is set', () => {
+  expect(hasSessionOverrides({ goal: 'ship the release' })).toBe(true)
+})
+
+// goalMaxTurns is a budget FOR a goal, not a standing objective of its own —
+// alone it has no loop to attach to, so it must not count as an override.
+it('does not count goalMaxTurns alone as an override', () => {
+  expect(hasSessionOverrides({ goalMaxTurns: 40 })).toBe(false)
+})
