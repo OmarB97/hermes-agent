@@ -8,13 +8,28 @@ import {
   $activeSessionId,
   $connection,
   $currentCwd,
+  $currentFastMode,
+  $currentReasoningEffort,
+  $primaryFastMode,
+  $primaryModel,
+  $primaryProvider,
+  $primaryReasoningEffort,
   $selectedStoredSessionId,
   $unreadFinishedSessionIds,
   applyConfiguredDefaultProjectDir,
+  clearActiveSessionRuntime,
   mergeSessionPage,
   sessionAliasIds,
   sessionPinId,
+  setActiveSessionFastMode,
+  setActiveSessionModel,
+  setActiveSessionProvider,
+  setActiveSessionReasoningEffort,
   setCurrentCwd,
+  setCurrentFastMode,
+  setCurrentModel,
+  setCurrentProvider,
+  setCurrentReasoningEffort,
   setSelectedStoredSessionId,
   workspaceCwdForNewSession
 } from './session'
@@ -385,5 +400,85 @@ describe('unread finished sessions', () => {
 
     setSelectedStoredSessionId('s1')
     expect($unreadFinishedSessionIds.get()).toEqual([])
+  })
+})
+
+// The reasoning-effort/fast-mode half of the #318 fix: those two sticky
+// composer fields had the identical leak as model/provider (a session's
+// runtime metadata overwriting the composer's persisted pick) but were left
+// unfixed. Same shape as $activeSessionModel/$primaryModel throughout.
+describe('composer runtime mirrors — reasoning effort / fast mode', () => {
+  afterEach(() => {
+    clearActiveSessionRuntime()
+    setCurrentModel('')
+    setCurrentProvider('')
+    setCurrentReasoningEffort('')
+    setCurrentFastMode(false)
+  })
+
+  it('setCurrentReasoningEffort/setCurrentFastMode persist the pick to localStorage', () => {
+    setCurrentReasoningEffort('high')
+    setCurrentFastMode(true)
+
+    expect(window.localStorage.getItem('hermes.desktop.composer.reasoning-effort')).toBe('high')
+    expect(window.localStorage.getItem('hermes.desktop.composer.fast')).toBe('true')
+  })
+
+  it('setActiveSessionReasoningEffort/setActiveSessionFastMode do not touch localStorage', () => {
+    setCurrentReasoningEffort('high')
+    setCurrentFastMode(true)
+
+    setActiveSessionReasoningEffort('low')
+    setActiveSessionFastMode(false)
+
+    // The persisted pick — what a NEW chat reads — is untouched by the mirror write.
+    expect(window.localStorage.getItem('hermes.desktop.composer.reasoning-effort')).toBe('high')
+    expect(window.localStorage.getItem('hermes.desktop.composer.fast')).toBe('true')
+  })
+
+  it('$primaryReasoningEffort/$primaryFastMode fall back to the pick when no session owns the mirror', () => {
+    setCurrentReasoningEffort('medium')
+    setCurrentFastMode(true)
+
+    expect($primaryReasoningEffort.get()).toBe('medium')
+    expect($primaryFastMode.get()).toBe(true)
+  })
+
+  it('$primaryReasoningEffort/$primaryFastMode show the mirror once a session reports its own value', () => {
+    setCurrentReasoningEffort('high')
+    setCurrentFastMode(true)
+
+    setActiveSessionReasoningEffort('low')
+    setActiveSessionFastMode(false)
+
+    expect($primaryReasoningEffort.get()).toBe('low')
+    expect($primaryFastMode.get()).toBe(false)
+    // The pick itself never moved.
+    expect($currentReasoningEffort.get()).toBe('high')
+    expect($currentFastMode.get()).toBe(true)
+  })
+
+  it('clearActiveSessionRuntime hands all four mirrors back to the pick', () => {
+    setCurrentModel('anthropic/claude-sonnet-4.6')
+    setCurrentProvider('anthropic')
+    setCurrentReasoningEffort('high')
+    setCurrentFastMode(true)
+
+    setActiveSessionModel('deepseek-v4-flash-0731-ds4')
+    setActiveSessionProvider('ai-router')
+    setActiveSessionReasoningEffort('low')
+    setActiveSessionFastMode(false)
+
+    expect($primaryModel.get()).toBe('deepseek-v4-flash-0731-ds4')
+    expect($primaryProvider.get()).toBe('ai-router')
+    expect($primaryReasoningEffort.get()).toBe('low')
+    expect($primaryFastMode.get()).toBe(false)
+
+    clearActiveSessionRuntime()
+
+    expect($primaryModel.get()).toBe('anthropic/claude-sonnet-4.6')
+    expect($primaryProvider.get()).toBe('anthropic')
+    expect($primaryReasoningEffort.get()).toBe('high')
+    expect($primaryFastMode.get()).toBe(true)
   })
 })

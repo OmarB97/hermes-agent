@@ -332,6 +332,20 @@ export const $currentFallbackPolicy = atom<'' | 'any' | 'local-only' | 'off'>(''
 export const $currentReasoningEffort = atom(storedString(COMPOSER_EFFORT_KEY) ?? '')
 export const $currentServiceTier = atom('')
 export const $currentFastMode = atom(storedBoolean(COMPOSER_FAST_KEY, false))
+// Runtime mirrors for the other two sticky composer fields — same reason and
+// shape as $activeSessionModel/$activeSessionProvider above: a session's
+// reported reasoning_effort/fast must paint the mirror, never overwrite
+// $currentReasoningEffort/$currentFastMode (the composer's persisted pick).
+export const $activeSessionReasoningEffort = atom<null | string>(null)
+export const $activeSessionFastMode = atom<boolean | null>(null)
+
+/** Same shape as $primaryModel/$primaryProvider: the open session's
+ *  effort/fast, falling back to the composer's sticky pick on a fresh draft. */
+export const $primaryReasoningEffort = computed(
+  [$activeSessionReasoningEffort, $currentReasoningEffort],
+  (live, picked) => live ?? picked
+)
+export const $primaryFastMode = computed([$activeSessionFastMode, $currentFastMode], (live, picked) => live ?? picked)
 // Effective approval-bypass state mirrored from the gateway (session.info).
 // Persistence lives in the backend config (approvals.mode), so this is a plain
 // reflection of the truth the gateway reports rather than its own store.
@@ -433,12 +447,17 @@ export const setCurrentProvider = (next: Updater<string>) => {
 // back to the composer's sticky pick (a fresh draft owns no session).
 export const setActiveSessionModel = (next: Updater<null | string>) => updateAtom($activeSessionModel, next)
 export const setActiveSessionProvider = (next: Updater<null | string>) => updateAtom($activeSessionProvider, next)
+export const setActiveSessionReasoningEffort = (next: Updater<null | string>) =>
+  updateAtom($activeSessionReasoningEffort, next)
+export const setActiveSessionFastMode = (next: Updater<boolean | null>) => updateAtom($activeSessionFastMode, next)
 
-/** Hand the model display back to the composer's pick — a fresh draft, or a
- *  gateway swap that left no open session. */
-export const clearActiveSessionModel = () => {
+/** Hand the model/provider/effort/fast display back to the composer's pick —
+ *  a fresh draft, or a gateway swap that left no open session. */
+export const clearActiveSessionRuntime = () => {
   setActiveSessionModel(null)
   setActiveSessionProvider(null)
+  setActiveSessionReasoningEffort(null)
+  setActiveSessionFastMode(null)
 }
 
 export const getCurrentModelSource = (): ComposerModelSource => {

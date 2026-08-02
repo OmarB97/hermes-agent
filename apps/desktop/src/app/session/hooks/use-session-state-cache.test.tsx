@@ -14,10 +14,12 @@ import {
   $currentServiceTier,
   $currentUsage,
   $messages,
+  $primaryFastMode,
   $primaryModel,
   $primaryProvider,
+  $primaryReasoningEffort,
   $turnStartedAt,
-  clearActiveSessionModel,
+  clearActiveSessionRuntime,
   setActiveSessionId,
   setActiveSessionStoredIdRotation,
   setCurrentFallbackPolicy,
@@ -122,7 +124,7 @@ describe('useSessionStateCache — per-session turn timer', () => {
     })
     window.localStorage.clear()
     setTurnStartedAt(null)
-    clearActiveSessionModel()
+    clearActiveSessionRuntime()
     setCurrentModel('')
     setCurrentProvider('')
     setCurrentReasoningEffort('')
@@ -136,7 +138,7 @@ describe('useSessionStateCache — per-session turn timer', () => {
     cleanup()
     vi.restoreAllMocks()
     setTurnStartedAt(null)
-    clearActiveSessionModel()
+    clearActiveSessionRuntime()
     setCurrentModel('')
     setCurrentProvider('')
     setCurrentReasoningEffort('')
@@ -217,10 +219,12 @@ describe('useSessionStateCache — per-session turn timer', () => {
     let cache!: Cache
 
     // The composer's sticky pick — what a NEW chat would be created with. The
-    // focused session's model must paint over it on screen without overwriting
-    // it in storage.
+    // focused session's model/effort/fast must paint over it on screen without
+    // overwriting it in storage.
     setCurrentModel('anthropic/claude-sonnet-4.6')
     setCurrentProvider('anthropic')
+    setCurrentReasoningEffort('low')
+    setCurrentFastMode(false)
 
     const { rerender } = render(
       <Harness activeSessionId="fg-runtime" onReady={c => (cache = c)} selectedStoredSessionId="fg-stored" />
@@ -244,8 +248,8 @@ describe('useSessionStateCache — per-session turn timer', () => {
 
     // Background metadata is cached but must not bleed into the visible statusbar.
     expect($primaryModel.get()).toBe('anthropic/claude-sonnet-4.6')
-    expect($currentReasoningEffort.get()).toBe('')
-    expect($currentFastMode.get()).toBe(false)
+    expect($primaryReasoningEffort.get()).toBe('low')
+    expect($primaryFastMode.get()).toBe(false)
     expect($currentFallbackPolicy.get()).toBe('')
 
     rerender(<Harness activeSessionId="bg-runtime" onReady={c => (cache = c)} selectedStoredSessionId="bg-stored" />)
@@ -259,15 +263,17 @@ describe('useSessionStateCache — per-session turn timer', () => {
 
     expect($primaryModel.get()).toBe('anthropic/claude-opus-4.8')
     expect($primaryProvider.get()).toBe('anthropic')
-    expect($currentReasoningEffort.get()).toBe('high')
+    expect($primaryReasoningEffort.get()).toBe('high')
     expect($currentServiceTier.get()).toBe('priority')
-    expect($currentFastMode.get()).toBe(true)
+    expect($primaryFastMode.get()).toBe(true)
     expect($currentFallbackPolicy.get()).toBe('local-only')
 
     // ...and the composer's persisted pick is untouched, so the next new chat
-    // still starts on the model the user chose.
+    // still starts on the model/effort/fast the user chose.
     expect($currentModel.get()).toBe('anthropic/claude-sonnet-4.6')
     expect($currentProvider.get()).toBe('anthropic')
+    expect($currentReasoningEffort.get()).toBe('low')
+    expect($currentFastMode.get()).toBe(false)
   })
 
   it('clears stale model metadata when the newly focused session has no cached value', () => {
@@ -297,16 +303,18 @@ describe('useSessionStateCache — per-session turn timer', () => {
       cache.syncSessionStateToView('bg-runtime', bgState!)
     })
 
-    // The focused session reported no model, so the display blanks (the pill's
-    // loader) rather than keeping the previous session's — but the composer's
-    // own pick survives in storage for the next new chat.
+    // The focused session reported no model/effort/fast, so the display blanks
+    // (the pill's loader) rather than keeping the previous session's — but the
+    // composer's own pick survives in storage for the next new chat.
     expect($primaryModel.get()).toBe('')
     expect($primaryProvider.get()).toBe('')
+    expect($primaryReasoningEffort.get()).toBe('')
+    expect($primaryFastMode.get()).toBe(false)
     expect($currentModel.get()).toBe('previous-model')
     expect($currentProvider.get()).toBe('previous-provider')
-    expect($currentReasoningEffort.get()).toBe('')
+    expect($currentReasoningEffort.get()).toBe('high')
     expect($currentServiceTier.get()).toBe('')
-    expect($currentFastMode.get()).toBe(false)
+    expect($currentFastMode.get()).toBe(true)
     expect($currentFallbackPolicy.get()).toBe('')
   })
 
@@ -342,6 +350,41 @@ describe('useSessionStateCache — per-session turn timer', () => {
     expect($currentModel.get()).toBe('anthropic/claude-sonnet-4.6')
     expect($currentProvider.get()).toBe('anthropic')
     expect(window.localStorage.getItem('hermes.desktop.composer.model')).toBe('anthropic/claude-sonnet-4.6')
+  })
+
+  // The same #298-shaped leak, for the other two sticky composer fields (#318
+  // only fixed model/provider). `state.reasoningEffort`/`state.fast` are
+  // stamped from every session.info too, so routing them through
+  // setCurrentReasoningEffort/setCurrentFastMode here rewrote the user's
+  // persisted pick on every heartbeat of a session running a different value.
+  it("does not write a focused session's effort/fast into the persisted composer pick", () => {
+    setCurrentReasoningEffort('high')
+    setCurrentFastMode(true)
+
+    let cache!: Cache
+    render(<Harness activeSessionId="spawn-runtime" onReady={c => (cache = c)} selectedStoredSessionId="spawn-stored" />)
+
+    // Three heartbeats, as a live session emits over its lifetime.
+    for (let beat = 0; beat < 3; beat += 1) {
+      act(() => {
+        cache.updateSessionState(
+          'spawn-runtime',
+          state => ({ ...state, fast: false, reasoningEffort: 'low' }),
+          'spawn-stored'
+        )
+      })
+    }
+
+    // The focused session shows its own effort/fast...
+    expect($primaryReasoningEffort.get()).toBe('low')
+    expect($primaryFastMode.get()).toBe(false)
+
+    // ...and the next new chat still gets the user's pick, from memory and
+    // from the localStorage the composer re-seeds itself from on restart.
+    expect($currentReasoningEffort.get()).toBe('high')
+    expect($currentFastMode.get()).toBe(true)
+    expect(window.localStorage.getItem('hermes.desktop.composer.reasoning-effort')).toBe('high')
+    expect(window.localStorage.getItem('hermes.desktop.composer.fast')).toBe('true')
   })
 
   it('switches the context meter immediately to the newly focused cached session', () => {

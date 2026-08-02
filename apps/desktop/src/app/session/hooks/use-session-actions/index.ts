@@ -28,7 +28,7 @@ import {
   $sessions,
   $sessionsTotal,
   $yoloActive,
-  clearActiveSessionModel,
+  clearActiveSessionRuntime,
   type NewChatWorkspaceTarget,
   sessionAliasIds,
   setActiveSessionId,
@@ -342,9 +342,9 @@ export function useSessionActions({
       // back to the profile default, so we deliberately don't reset it here. The
       // profile default still owns first-run seeding and profile switches (see
       // refreshCurrentModel). Only the live-session mirrors ($currentServiceTier
-      // and the model/provider pair) are cleared — with no session open, the
-      // composer's own pick is what the pill should show again.
-      clearActiveSessionModel()
+      // and the model/provider/effort/fast quartet) are cleared — with no
+      // session open, the composer's own pick is what the pill should show again.
+      clearActiveSessionRuntime()
       setCurrentServiceTier('')
       setCurrentFallbackPolicy('')
       setYoloActive(false)

@@ -7,13 +7,13 @@ import {
   $awaitingResponse,
   $busy,
   $currentCwd,
-  $currentFastMode,
-  $currentReasoningEffort,
   $lastVisibleMessageIsUser,
   $messages,
   $messagesEmpty,
+  $primaryFastMode,
   $primaryModel,
   $primaryProvider,
+  $primaryReasoningEffort,
   $selectedStoredSessionId
 } from '@/store/session'
 
@@ -49,7 +49,9 @@ export const PRIMARY_SESSION_VIEW: SessionView = {
   $awaitingResponse,
   $busy,
   $cwd: $currentCwd,
-  $fast: $currentFastMode,
+  // The OPEN session's fast mode, not the composer's persisted pick — those
+  // are the same value only on a fresh draft (see $primaryModel).
+  $fast: $primaryFastMode,
   $lastVisibleIsUser: $lastVisibleMessageIsUser,
   $messages,
   $messagesEmpty,
@@ -57,7 +59,7 @@ export const PRIMARY_SESSION_VIEW: SessionView = {
   // the same value only on a fresh draft (see $primaryModel).
   $model: $primaryModel,
   $provider: $primaryProvider,
-  $reasoningEffort: $currentReasoningEffort,
+  $reasoningEffort: $primaryReasoningEffort,
   $runtimeId: $activeSessionId,
   $storedId: $selectedStoredSessionId
 }

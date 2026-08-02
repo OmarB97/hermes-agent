@@ -10,14 +10,14 @@ import {
   $currentCwd,
   $sessions,
   sessionMatchesStoredId,
+  setActiveSessionFastMode,
   setActiveSessionModel,
   setActiveSessionProvider,
+  setActiveSessionReasoningEffort,
   setCurrentBranch,
   setCurrentCwd,
   setCurrentFallbackPolicy,
-  setCurrentFastMode,
   setCurrentPersonality,
-  setCurrentReasoningEffort,
   setCurrentServiceTier,
   setCurrentUsage,
   setSessions,
@@ -569,8 +569,10 @@ export function applyRuntimeInfo(
     sessionState.personality = personality
   }
 
+  // Same leak as model/provider above (#318 fixed only those two): a
+  // session's reported effort paints the mirror, never the composer's pick.
   if (typeof info.reasoning_effort === 'string') {
-    setCurrentReasoningEffort(info.reasoning_effort)
+    setActiveSessionReasoningEffort(info.reasoning_effort)
     sessionState.reasoningEffort = info.reasoning_effort
   }
 
@@ -580,7 +582,7 @@ export function applyRuntimeInfo(
   }
 
   if (typeof info.fast === 'boolean') {
-    setCurrentFastMode(info.fast)
+    setActiveSessionFastMode(info.fast)
     sessionState.fast = info.fast
   }
 
@@ -604,13 +606,14 @@ export function applyRuntimeInfo(
 
 export function applyStoredSessionPreviewRuntimeInfo(stored: { model?: null | string } | undefined) {
   // A resume in flight has no runtime id yet, so the mirror (not $activeSessionId)
-  // is what keeps the stored row's model on screen until session.info lands.
+  // is what keeps the stored row's model (and effort/fast) on screen until
+  // session.info lands.
   setActiveSessionModel(stored?.model || '')
   setActiveSessionProvider('')
   setCurrentFallbackPolicy('')
-  setCurrentReasoningEffort('')
+  setActiveSessionReasoningEffort('')
   setCurrentServiceTier('')
-  setCurrentFastMode(false)
+  setActiveSessionFastMode(false)
   setYoloActive(false)
   setCurrentPersonality('')
 }
