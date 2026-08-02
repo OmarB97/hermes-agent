@@ -185,14 +185,16 @@ class TestRoutePrecedence:
         assert base_url is None
         assert _normalize_aux_provider(provider) == MAIN["provider"]
 
-    def test_vision_is_never_routed(self, hermes_home):
-        """An image payload needs a multimodal model; the vision path has its
-        own capability-aware chain. ``auxiliary.vision`` remains the pin."""
+    @pytest.mark.parametrize("task", ["vision", "moa_reference", "moa_aggregator"])
+    def test_excluded_tasks_are_never_routed(self, hermes_home, task):
+        """Vision needs a multimodal model and has its own capability-aware
+        chain; a MoA slot IS a per-slot model pin and the ensemble's value is
+        model diversity. Both keep their own config as the pin."""
         write_config(hermes_home, route_config(
             base_url=ROUTE_BASE_URL, api_key="lane-key", model="small-lane"))
 
-        assert _resolve_task_provider_model("vision") == ("auto", None, None, None, None)
-        assert _route_is_active_for_task("vision") is False
+        assert _resolve_task_provider_model(task) == ("auto", None, None, None, None)
+        assert _route_is_active_for_task(task) is False
 
     def test_raw_auxiliary_vision_config_is_untouched(self, hermes_home):
         """image_routing / vision_routing read RAW config to choose

@@ -1087,10 +1087,12 @@ Set `model` explicitly when you route to a bare `base_url` — there is no
 provider entry to read a default from, and a model id from one endpoint rarely
 exists on another.
 
-:::note Vision is not routed
+:::note Vision and MoA are not routed
 Image payloads need a multimodal model, and the vision path has its own
 capability-aware provider chain. `auxiliary.route` is a text lane; use
 `auxiliary.vision` to give screenshots and image analysis their own backend.
+Mixture-of-Agents slots are skipped too — a MoA slot is already a per-slot
+model pin, and the ensemble's value is model diversity.
 :::
 
 :::note Background review and the curator stay on your main model

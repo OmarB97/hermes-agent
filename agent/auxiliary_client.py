@@ -6386,6 +6386,11 @@ _AUX_DIRECT_API_BASE_URLS: Dict[str, str] = {
 #     text lane is a hard capability mismatch, not a cache optimisation.
 #     Users who want a dedicated vision lane already have
 #     ``auxiliary.vision.*`` — the per-task pin.
+#   * ``moa_reference`` / ``moa_aggregator`` — a MoA slot IS a per-slot model
+#     pin (``moa.presets.<name>.reference_models[]``), and the ensemble's whole
+#     value is model diversity. ``agent/moa_loop.py`` always passes an explicit
+#     provider, so the route would not fire anyway; naming them here means a
+#     slot with a blank provider can never collapse the ensemble onto one lane.
 #   * ``background_review`` / ``curator`` — both resolve their own runtime
 #     from raw config (``agent/background_review.py::_resolve_review_runtime``,
 #     ``agent/curator.py::_resolve_review_runtime``) and never call through
@@ -6393,7 +6398,7 @@ _AUX_DIRECT_API_BASE_URLS: Dict[str, str] = {
 #     transcript that is already warm in the main prompt cache.
 #   * calls with no ``task`` (``agent/plugin_llm.py``,
 #     ``trajectory_compressor.py``) — they stay on ``auto``.
-_AUX_ROUTE_EXCLUDED_TASKS = frozenset({"vision"})
+_AUX_ROUTE_EXCLUDED_TASKS = frozenset({"vision", "moa_reference", "moa_aggregator"})
 
 # A routed lane that is unreachable is quarantined for this long so a dead
 # endpoint costs its penalty once per TTL instead of once per auxiliary call.
