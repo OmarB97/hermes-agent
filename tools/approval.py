@@ -2631,7 +2631,16 @@ def _smart_approve(command: str, description: str) -> str:
             return "escalate"
 
     except Exception as e:
-        logger.debug("Smart approvals: LLM call failed (%s), escalating", e)
+        # WARNING, not debug: this fails CLOSED to a human prompt. In an
+        # unattended (gateway / cron) run every flagged command then costs a
+        # full ``approvals.timeout`` before it is blocked or left pending, and
+        # at debug level there is nothing in errors.log to explain why. The
+        # operator must be able to see that the approval LLM is the problem.
+        logger.warning(
+            "Smart approvals: LLM call failed (%s: %s) — escalating to a human "
+            "prompt. Check auxiliary.approval / auxiliary.route in config.yaml.",
+            e.__class__.__name__, e,
+        )
         return "escalate"
 
 

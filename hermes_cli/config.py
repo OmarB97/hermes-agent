@@ -1634,6 +1634,37 @@ DEFAULT_CONFIG = {
         # not a meaningful recovery, so an unretried blip silently loses the
         # call.
         "transient_retries": 2,
+        # ── Global auxiliary lane (off by default) ────────────────────────
+        # One endpoint for ALL short auxiliary work — smart approval, goal
+        # judge, title generation, compression, web_extract, ... — so those
+        # calls stop landing on the endpoint serving your main conversation.
+        # On a single-slot local server a 2-6K-token aux call evicts the KV
+        # slot holding a 95K-token conversation, and the next main turn
+        # re-reads the whole prefix instead of hitting the prompt cache.
+        #
+        # Precedence: auxiliary.<task>.*  >  auxiliary.route.*  >  "auto".
+        # "auto" means the route when one is set; ``provider: main`` on a task
+        # is the one-line opt-out back to the main model.
+        #
+        # Empty = off. Nothing here is written to config.yaml by a migration,
+        # and with every field blank resolution is identical to having no
+        # route at all. Vision is never routed here (an image payload needs a
+        # multimodal model — use auxiliary.vision instead).
+        #
+        # NOTE: with fallback_policy "any" (the default) an unreachable route
+        # silently re-routes back to the main lane, so cache protection is
+        # best-effort by design — that fallback is what keeps an unattended
+        # run from stalling on a dud lane.
+        "route": {
+            "provider": "",        # providers: entry name, or any provider id
+            "model": "",           # empty = the provider/entry default
+            "base_url": "",        # direct OpenAI-compatible endpoint
+            "api_key": "",         # inline key for base_url
+            "key_env": "",         # env var holding the key (preferred)
+            "api_mode": "",        # chat_completions | codex_responses | ...
+            "timeout": 0,          # seconds; 0 = use the per-task timeout
+            "transient_retries": 0,  # routed lanes don't retry by default
+        },
         "vision": {
             "provider": "auto",    # auto | openrouter | nous | codex | custom
             "model": "",           # e.g. "google/gemini-2.5-flash", "gpt-4o"
