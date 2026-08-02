@@ -248,7 +248,9 @@ def build_models_payload(
     if include_unconfigured:
         rows = list(rows) + [r for r in _append_unconfigured_rows(rows, ctx) if str(r.get("slug", "")).lower() != "moa"]
     effective_current_provider = _normalize_current_provider(ctx, rows)
-    rows = _hide_shadow_bare_custom_row(rows, effective_current_provider)
+    rows = _hide_shadow_bare_custom_row(
+        rows, effective_current_provider, ctx.current_provider
+    )
     if picker_hints:
         _apply_picker_hints(rows)
     if canonical_order:
@@ -273,18 +275,41 @@ def _single_named_custom_match(rows: list[dict], base_url: str) -> Optional[dict
     url = _norm_url(base_url)
     if not url:
         return None
-    matches = [
+    at_url = [
         row
         for row in rows
-        if row.get("is_user_defined")
-        and str(row.get("slug") or "").startswith("custom:")
-        and _norm_url(row.get("api_url") or "") == url
+        if row.get("is_user_defined") and _norm_url(row.get("api_url") or "") == url
     ]
-    return matches[0] if len(matches) == 1 else None
+
+    # ``list_authenticated_providers`` synthesizes the bare "Custom endpoint"
+    # row (source "model-config") only when no single configured row owns this
+    # endpoint. That decision is authoritative and already accounts for the
+    # ambiguous multi-owner case, so honour it rather than re-deriving one here.
+    if any(row.get("source") == "model-config" for row in at_url):
+        return None
+
+    prefixed = [r for r in at_url if str(r.get("slug") or "").startswith("custom:")]
+    if len(prefixed) == 1:
+        return prefixed[0]
+
+    # A ``providers:`` entry owns its endpoint under its own bare slug
+    # ("ai-router"), never the ``custom:`` prefix, so the check above cannot
+    # see it — which is why a `--provider ai-router` session (runtime provider
+    # "custom") used to fall through and stay attributed to bare ``custom``.
+    configured = [r for r in at_url if str(r.get("slug") or "") != "custom"]
+    if len(configured) == 1:
+        return configured[0]
+    return None
 
 
 def _normalize_current_provider(ctx: ConfigContext, rows: list[dict]) -> str:
-    """Map legacy bare ``custom`` state back to the named custom row."""
+    """Map bare ``custom`` runtime state back to the configured row that owns
+    the endpoint, so the picker marks that entry live instead of showing a
+    second, independently-badged "Custom endpoint" section for it.
+
+    Display attribution only — this renames nothing on disk and never touches
+    the composer's persisted selection.
+    """
     current = ctx.current_provider
     if current != "custom":
         return current
@@ -299,14 +324,29 @@ def _normalize_current_provider(ctx: ConfigContext, rows: list[dict]) -> str:
     return target
 
 
-def _hide_shadow_bare_custom_row(rows: list[dict], current_provider: str) -> list[dict]:
-    """Hide the canonical ``custom`` row when a named custom provider is active."""
-    if not str(current_provider or "").startswith("custom:"):
+def _hide_shadow_bare_custom_row(
+    rows: list[dict], current_provider: str, original_provider: str = ""
+) -> list[dict]:
+    """Hide the placeholder bare ``custom`` row when a named provider is live.
+
+    Two shapes reach here. A legacy ``custom:<name>`` selection leaves the
+    canonical ``custom`` row behind as a leftover of the provider universe. And
+    a bare ``custom`` runtime provider that ``_normalize_current_provider``
+    just attributed to a configured row leaves the ``configured-current``
+    placeholder that the explicit-only filter added to keep the live selection
+    visible — the attributed row now carries that job.
+
+    Both are synthesized rows with no endpoint of their own, so dropping them
+    removes a duplicate section, never a provider the user configured.
+    """
+    attributed = original_provider == "custom" and current_provider != "custom"
+    if not (str(current_provider or "").startswith("custom:") or attributed):
         return rows
+    shadow_sources = {"canonical", "configured-current"} if attributed else {"canonical"}
     return [
         row
         for row in rows
-        if not (row.get("slug") == "custom" and row.get("source") == "canonical")
+        if not (row.get("slug") == "custom" and row.get("source") in shadow_sources)
     ]
 
 

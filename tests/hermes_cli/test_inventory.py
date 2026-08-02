@@ -1031,3 +1031,147 @@ def test_list_authenticated_providers_refresh_busts_cache():
         assert clear.call_count == 0
         model_switch.list_authenticated_providers(refresh=True)
         assert clear.call_count == 1
+
+
+# ─── bare-custom attribution (spawn overrides) ─────────────────────────
+#
+# `hermes desktop spawn --provider <name>` binds a per-session override, and
+# resolve_runtime_provider() reports EVERY user-defined provider as
+# provider="custom" + base_url. The picker therefore sees bare "custom" for a
+# session that is really running a configured provider, and used to render it
+# as a second "Custom endpoint" section carrying its own thinking/effort badge
+# alongside the provider's own entry.
+
+
+def _endpoint_row(slug: str, api_url: str, models: list[str], **over) -> dict:
+    row = {
+        "slug": slug,
+        "name": slug,
+        "models": models,
+        "total_models": len(models),
+        "is_current": False,
+        "is_user_defined": True,
+        "source": "user-config",
+        "api_url": api_url,
+    }
+    row.update(over)
+    return row
+
+
+def _bare_custom_ctx(model: str, base_url: str) -> ConfigContext:
+    return ConfigContext(
+        current_provider="custom",
+        current_model=model,
+        current_base_url=base_url,
+        user_providers={},
+        custom_providers=[],
+    )
+
+
+def test_bare_custom_attributes_to_configured_row_serving_the_endpoint():
+    """A spawn override that matches a configured provider must be reported
+    under that provider, not as an anonymous "Custom endpoint" duplicate.
+
+    `providers:` entries carry their own bare slug ("ai-router"), never the
+    ``custom:`` prefix, so matching on that prefix alone missed them.
+    """
+    rows = [
+        _endpoint_row("ai-router", "http://10.55.0.3:8000/v1", ["ds4", "qwen3-coder"]),
+    ]
+    ctx = _bare_custom_ctx("ds4", "http://10.55.0.3:8000/v1")
+    with _list_auth_returning(rows):
+        payload = build_models_payload(ctx)
+
+    assert payload["provider"] == "ai-router"
+    assert [r["slug"] for r in payload["providers"] if r["is_current"]] == ["ai-router"]
+    assert "Custom endpoint" not in [r["name"] for r in payload["providers"]]
+
+
+def test_bare_custom_attribution_ignores_trailing_slash_and_case():
+    rows = [_endpoint_row("ai-router", "http://10.55.0.3:8000/v1", ["ds4"])]
+    ctx = _bare_custom_ctx("ds4", "HTTP://10.55.0.3:8000/V1/")
+    with _list_auth_returning(rows):
+        payload = build_models_payload(ctx)
+    assert payload["provider"] == "ai-router"
+
+
+def test_bare_custom_attribution_survives_an_unlisted_model():
+    """Attribution keys on endpoint identity, not model membership.
+
+    A row's model list is one live ``/models`` probe away from changing, so
+    keying on it would make the picker's sections flicker with endpoint
+    reachability. The running model is still surfaced on the attributed row.
+    """
+    rows = [_endpoint_row("ai-router", "http://10.55.0.3:8000/v1", ["ds4"])]
+    ctx = _bare_custom_ctx("uncurated-model", "http://10.55.0.3:8000/v1")
+    with _list_auth_returning(rows):
+        payload = build_models_payload(ctx)
+    assert payload["provider"] == "ai-router"
+
+
+def test_bare_custom_keeps_custom_endpoint_row_for_an_unmatched_endpoint():
+    """A genuinely novel endpoint keeps its "Custom endpoint" section — the
+    synthesized row is the only thing representing it."""
+    rows = [
+        _endpoint_row("ai-router", "http://10.55.0.3:8000/v1", ["ds4"]),
+        _endpoint_row(
+            "custom",
+            "http://10.99.0.9:9999/v1",
+            ["mystery"],
+            name="Custom endpoint",
+            source="model-config",
+            is_current=True,
+        ),
+    ]
+    ctx = _bare_custom_ctx("mystery", "http://10.99.0.9:9999/v1")
+    with _list_auth_returning(rows):
+        payload = build_models_payload(ctx)
+
+    assert payload["provider"] == "custom"
+    assert "Custom endpoint" in [r["name"] for r in payload["providers"]]
+
+
+def test_bare_custom_does_not_attribute_when_endpoint_is_ambiguous():
+    """Two configured rows on one endpoint can't be told apart — leave the
+    selection on bare ``custom`` rather than guessing a section."""
+    rows = [
+        _endpoint_row("proxy-a", "http://shared.local/v1", ["m1"]),
+        _endpoint_row("proxy-b", "http://shared.local/v1", ["m1"]),
+    ]
+    ctx = _bare_custom_ctx("m1", "http://shared.local/v1")
+    with _list_auth_returning(rows):
+        payload = build_models_payload(ctx)
+    assert payload["provider"] == "custom"
+
+
+def test_explicit_only_drops_the_placeholder_custom_row_after_attribution():
+    """The explicit-only filter re-adds a ``custom`` placeholder to keep the
+    live selection visible. Once attribution hands that job to the real
+    provider row, the placeholder is a duplicate section and must go."""
+    rows = [_endpoint_row("ai-router", "http://10.55.0.3:8000/v1", ["ds4"])]
+    ctx = _bare_custom_ctx("ds4", "http://10.55.0.3:8000/v1")
+    with (
+        _list_auth_returning(rows),
+        patch("hermes_cli.config.read_raw_config", return_value={}),
+        patch("hermes_cli.auth.is_provider_explicitly_configured", return_value=False),
+    ):
+        payload = build_models_payload(ctx, explicit_only=True)
+
+    assert payload["provider"] == "ai-router"
+    assert [r["slug"] for r in payload["providers"]] == ["ai-router"]
+
+
+def test_non_custom_provider_is_never_re_attributed():
+    """Only bare ``custom`` is ambiguous — a named current provider passes
+    through untouched even when another row shares its endpoint."""
+    rows = [_endpoint_row("ai-router", "http://10.55.0.3:8000/v1", ["ds4"])]
+    ctx = ConfigContext(
+        current_provider="anthropic",
+        current_model="claude-sonnet-5",
+        current_base_url="http://10.55.0.3:8000/v1",
+        user_providers={},
+        custom_providers=[],
+    )
+    with _list_auth_returning(rows):
+        payload = build_models_payload(ctx)
+    assert payload["provider"] == "anthropic"
