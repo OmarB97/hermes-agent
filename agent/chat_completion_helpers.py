@@ -30,6 +30,7 @@ from hermes_cli.timeouts import (
     get_provider_first_chunk_timeout,
     get_provider_request_timeout,
     get_provider_stale_timeout,
+    resolve_provider_config_key,
 )
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
@@ -255,19 +256,37 @@ def _is_dflash_like_model(model: Any) -> bool:
     return bool(_DFLASH_MODEL_FAMILY_RE.search(str(model or "").strip()))
 
 
-# Providers that front the lifecycle-managed W2 lane.
+# Config-entry names of the providers that front the lifecycle-managed W2 lane.
+#
+# READ THIS BEFORE ADDING A SLUG. These are `providers:` / `custom_providers:`
+# ENTRY NAMES, and they are matched against a name RECOVERED FROM CONFIG — not
+# against `agent.provider`. At runtime `agent.provider` is the bare billing
+# class "custom" for every user-declared endpoint: both return sites of
+# `hermes_cli/runtime_provider.py::_resolve_named_custom_runtime` hardcode
+# `"provider": "custom"` and keep the entry name only in `requested_provider`
+# and `source`. So a slug listed here matches NOTHING on the strength of being
+# listed.
+#
+# That is not hypothetical. `ai-router` was added to this set by a fix whose
+# own comment read "was simply never listed, so the 360s W2 floor did not apply
+# on the path the desktop actually uses" — and the fix never took effect,
+# because the comparison it fed was against `agent.provider`. The floor had
+# never applied in production on ANY lane. It went unnoticed because every test
+# assigned `provider = "ai-router"` directly onto a fake agent, bypassing
+# provider resolution entirely. `_is_managed_local_w2_route` now recovers the
+# entry name from the live endpoint before comparing; keep it that way, and
+# test any new slug through `resolve_runtime_provider`, not a stub.
 #
 # `ai-router` is the ko-nas fleet router (:9081). It proxies to taro's ai-gate,
 # which proxies to llama-swap/vLLM — the SAME physical lane as the `taro`
-# provider, with the same slow cold prefill. It was simply never listed, so the
-# 360s W2 floor did not apply on the path the desktop actually uses: a 90k-token
-# turn fell through to the generic DFlash ladder and got 240s.
+# provider, with the same slow cold prefill.
 #
 # Deliberately an allowlist, not "any local endpoint serving W2". The floor is
 # route-specific by design (see
 # test_managed_local_w2_timeout_floor_is_route_and_model_specific): an arbitrary
 # LAN provider that happens to serve a W2-named model is NOT this lane and must
-# keep the generic deadline.
+# keep the generic deadline. Recovery preserves that — it only ever returns a
+# name that a configured entry actually owns.
 _MANAGED_W2_PROVIDERS = frozenset({
     "ai-router",
     "meshboard-qualified-local",
@@ -276,13 +295,54 @@ _MANAGED_W2_PROVIDERS = frozenset({
 
 
 def _is_managed_local_w2_route(agent: Any, model: Any) -> bool:
-    """Return whether this is a managed local production W2 route."""
-    provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    """Return whether this is a managed local production W2 route.
+
+    Order is load-bearing for cost. This runs on every API turn and the
+    identity recovery below reads config, so the model test comes first and
+    returns early: a non-W2 turn never pays for it.
+
+    The allowlist is then matched twice, because the same lane presents two
+    different provider strings depending on how the agent was built:
+
+    1. directly against ``agent.provider`` — a bare entry name still matches,
+       which is the shape unit tests stub and the shape a caller that passes
+       the entry name through verbatim produces;
+    2. against the config-entry name recovered from the live endpoint — the
+       ONLY shape production ever sees, since every user-declared endpoint
+       resolves to the bare billing class ``"custom"``.
+
+    Recovery is by endpoint identity and therefore requires a ``base_url``.
+    Without one, ``resolve_provider_config_key`` would fall back to
+    ``config.model.provider``, which would hand this lane's hardcoded timing
+    exception to an endpoint we cannot identify — so no base_url means not this
+    lane. The narrowness is the point: an arbitrary LAN provider serving a
+    W2-named model must keep the generic deadline.
+    """
     model_id = str(model or "").strip().lower().rsplit("/", 1)[-1]
-    return (
-        provider in _MANAGED_W2_PROVIDERS
-        and model_id == "deepseek-v4-flash-w2"
-    )
+    if model_id != "deepseek-v4-flash-w2":
+        return False
+
+    provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    if provider in _MANAGED_W2_PROVIDERS:
+        return True
+
+    base_url = str(getattr(agent, "base_url", "") or "").strip()
+    if not base_url:
+        return False
+
+    try:
+        recovered = resolve_provider_config_key(provider, base_url)
+    except Exception:
+        # Identity recovery reads config. An unreadable or malformed config
+        # must never raise into a request path — degrade to the generic
+        # deadline instead.
+        logger.debug(
+            "Managed-W2 provider identity recovery failed for %r", provider,
+            exc_info=True,
+        )
+        return False
+
+    return str(recovered or "").strip().lower() in _MANAGED_W2_PROVIDERS
 
 
 # Prefill cost, in seconds per 1k prompt tokens, for the local DFlash family.

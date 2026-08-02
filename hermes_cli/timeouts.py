@@ -21,6 +21,35 @@ def _normalize_url(value: object) -> str:
     return str(value or "").strip().rstrip("/").lower()
 
 
+def _is_bare_custom_provider_id(provider_id: object) -> bool:
+    """Return whether *provider_id* is the bare ``custom`` billing class.
+
+    ``custom`` and ``custom:<name>`` are the only runtime provider ids that do
+    NOT already name their own ``providers:`` key, so they are the only ones a
+    reverse lookup can say anything about. Shared by the recovery helper and
+    its public wrapper so the two can never disagree about which ids need
+    recovering.
+    """
+    normalized = str(provider_id or "").strip().lower()
+    return normalized == "custom" or normalized.startswith("custom:")
+
+
+def _loaded_providers_section() -> dict | None:
+    """Return the live ``providers:`` mapping, or ``None`` if unavailable.
+
+    Uses ``load_config_readonly`` (no defensive deepcopy) because this is read
+    on API-turn paths; the result is never mutated here.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+    except Exception:
+        return None
+    providers = config.get("providers") if isinstance(config, dict) else None
+    return providers if isinstance(providers, dict) else None
+
+
 def _recover_custom_provider_key(
     provider_id: str, base_url: str | None, providers: dict | None = None
 ) -> str | None:
@@ -49,8 +78,8 @@ def _recover_custom_provider_key(
     is right for credential recovery but wrong here: a genuinely ad-hoc
     endpoint would silently inherit an unrelated provider's timeouts.
     """
-    normalized = provider_id.strip().lower()
-    if normalized != "custom" and not normalized.startswith("custom:"):
+    normalized = str(provider_id or "").strip().lower()
+    if not _is_bare_custom_provider_id(normalized):
         return None
 
     # A ``custom:<name>`` runtime id already carries the entry name.
@@ -102,6 +131,41 @@ def _recover_custom_provider_key(
     if not identity:
         return None
     return identity.split(":", 1)[1] if ":" in identity else identity
+
+
+def resolve_provider_config_key(
+    provider_id: str, base_url: str | None = None, providers: dict | None = None
+) -> str | None:
+    """Map a runtime provider id back to the config-entry name that owns it.
+
+    Public wrapper around :func:`_recover_custom_provider_key` for callers
+    outside this module that need the same identity recovery — anything keyed
+    on a ``providers:`` / ``custom_providers:`` ENTRY NAME rather than on the
+    resolved billing class. ``resolve_runtime_provider()`` reports every
+    user-declared endpoint as the bare string ``"custom"``, so code that
+    compares ``agent.provider`` against entry names matches nothing at runtime;
+    run the provider through here first.
+
+    Returns ``None`` for a named or built-in provider id (``"anthropic"``,
+    ``"openrouter"``, …). That is not "no entry exists" — those ids ARE their
+    own config key already, so there is nothing to recover and no config read
+    is performed.
+
+    Attribution is by endpoint identity: pass the agent's live ``base_url``.
+    With no ``base_url`` the underlying helper falls back to
+    ``config.model.provider``, which is right for credential/timeout recovery
+    but wrong for anything that must not be granted to an unidentified
+    endpoint — such callers should refuse to recover without a ``base_url``.
+
+    ``providers`` is loaded from config when not supplied. Supplying it also
+    engages the exactly-one-owner rule (#330): when two entries declare the
+    same endpoint, neither owns it and the result is ``None``.
+    """
+    if not _is_bare_custom_provider_id(provider_id):
+        return None
+    if providers is None:
+        providers = _loaded_providers_section()
+    return _recover_custom_provider_key(str(provider_id), base_url, providers)
 
 
 def _provider_config(
