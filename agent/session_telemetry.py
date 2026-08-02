@@ -1005,12 +1005,16 @@ def record_canonical_usage(
     compressor = getattr(agent, "context_compressor", None)
     if compressor is not None:
         try:
-            if messages_len is None:
-                compressor.update_from_response(usage_dict)
-            else:
-                compressor.update_from_response(
-                    usage_dict, messages_len=messages_len
-                )
+            # ContextEngine is a plugin ABC: in-tree ContextCompressor and any
+            # third-party engine implement update_from_response(usage) and
+            # nothing more.  Passing messages_len= raised TypeError on every
+            # main-loop call, and the except below swallowed it, so the real
+            # provider prompt count never reached the compressor and every
+            # compression decision ran on the rough preflight estimate.
+            # Record the message count the same way the preflight path does.
+            compressor.update_from_response(usage_dict)
+            if messages_len is not None:
+                compressor.last_prompt_messages_len = messages_len
             if context_length is not None and telemetry_counter(context_length) > 0:
                 compressor.context_length = telemetry_counter(context_length)
         except Exception:
