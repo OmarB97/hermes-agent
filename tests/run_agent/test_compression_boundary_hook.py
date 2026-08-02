@@ -209,6 +209,13 @@ class TestSessionCompressEvent:
             )
             original_sid = agent.session_id
             agent.context_compressor = self._stub_compressor()
+            # Since #274, SQLite is the canonical telemetry store and the
+            # compressor's counters are a projection of it: _ensure_db_session
+            # re-hydrates compression_count from the session row mid-compress.
+            # A real compressor's increment reaches that row through the
+            # telemetry persist path, but this stub only sets the in-memory
+            # attribute — seed the canonical value too or hydration resets it.
+            db.set_compression_count(original_sid, 1)
 
             agent._compress_context(
                 [{"role": "user", "content": f"m{i}"} for i in range(10)],
