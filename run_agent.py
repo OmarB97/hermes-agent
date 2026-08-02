@@ -1369,7 +1369,9 @@ class AIAgent:
         passed as a per-call ``timeout=`` kwarg, overriding the client-level
         timeout the AIAgent.__init__ path configured.
         """
-        cfg = get_provider_request_timeout(self.provider, self.model)
+        cfg = get_provider_request_timeout(
+            self.provider, self.model, base_url=getattr(self, "base_url", None)
+        )
         if cfg is not None:
             return cfg
         return env_float("HERMES_API_TIMEOUT", 1800.0)
@@ -1392,7 +1394,9 @@ class AIAgent:
         explicitly configured a stale timeout, such as auto-disabling the
         detector for local endpoints.
         """
-        cfg = get_provider_stale_timeout(self.provider, self.model)
+        cfg = get_provider_stale_timeout(
+            self.provider, self.model, base_url=getattr(self, "base_url", None)
+        )
         if cfg is not None:
             return cfg, False
 
@@ -1426,7 +1430,10 @@ class AIAgent:
         stale_base, uses_implicit_default = self._resolved_api_call_stale_timeout_base()
         base_url = getattr(self, "_base_url", None) or self.base_url or ""
         has_explicit_timeout = (
-            get_provider_stale_timeout(self.provider, self.model) is not None
+            get_provider_stale_timeout(
+                self.provider, self.model, base_url=getattr(self, "base_url", None)
+            )
+            is not None
             or os.getenv("HERMES_API_CALL_STALE_TIMEOUT") is not None
         )
         if not has_explicit_timeout and base_url and is_local_endpoint(base_url):
@@ -4602,7 +4609,9 @@ class AIAgent:
             client = build_anthropic_client(
                 self._anthropic_api_key,
                 getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=get_provider_request_timeout(
+                    self.provider, self.model, base_url=getattr(self, "base_url", None)
+                ),
                 drop_context_1m_beta=_drop_1m,
             )
         logger.debug(
@@ -4900,7 +4909,9 @@ class AIAgent:
             self._anthropic_client = build_anthropic_client(
                 new_token,
                 getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=get_provider_request_timeout(
+                    self.provider, self.model, base_url=getattr(self, "base_url", None)
+                ),
             )
         except Exception as exc:
             logger.warning("Failed to rebuild Anthropic client after credential refresh: %s", exc)
@@ -5022,7 +5033,9 @@ class AIAgent:
             self._anthropic_base_url = runtime_base
             self._anthropic_client = build_anthropic_client(
                 runtime_key, runtime_base,
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=get_provider_request_timeout(
+                    self.provider, self.model, base_url=getattr(self, "base_url", None)
+                ),
             )
             self._is_anthropic_oauth = _is_oauth_token(runtime_key) if self.provider == "anthropic" else False
             self.api_key = runtime_key
@@ -5094,7 +5107,9 @@ class AIAgent:
             self._anthropic_client = build_anthropic_client(
                 self._anthropic_api_key,
                 getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=get_provider_request_timeout(
+                    self.provider, self.model, base_url=getattr(self, "base_url", None)
+                ),
                 drop_context_1m_beta=_drop_1m,
             )
 
