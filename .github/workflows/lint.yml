@@ -8,6 +8,12 @@ name: Lint (ruff + ty)
 #      Separate job so the advisory diff still runs even when enforcement
 #      fails.
 #
+# Both jobs install ruff/ty at the versions pinned in pyproject.toml's
+# ``dev`` extra, resolved by ``.github/actions/linter-versions``. One pin,
+# one source of truth: a blocking gate must not run a floating linter that
+# a new release can turn red on untouched code, and a contributor's
+# ``uv sync --extra dev`` ruff has to agree with CI's.
+#
 # CI-sensitive file review was previously here as a ``ci-review`` job but
 # has moved to ``review-labels.yml`` so it can be rerun independently.
 
@@ -41,10 +47,19 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
 
+      - name: Resolve pinned linter versions
+        id: pins
+        uses: ./.github/actions/linter-versions
+
       - name: Install ruff + ty
         uses: ./.github/actions/retry
         with:
-          command: uv tool install ruff && uv tool install ty
+          # Pinned, not floating — and doubly so here: the HEAD scan and the
+          # base-worktree scan below must run the *same* linter, or the
+          # "new since base" diff degrades into a linter changelog.
+          command: >-
+            uv tool install ruff==${{ steps.pins.outputs.ruff }} &&
+            uv tool install ty==${{ steps.pins.outputs.ty }}
 
       - name: Determine base ref
         id: base
@@ -130,10 +145,18 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
 
+      - name: Resolve pinned ruff version
+        id: pins
+        uses: ./.github/actions/linter-versions
+
       - name: Install ruff
         uses: ./.github/actions/retry
         with:
-          command: uv tool install ruff
+          # Pinned to pyproject.toml's dev extra. A bare ``uv tool install
+          # ruff`` here means the next ruff release can fail this blocking
+          # gate on code nobody touched — and ``preview = true`` in
+          # [tool.ruff] opts us into rules that change between releases.
+          command: uv tool install ruff==${{ steps.pins.outputs.ruff }}
 
       - name: ruff check .
         # No --exit-zero, no || true. Exit code propagates to the job,
