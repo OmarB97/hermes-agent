@@ -75,6 +75,12 @@ class _FakeAgent:
     def _restore_primary_runtime(self):
         pass
 
+    def _refresh_fallback_policy(self):
+        return "any"
+
+    def _emit_pending_fallback_notice(self):
+        pass
+
     def _cleanup_dead_connections(self):
         return False
 
