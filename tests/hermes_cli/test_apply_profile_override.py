@@ -346,3 +346,68 @@ class TestSupervisedChildIgnoresStickyProfile:
         result = os.environ.get("HERMES_HOME")
         assert result is not None
         assert result.endswith("coder")
+
+
+class TestPytestArgvIsNotAHermesCommandLine:
+    """pytest's ``-p <plugin>`` must not be read as ``--profile <name>``.
+
+    ``_apply_profile_override`` runs at import of ``hermes_cli.main`` and scans
+    raw ``sys.argv``. Under pytest that argv belongs to pytest, whose ``-p``
+    selects a plugin. The step-1b regex only rejects names that cannot be
+    profile ids ("no:logging"); plugin names like "anyio" or "cacheprovider"
+    are valid ids, so they used to reach ``resolve_profile_env()`` and exit 1 —
+    failing every test in any file importing this module, directly or
+    transitively, with "Profile 'anyio' does not exist".
+    """
+
+    def test_under_pytest_is_true_during_a_test(self):
+        from hermes_cli.main import _under_pytest
+
+        assert _under_pytest() is True
+
+    def test_under_pytest_survives_unset_current_test_env(self, monkeypatch):
+        """Collection-time imports have no PYTEST_CURRENT_TEST — sys.modules
+        is what makes the guard cover them."""
+        from hermes_cli.main import _under_pytest
+
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        assert _under_pytest() is True
+
+    def test_reimport_with_pytest_plugin_flag_does_not_exit(self, monkeypatch):
+        """The regression: a plugin name that is a *valid* profile id.
+
+        "cacheprovider" matches the step-1b profile-id regex, so only the
+        under-pytest guard keeps this import from calling resolve_profile_env()
+        and exiting 1 on a profile nobody asked for.
+        """
+        import importlib
+
+        monkeypatch.setattr(
+            sys, "argv", ["pytest", "-p", "cacheprovider", "tests/x.py"]
+        )
+        monkeypatch.delenv("HERMES_SKIP_PROFILE_OVERRIDE", raising=False)
+        monkeypatch.setitem(sys.modules, "hermes_cli.main", None)
+        sys.modules.pop("hermes_cli.main", None)
+
+        # Must not raise SystemExit.
+        importlib.import_module("hermes_cli.main")
+
+    def test_explicit_call_still_reads_a_real_hermes_argv(
+        self, tmp_path, monkeypatch
+    ):
+        """The guard is on the import-time call only — the function itself is
+        unchanged, so tests (and the CLI) still get full profile resolution
+        even though this whole suite runs under pytest."""
+        hermes_root = tmp_path / ".hermes"
+        (hermes_root / "profiles" / "coder").mkdir(parents=True, exist_ok=True)
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setattr(sys, "argv", ["hermes", "-p", "coder", "chat"])
+
+        from hermes_cli.main import _apply_profile_override
+        _apply_profile_override()
+
+        result = os.environ.get("HERMES_HOME")
+        assert result is not None
+        assert result.endswith("coder")

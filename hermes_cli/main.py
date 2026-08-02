@@ -473,6 +473,18 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # The flag is stripped from sys.argv so argparse never sees it.
 # Falls back to ~/.hermes/active_profile for sticky default.
 # ---------------------------------------------------------------------------
+def _under_pytest() -> bool:
+    """True when this process is a pytest run rather than a hermes command line.
+
+    Deliberately stronger than ``managed_scope._under_pytest``, which checks only
+    ``PYTEST_CURRENT_TEST``: that variable is set per-test, so it is absent while
+    pytest is *collecting* — which is exactly when a test module's top-level
+    ``import hermes_cli.main`` runs. ``sys.modules`` is true from pytest's own
+    startup onward and so covers collection, fixture setup, and test bodies alike.
+    """
+    return "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ
+
+
 def _apply_profile_override() -> None:
     """Pre-parse --profile/-p and set HERMES_HOME before module imports."""
 
@@ -655,7 +667,20 @@ def _apply_profile_override() -> None:
             sys.argv = sys.argv[:start] + sys.argv[start + consume :]
 
 
-_apply_profile_override()
+# Only when this process's argv is actually a hermes command line. pytest owns
+# `-p` too (plugin selection), and step 1b's regex cannot separate the two: it
+# rejects names that are invalid profile ids ("no:logging"), but a plugin name
+# is often a perfectly valid one ("anyio", "cacheprovider", "randomly"). Such a
+# name reaches resolve_profile_env(), which exits 1 for a profile the user never
+# asked for — killing every test in any file that imports this module, directly
+# or transitively, with "Profile 'anyio' does not exist".
+#
+# Skipping the import-time call is enough: tests that exercise the real
+# behaviour call _apply_profile_override() directly with a hermes argv. Under
+# pytest there is nothing here worth parsing anyway — the sticky active_profile
+# branch would just let a developer's `hermes profile use` leak into the suite.
+if not _under_pytest():
+    _apply_profile_override()
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
