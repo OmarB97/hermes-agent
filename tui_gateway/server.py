@@ -4924,7 +4924,14 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "service_tier": getattr(agent, "service_tier", None) or _load_service_tier(),
         "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
         "platform": "tui",
-        "session_db": _get_db(),
+        # Every other field here is inherited from the parent agent; the db has
+        # to be too. Both callers pass ``session["agent"]``, so handing back the
+        # launch handle wrote a profile session's background/preview transcript
+        # into the LAUNCHER's state.db — visible in the wrong profile's session
+        # list and missing from its own. The background agent runs on its own
+        # thread, so this must be a handle that outlives the call (the agent's,
+        # not a _session_db() one), matching _persist_live_session_runtime.
+        "session_db": getattr(agent, "_session_db", None) or _get_db(),
         "fallback_model": _agent_fallback_model(agent),
         "fallback_chain_from_config": getattr(
             agent, "_fallback_chain_from_config", False
@@ -7593,13 +7600,18 @@ def _message_preview(history: list) -> str:
 
 
 def _session_live_title(session: dict, key: str) -> str:
+    # The title lives in the db that owns this session's ROW — a profile
+    # session's is <profile_home>/state.db, where session.title persists it.
+    # Read through _get_db() (the launch profile's handle) and the lookup
+    # missed, so every profile session reported title "" in session.info and
+    # the sidebar fell back to the message preview even after a rename.
     title = str(session.get("pending_title") or "").strip()
-    db = _get_db()
-    if db is not None:
-        try:
-            title = str(db.get_session_title(key) or title or "").strip()
-        except Exception:
-            pass
+    with _session_db(session) as db:
+        if db is not None:
+            try:
+                title = str(db.get_session_title(key) or title or "").strip()
+            except Exception:
+                pass
     return title
 
 
@@ -7824,83 +7836,88 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
-    db = _get_db()
-    if db is None:
-        return _db_unavailable_error(rid, code=5007)
     key = session["session_key"]
-    if "title" not in params:
-        fallback = session.get("pending_title") or ""
-        try:
-            resolved_title = db.get_session_title(key) or ""
-            if fallback:
-                if db.set_session_title(key, fallback):
-                    session["pending_title"] = None
-                    resolved_title = fallback
-                else:
-                    existing_row = db.get_session(key)
-                    existing_title = ((existing_row or {}).get("title") or "").strip()
-                    if existing_title == fallback:
+    # Read AND write the title in the db that owns this session's row. The set
+    # path already reached the profile db, but only by accident: the launch
+    # UPDATE matched 0 rows and fell through to the _ensure_session_db_row +
+    # _session_db recovery below. The read path had no such fallback, so a
+    # renamed profile session answered "" — the title was in
+    # <profile_home>/state.db all along.
+    with _session_db(session) as db:
+        if db is None:
+            return _db_unavailable_error(rid, code=5007)
+        if "title" not in params:
+            fallback = session.get("pending_title") or ""
+            try:
+                resolved_title = db.get_session_title(key) or ""
+                if fallback:
+                    if db.set_session_title(key, fallback):
                         session["pending_title"] = None
                         resolved_title = fallback
-                    elif not resolved_title:
-                        resolved_title = fallback
-            elif resolved_title:
-                session["pending_title"] = None
-        except Exception:
-            resolved_title = fallback
-        _emit_session_info_for_session(params.get("session_id", ""), session)
-        return _ok(
-            rid,
-            {
-                "title": resolved_title,
-                "session_key": key,
-            },
-        )
-    title = (params.get("title", "") or "").strip()
-    if not title:
-        return _err(rid, 4021, "title required")
-    try:
-        if db.set_session_title(key, title):
-            session["pending_title"] = None
-            _emit_session_info_for_session(params.get("session_id", ""), session)
-            return _ok(rid, {"pending": False, "title": title})
-        # rowcount == 0 can mean "same value" as well as "missing row".
-        existing_row = db.get_session(key)
-        if existing_row:
-            session["pending_title"] = None
+                    else:
+                        existing_row = db.get_session(key)
+                        existing_title = ((existing_row or {}).get("title") or "").strip()
+                        if existing_title == fallback:
+                            session["pending_title"] = None
+                            resolved_title = fallback
+                        elif not resolved_title:
+                            resolved_title = fallback
+                elif resolved_title:
+                    session["pending_title"] = None
+            except Exception:
+                resolved_title = fallback
             _emit_session_info_for_session(params.get("session_id", ""), session)
             return _ok(
                 rid,
                 {
-                    "pending": False,
-                    "title": (existing_row.get("title") or title),
+                    "title": resolved_title,
+                    "session_key": key,
                 },
             )
-        # No row yet (the DB write is deferred to the first prompt so empty
-        # drafts don't litter the sidebar). An explicit /title is clear user
-        # intent, not an abandoned draft — so persist the row NOW and set the
-        # title, mirroring the messaging gateway's _handle_title_command. The
-        # old behavior only queued pending_title and relied on the post-turn
-        # apply block; if that turn never landed under this session_key the
-        # title was silently lost and the sidebar fell back to the message
-        # preview. Creating the row up front removes that race entirely. The
-        # min-messages sidebar filter keeps a titled 0-message row hidden, so
-        # a /title'd-but-never-used draft still doesn't clutter the list.
-        _ensure_session_db_row(session)
-        with _session_db(session) as scoped_db:
-            if scoped_db is not None and scoped_db.set_session_title(key, title):
+        title = (params.get("title", "") or "").strip()
+        if not title:
+            return _err(rid, 4021, "title required")
+        try:
+            if db.set_session_title(key, title):
                 session["pending_title"] = None
                 _emit_session_info_for_session(params.get("session_id", ""), session)
                 return _ok(rid, {"pending": False, "title": title})
-        # Row creation didn't take (DB unavailable, or a concurrent writer) —
-        # fall back to queuing so the post-turn apply block can still recover.
-        session["pending_title"] = title
-        _emit_session_info_for_session(params.get("session_id", ""), session)
-        return _ok(rid, {"pending": True, "title": title})
-    except ValueError as e:
-        return _err(rid, 4022, str(e))
-    except Exception as e:
-        return _err(rid, 5007, str(e))
+            # rowcount == 0 can mean "same value" as well as "missing row".
+            existing_row = db.get_session(key)
+            if existing_row:
+                session["pending_title"] = None
+                _emit_session_info_for_session(params.get("session_id", ""), session)
+                return _ok(
+                    rid,
+                    {
+                        "pending": False,
+                        "title": (existing_row.get("title") or title),
+                    },
+                )
+            # No row yet (the DB write is deferred to the first prompt so empty
+            # drafts don't litter the sidebar). An explicit /title is clear user
+            # intent, not an abandoned draft — so persist the row NOW and set the
+            # title, mirroring the messaging gateway's _handle_title_command. The
+            # old behavior only queued pending_title and relied on the post-turn
+            # apply block; if that turn never landed under this session_key the
+            # title was silently lost and the sidebar fell back to the message
+            # preview. Creating the row up front removes that race entirely. The
+            # min-messages sidebar filter keeps a titled 0-message row hidden, so
+            # a /title'd-but-never-used draft still doesn't clutter the list.
+            _ensure_session_db_row(session)
+            if db.set_session_title(key, title):
+                session["pending_title"] = None
+                _emit_session_info_for_session(params.get("session_id", ""), session)
+                return _ok(rid, {"pending": False, "title": title})
+            # Row creation didn't take (DB unavailable, or a concurrent writer) —
+            # fall back to queuing so the post-turn apply block can still recover.
+            session["pending_title"] = title
+            _emit_session_info_for_session(params.get("session_id", ""), session)
+            return _ok(rid, {"pending": True, "title": title})
+        except ValueError as e:
+            return _err(rid, 4022, str(e))
+        except Exception as e:
+            return _err(rid, 5007, str(e))
 
 
 def _main_runtime_from_agent(agent) -> dict | None:
@@ -9709,12 +9726,15 @@ def _(rid, params: dict) -> dict:
     key = session.get("session_key") or params.get("session_id") or ""
     agent = session.get("agent")
     meta = {}
-    db = _get_db()
-    if db and key:
-        try:
-            meta = db.get_session(key) or {}
-        except Exception:
-            meta = {}
+    # The row this status describes lives in the session's OWN db. Reading the
+    # launch handle returned no row for a profile session, so /status showed no
+    # Title and reported Created/Last Activity as "now" on every call.
+    with _session_db(session) as db:
+        if db and key:
+            try:
+                meta = db.get_session(key) or {}
+            except Exception:
+                meta = {}
 
     def _dt(value, fallback: datetime | None = None) -> datetime:
         if value:
@@ -10007,13 +10027,39 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
-    db = _get_db()
+    # A branch row is an FK CHILD of the parent's row (parent_session_id), so it
+    # has to be created in the db that actually HOLDS the parent — for a session
+    # created under a non-launch profile that is <profile_home>/state.db. Against
+    # _get_db() (the launch profile's cached handle) the INSERT hit no parent row
+    # and the whole handler died with "branch failed: FOREIGN KEY constraint
+    # failed": /branch was unusable in app-global remote mode. As in
+    # session.resume, the child agent OWNS this handle for the life of the
+    # session, so it is deliberately not auto-closed on the success path.
+    profile_home = session.get("profile_home")
+    if profile_home:
+        from hermes_state import SessionDB
+
+        try:
+            db = SessionDB(db_path=Path(profile_home) / "state.db")
+        except Exception:
+            logger.debug("failed to open profile db for branch", exc_info=True)
+            db = None
+    else:
+        db = _get_db()
     if db is None:
         return _db_unavailable_error(rid, code=5008)
+    branch_db_owned = bool(profile_home)
+
+    def _release_branch_db() -> None:
+        if branch_db_owned:
+            with contextlib.suppress(Exception):
+                db.close()
+
     old_key = session["session_key"]
     with session["history_lock"]:
         history = [dict(msg) for msg in session.get("history", [])]
     if not history:
+        _release_branch_db()
         return _err(rid, 4008, "nothing to branch — send a message first")
     new_key = _new_session_key()
     new_sid = uuid.uuid4().hex[:8]
@@ -10022,66 +10068,87 @@ def _(rid, params: dict) -> dict:
         new_key, live_session_id=new_sid, surface=source
     )
     if limit_message is not None:
+        _release_branch_db()
         return _err(rid, 4090, limit_message)
     branch_name = params.get("name", "")
     try:
-        if branch_name:
-            title = branch_name
-        else:
-            current = db.get_session_title(old_key) or "branch"
-            title = (
-                db.get_next_title_in_lineage(current)
-                if hasattr(db, "get_next_title_in_lineage")
-                else f"{current} (branch)"
+        # Bind the parent's home for the row write: _resolve_model() below reads
+        # config.yaml, and unbound it stamps the LAUNCH profile's default model
+        # into the branch's row — the same mis-binding #325 fixed for
+        # _ensure_session_db_row, made permanent here by the row's COALESCE
+        # upsert.
+        with _profile_home_bound(profile_home):
+            if branch_name:
+                title = branch_name
+            else:
+                current = db.get_session_title(old_key) or "branch"
+                title = (
+                    db.get_next_title_in_lineage(current)
+                    if hasattr(db, "get_next_title_in_lineage")
+                    else f"{current} (branch)"
+                )
+            db.create_session(
+                new_key,
+                source=source,
+                model=_resolve_model(),
+                # Stable _branched_from marker so list_sessions_rich() keeps the
+                # branch visible in /resume and /sessions. The TUI branch leaves
+                # the parent live (no end_reason='branched'), so the legacy
+                # end_reason heuristic never matches it — the marker is the only
+                # thing that surfaces TUI branches. See issue #20856.
+                model_config={"_branched_from": old_key},
+                parent_session_id=old_key,
+                cwd=_session_cwd(session),
             )
-        db.create_session(
-            new_key,
-            source=source,
-            model=_resolve_model(),
-            # Stable _branched_from marker so list_sessions_rich() keeps the
-            # branch visible in /resume and /sessions. The TUI branch leaves
-            # the parent live (no end_reason='branched'), so the legacy
-            # end_reason heuristic never matches it — the marker is the only
-            # thing that surfaces TUI branches. See issue #20856.
-            model_config={"_branched_from": old_key},
-            parent_session_id=old_key,
-            cwd=_session_cwd(session),
-        )
-        for msg in history:
-            db.append_message(
-                session_id=new_key,
-                role=msg.get("role", "user"),
-                content=msg.get("content"),
-            )
-        db.set_session_title(new_key, title)
+            for msg in history:
+                db.append_message(
+                    session_id=new_key,
+                    role=msg.get("role", "user"),
+                    content=msg.get("content"),
+                )
+            db.set_session_title(new_key, title)
     except Exception as e:
         if lease is not None:
             lease.release()
+        _release_branch_db()
         return _err(rid, 5008, f"branch failed: {e}")
     try:
         tokens = _set_session_context(new_key)
         try:
-            agent = _make_agent(
-                new_sid,
-                new_key,
-                session_id=new_key,
-                platform_override=source,
-            )
+            # The child inherits the parent's profile: its rows are in that
+            # profile's db (above), so its agent must persist there too and
+            # resolve config/skills/model under that home.
+            with _profile_home_bound(profile_home):
+                agent = _make_agent(
+                    new_sid,
+                    new_key,
+                    session_id=new_key,
+                    session_db=db,
+                    platform_override=source,
+                )
         finally:
             _clear_session_context(tokens)
-        _init_session(
-            new_sid,
-            new_key,
-            agent,
-            list(history),
-            cols=session.get("cols", 80),
-            source=source,
-        )
+        with _profile_home_bound(profile_home):
+            _init_session(
+                new_sid,
+                new_key,
+                agent,
+                list(history),
+                cols=session.get("cols", 80),
+                session_db=db,
+                source=source,
+            )
         if new_sid in _sessions:
             _sessions[new_sid]["active_session_lease"] = lease
+            # Every later turn (and every _session_db() read) re-binds from this.
+            # Without it the child would resolve its home under the LAUNCHER
+            # while its rows sit in the parent's profile db.
+            if profile_home:
+                _sessions[new_sid]["profile_home"] = str(profile_home)
     except Exception as e:
         if lease is not None:
             lease.release()
+        _release_branch_db()
         return _err(rid, 5000, f"agent init failed on branch: {e}")
     return _ok(rid, {"session_id": new_sid, "title": title, "parent": old_key})
 
@@ -10488,14 +10555,21 @@ def _(rid, params: dict) -> dict:
             truncated = history[: user_indices[ordinal]]
             session["history"] = truncated
             session["history_version"] = int(session.get("history_version", 0)) + 1
-            if (db := _get_db()) is not None:
-                try:
-                    db.replace_messages(session["session_key"], truncated)
-                    db.deactivate_turn_outcomes_from_ordinal(
-                        session["session_key"], ordinal
-                    )
-                except Exception as exc:
-                    print(f"[tui_gateway] prompt.submit: replace_messages failed: {exc}", file=sys.stderr)
+            # Rewrite the transcript in the db that owns it. Against the launch
+            # handle a profile session's rows aren't there: replace_messages
+            # raised "FOREIGN KEY constraint failed", which also skipped the
+            # turn-outcome deactivation below, and the profile db kept the FULL
+            # pre-edit history — so resuming the session brought the edited-away
+            # turns straight back. Same class as the /undo rewind in #323.
+            with _session_db(session) as db:
+                if db is not None:
+                    try:
+                        db.replace_messages(session["session_key"], truncated)
+                        db.deactivate_turn_outcomes_from_ordinal(
+                            session["session_key"], ordinal
+                        )
+                    except Exception as exc:
+                        print(f"[tui_gateway] prompt.submit: replace_messages failed: {exc}", file=sys.stderr)
         _begin_prompt_dispatch_locked(session, text)
         session["last_active"] = time.time()
 
@@ -10568,6 +10642,45 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"status": "streaming"})
 
 
+def _resolve_session_lineage_key(session: dict, evt_key: str) -> str:
+    """Map ``evt_key`` forward to its continuation tip in *this session's* db.
+
+    Both notification-ownership checks ask the same question — "is this event's
+    key part of my compression lineage?" — and that is a question about the db
+    holding this session's rows. For a session created under a non-launch
+    profile those rows are in ``<profile_home>/state.db``; ``_get_db()`` (the
+    launch profile's cached handle, bound to ``DEFAULT_DB_PATH`` at import) has
+    no such row, so ``resolve_resume_session_id`` silently returned the raw key
+    and a post-compression profile session stopped recognising its own
+    pre-compression dispatches. With the fail-closed gate of #55578 in front,
+    that dropped the delegation completion outright.
+
+    Only a profile session needs a non-launch handle, and for one we prefer the
+    agent's own long-lived handle over opening a new one: this runs in the
+    notification poll loop, and a fresh read-write ``SessionDB`` per event would
+    take that profile db's schema write lock at poll frequency and contend with
+    that profile's live backend. Every path that builds a profile session's
+    agent (the deferred build, resume, branch) hands it that profile's handle,
+    so it answers for the same rows ``_session_db`` would; ``_session_db`` is
+    the fallback for a session whose agent isn't built yet. A launch-profile
+    session takes neither branch and resolves through the shared handle exactly
+    as it always has.
+    """
+    if not evt_key:
+        return evt_key
+    try:
+        if session.get("profile_home"):
+            agent_db = getattr(session.get("agent"), "_session_db", None)
+            if agent_db is not None:
+                return agent_db.resolve_resume_session_id(evt_key) or evt_key
+        with _session_db(session) as db:
+            if db is not None:
+                return db.resolve_resume_session_id(evt_key) or evt_key
+    except Exception:
+        pass
+    return evt_key
+
+
 def _notification_event_belongs_elsewhere(sid: str, session: dict, evt: dict) -> bool:
     """True if ``evt`` is owned by a *different* live session.
 
@@ -10606,13 +10719,7 @@ def _notification_event_belongs_elsewhere(sid: str, session: dict, evt: dict) ->
     # still running. Resolve the event's original key to its continuation tip so
     # an event captured before or after compression still maps to the same live
     # desktop session instead of becoming an orphan that any poller may consume.
-    resolved_key = evt_key
-    try:
-        db = _get_db()
-        if db is not None:
-            resolved_key = db.resolve_resume_session_id(evt_key) or evt_key
-    except Exception:
-        resolved_key = evt_key
+    resolved_key = _resolve_session_lineage_key(session, evt_key)
 
     # If the key has a live continuation, prefer that continuation over the
     # compressed parent. Otherwise a stale parent tab could consume the event
@@ -10681,14 +10788,7 @@ def _session_owns_notification_event(sid: str, session: dict, evt: dict) -> bool
     }
     if evt_key in current_keys:
         return True
-    try:
-        db = _get_db()
-        resolved_key = (
-            db.resolve_resume_session_id(evt_key) if db is not None else evt_key
-        ) or evt_key
-    except Exception:
-        resolved_key = evt_key
-    return resolved_key in current_keys
+    return _resolve_session_lineage_key(session, evt_key) in current_keys
 
 
 def _notification_event_requires_owner(evt: dict) -> bool:
@@ -11413,23 +11513,29 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             # Apply pending_title now that the DB row exists.
             _pending = session.get("pending_title")
             if _pending and status == "complete":
-                _pdb = _get_db()
-                if _pdb:
-                    _session_key = session.get("session_key") or sid
-                    try:
-                        if _pdb.set_session_title(_session_key, _pending):
+                # ``_ensure_session_db_row`` just wrote that row through
+                # ``_session_db``, so the title has to be applied to the same
+                # db. Against the launch handle the UPDATE matched no row,
+                # returned False, and left pending_title set — so a session
+                # created with a title under a non-launch profile retried
+                # forever and never persisted one.
+                with _session_db(session) as _pdb:
+                    if _pdb:
+                        _session_key = session.get("session_key") or sid
+                        try:
+                            if _pdb.set_session_title(_session_key, _pending):
+                                session["pending_title"] = None
+                        except ValueError as exc:
+                            # Invalid/duplicate title — non-retryable, drop it.
+                            # Auto-title will take over. Fix for #19029.
                             session["pending_title"] = None
-                    except ValueError as exc:
-                        # Invalid/duplicate title — non-retryable, drop it.
-                        # Auto-title will take over. Fix for #19029.
-                        session["pending_title"] = None
-                        logger.info(
-                            "Dropping pending title for session %s: %s",
-                            _session_key, exc,
-                        )
-                    except Exception:
-                        # Transient DB failure — keep pending_title for retry.
-                        pass
+                            logger.info(
+                                "Dropping pending title for session %s: %s",
+                                _session_key, exc,
+                            )
+                        except Exception:
+                            # Transient DB failure — keep pending_title for retry.
+                            pass
 
             if (
                 status == "complete"
@@ -11448,7 +11554,13 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     _title_model = getattr(agent, "model", None)
                     _title_provider = getattr(agent, "provider", None)
                     maybe_auto_title(
-                        _get_db(),
+                        # The titler writes from its own daemon thread, so it
+                        # needs a handle that OUTLIVES this call — the agent's
+                        # own (profile-scoped in app-global remote mode), not a
+                        # _session_db() handle we would close on block exit.
+                        # Handed the launch db, the UPDATE found no row and
+                        # every profile session stayed permanently untitled.
+                        getattr(agent, "_session_db", None) or _get_db(),
                         _title_key,
                         text,
                         raw,
@@ -15509,16 +15621,21 @@ def _format_live_usage_output(session: dict) -> str:
 
 
 def _format_live_history_output(session: dict) -> str:
+    # Same read the session.history RPC already does through _session_db. Here
+    # it went to the launch handle, which holds no rows for a profile session —
+    # and the assignment is unconditional, so an empty result REPLACED the live
+    # in-memory history and /history answered "No conversation history yet."
+    # on a session that was mid-conversation.
     with session["history_lock"]:
         history = list(session.get("history", []))
-    db = _get_db()
-    if db is not None and session.get("session_key"):
-        try:
-            history = db.get_messages_as_conversation(
-                session["session_key"], include_ancestors=True
-            )
-        except Exception:
-            pass
+    with _session_db(session) as db:
+        if db is not None and session.get("session_key"):
+            try:
+                history = db.get_messages_as_conversation(
+                    session["session_key"], include_ancestors=True
+                )
+            except Exception:
+                pass
     messages = _history_to_messages(history)
     if not messages:
         return "No conversation history yet."
@@ -15550,15 +15667,19 @@ def _format_live_prompt_output(session: dict) -> str:
 
 
 def _format_live_context_output(session: dict) -> str:
+    # Sibling of _format_live_history_output: the stored transcript (ancestors
+    # included) lives in the session's own db. Read from the launch handle a
+    # profile session fell back to its live in-memory window, so /context
+    # under-reported the conversation — every pre-compression message missing.
     messages = []
-    db = _get_db()
-    if db is not None and session.get("session_key"):
-        try:
-            messages = _history_to_messages(
-                db.get_messages_as_conversation(session["session_key"], include_ancestors=True)
-            )
-        except Exception:
-            messages = []
+    with _session_db(session) as db:
+        if db is not None and session.get("session_key"):
+            try:
+                messages = _history_to_messages(
+                    db.get_messages_as_conversation(session["session_key"], include_ancestors=True)
+                )
+            except Exception:
+                messages = []
     if not messages:
         with session["history_lock"]:
             messages = _history_to_messages(list(session.get("history", [])))
