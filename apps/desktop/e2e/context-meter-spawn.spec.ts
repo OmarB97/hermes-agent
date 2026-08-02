@@ -27,8 +27,6 @@ import path from 'node:path'
 
 import { expect, test } from '@playwright/test'
 
-import { compactNumber } from '../src/lib/format'
-
 import { type MockBackendFixture, setupMockBackend, waitForAppReady } from './fixtures'
 import { probeRoundPromptCount, resetProbeRoundPromptCount } from './mock-server'
 
@@ -231,14 +229,22 @@ test.describe('statusbar context meter', () => {
       expect(probeTokens, 'the mock never served the tool-free round').not.toBeNull()
       expectNeverDips(readings)
 
-      // Formatted through the status bar's own formatter rather than compared
-      // as a number: the gauge is what the user reads, and a literal here would
-      // drift the moment the prompt or tool list changes size.
-      const expectedLabel = `${compactNumber(probeTokens)}/`
+      // Compared as a number against what the mock actually served, never a
+      // literal, which would drift the moment the prompt or tool list changes
+      // size. The gauge renders one decimal in 'k', so a reading round-trips to
+      // within half a step of the real figure; the rounds here are 3k apart, so
+      // that slack cannot let a neighbouring round pass for this one.
+      //
+      // Formatting the expectation with the status bar's own `compactNumber`
+      // would read better, but `tsconfig.e2e.json` excludes `src` on purpose,
+      // and hand-rolling the formatter here is the display-math duplication the
+      // repo keeps a single formatter to avoid.
+      const GAUGE_ROUNDING_TOKENS = 100
+      const seen = readings.map(occupancyOf)
 
       expect(
-        readings.some(reading => reading.startsWith(expectedLabel)),
-        `the tool-free round never reached the meter — wanted ${expectedLabel} in ${readings.join(' -> ')}`
+        seen.some(reading => Math.abs(reading - probeTokens!) <= GAUGE_ROUNDING_TOKENS),
+        `the tool-free round never reached the meter — served ${probeTokens}, saw ${seen.join(', ')}`
       ).toBe(true)
     } finally {
       delete process.env.MOCK_TOOL_FREE_ROUND
