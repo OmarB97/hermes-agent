@@ -20,8 +20,12 @@ from agent.lsp.client import LSPClient
 MOCK_SERVER = str(Path(__file__).parent / "_mock_lsp_server.py")
 
 
-def _client(workspace: Path, script: str = "clean") -> LSPClient:
-    env = {"MOCK_LSP_SCRIPT": script, "PYTHONPATH": os.environ.get("PYTHONPATH", "")}
+def _client(workspace: Path, script: str = "clean", **env_extra: str) -> LSPClient:
+    env = {
+        "MOCK_LSP_SCRIPT": script,
+        "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
+        **env_extra,
+    }
     return LSPClient(
         server_id=f"mock-{script}",
         workspace_root=str(workspace),
@@ -123,6 +127,44 @@ async def test_client_shutdown_idempotent(tmp_path: Path):
     await client.start()
     await client.shutdown()
     await client.shutdown()  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_clean_shutdown_waits_for_exit_instead_of_signalling(
+    tmp_path: Path, monkeypatch
+):
+    """A server still quitting after ``exit`` must not be SIGTERMed.
+
+    ``proc.returncode is None`` only says we haven't *observed* an exit,
+    so escalating straight to signals cuts a well-behaved server off
+    mid-cleanup — and when the child is already gone it means signalling
+    an unreaped zombie, which is how every LSP e2e test could die inside
+    ``finally: await client.shutdown()`` on a loaded runner.
+    """
+    f = tmp_path / "x.py"
+    f.write_text("print('hi')\n")
+
+    client = _client(tmp_path, "clean", MOCK_LSP_EXIT_DELAY="0.3")
+    await client.start()
+    proc = client._proc
+    assert proc is not None
+
+    # Record signals but still deliver them, so a regression fails the
+    # assertion below rather than hanging on a process nothing can kill.
+    signalled: list[str] = []
+    for name in ("terminate", "kill"):
+        real = getattr(proc, name)
+
+        def spy(_name=name, _real=real):
+            signalled.append(_name)
+            _real()
+
+        monkeypatch.setattr(proc, name, spy)
+
+    await client.shutdown()
+
+    assert signalled == [], "graceful `exit` must be honoured before signals"
+    assert proc.returncode == 0, "server should exit on its own terms"
 
 
 @pytest.mark.asyncio

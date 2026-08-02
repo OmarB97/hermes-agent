@@ -620,6 +620,15 @@ def _live_system_guard(request, monkeypatch):
             for parent in walker.parents():
                 if parent.pid == test_pid:
                     return True
+        except _psutil.NoSuchProcess:
+            # The target died between Process() and the parent walk, or is
+            # an unreaped zombie whose chain can no longer be read
+            # (ZombieProcess subclasses NoSuchProcess). Either way it is
+            # not a live foreign process — a signal to it is a no-op, the
+            # same reasoning as the stale-PID branch above. Blocking here
+            # turned "child exited a moment before we signalled it" into a
+            # load-dependent test failure.
+            return True
         except Exception:
             return False
         return False

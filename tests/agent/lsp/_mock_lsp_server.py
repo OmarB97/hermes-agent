@@ -26,6 +26,10 @@ Behaviour (all behaviours selectable via env var ``MOCK_LSP_SCRIPT``):
   and then pushes EMPTY diagnostics.  Models a server that fixes
   the ghost if you actually wait for it.  Pull endpoint rejects.
 
+Independent of the script, ``MOCK_LSP_EXIT_DELAY`` (default 0) holds the
+process open for that many seconds after the ``exit`` notification —
+the window in which a real server finishes its own cleanup.
+
 The script writes JSON-RPC framed messages to stdout and reads from
 stdin.  No third-party dependencies — uses only stdlib so it runs
 under whatever Python the test process picks up.
@@ -188,6 +192,13 @@ def main():
             continue
 
         if msg.get("method") == "exit":
+            # ``MOCK_LSP_EXIT_DELAY`` seconds of "still tidying up" before
+            # the process actually goes away.  Real servers flush caches
+            # and remove temp files here; the delay lets tests assert the
+            # client waits for that instead of racing it to SIGTERM.
+            exit_delay = float(os.environ.get("MOCK_LSP_EXIT_DELAY", "0"))
+            if exit_delay > 0:
+                time.sleep(exit_delay)
             return 0
 
         # Unknown request: respond with method-not-found.
