@@ -8091,9 +8091,18 @@ def test_prompt_submit_surfaces_backend_error_as_visible_text(monkeypatch):
 
 
 def test_prompt_submit_preserves_empty_response_without_error(monkeypatch):
-    """An empty final_response with NO backend error must stay empty — do not
-    synthesize an error string. Preserves the existing None/empty-sentinel
-    semantics owned by downstream handlers."""
+    """An empty final_response must stay empty — do not synthesize an error
+    string. Preserves the existing None/empty-sentinel semantics owned by
+    downstream handlers.
+
+    Since #270 the turn-outcome classifier owns ``status``: a turn that ends
+    with no visible response is terminal-classified ``failed`` ("turn ended
+    without a visible response"), which _freeze_turn_outcome maps onto
+    ``status: "error"``. That is the deliberate contract — see the
+    ``final_response: ""`` -> ``failed`` case in
+    tests/tui_gateway/test_turn_outcomes.py. What this test still guards is the
+    payload text: classifying the turn must not fabricate an "Error:" string.
+    """
 
     class _Agent:
         def run_conversation(
@@ -8130,8 +8139,8 @@ def test_prompt_submit_preserves_empty_response_without_error(monkeypatch):
     complete_events = [e for e in emitted if e[0] == "message.complete"]
     assert complete_events, "expected message.complete to be emitted"
     payload = complete_events[-1][2]
-    # Status stays "complete" because no error flag was set
-    assert payload.get("status") == "complete"
+    # No visible response => the turn-outcome classifier reports it (#270).
+    assert payload.get("status") == "error"
     # Text stays empty — we did NOT fabricate an "Error:" string
     text = payload.get("text", "")
     assert text in {"", None}, f"expected empty text, got {text!r}"
