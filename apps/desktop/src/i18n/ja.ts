@@ -1780,9 +1780,16 @@ export const ja = defineLocale({
     queueSendNext: '次に送信',
     queueSend: '送信',
     queueDelete: '削除',
+    queueRetry: '再試行',
     queueStuckTitle: 'キュー内のメッセージを送信できません',
     queueStuckBody:
-      'キューに入れたターンの送信が繰り返し失敗しました。まだキューに残っています。もう一度送信してください。',
+      'キューに入れたターンが送信を試みるのをやめました。まだキューに残っています。そこから再試行するか削除してください。',
+    queueStuckReason: {
+      'attachment-missing': '添付ファイルが見つかりません',
+      'drain-failed': '送信が繰り返し失敗しました',
+      expired: 'キューに入ってから時間が経ちすぎ、自動送信されませんでした',
+      'origin-unresolved': '元のチャットを開けませんでした'
+    },
     previewUnavailable: 'プレビューは利用できません',
     previewLabel: label => `${label} のプレビュー`,
     couldNotPreview: label => `${label} をプレビューできませんでした`,

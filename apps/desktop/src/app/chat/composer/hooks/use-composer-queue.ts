@@ -2,18 +2,23 @@ import { type RefObject, useCallback, useEffect, useRef, useState } from 'react'
 
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
+import { desktopPathProbe, firstMissingAttachmentPath } from '@/lib/queued-attachment-preflight'
 import { useSessionSlice } from '@/lib/use-session-slice'
 import { type ComposerAttachment } from '@/store/composer'
 import { resetBrowseState } from '@/store/composer-input-history'
 import {
   $queuedPromptsBySession,
+  drainableQueuedPromptCount,
   enqueueQueuedPrompt,
   getQueuedPrompts,
-  MAX_AUTO_DRAIN_ATTEMPTS,
+  markQueuedPromptStuck,
   migrateQueuedPrompts,
+  nextDrainableQueuedPrompt,
   promoteQueuedPrompt,
   type QueuedPromptEntry,
+  recordDrainFailure,
   removeQueuedPrompt,
+  retryQueuedPrompt,
   shouldAutoDrain,
   updateQueuedPrompt
 } from '@/store/composer-queue'
@@ -84,7 +89,16 @@ export function useComposerQueue({
 
   const prevQueueKeyRef = useRef(activeQueueSessionKey)
   const drainingQueueRef = useRef(false)
-  const drainFailuresRef = useRef(new Map<string, number>())
+  const pathProbe = desktopPathProbe()
+
+  const notifyStuck = useCallback(() => {
+    notify({
+      id: 'composer-queue-stuck',
+      kind: 'error',
+      title: t.composer.queueStuckTitle,
+      message: t.composer.queueStuckBody
+    })
+  }, [t])
 
   const beginQueuedEdit = (entry: QueuedPromptEntry) => {
     if (!activeQueueSessionKey || queueEdit) {
@@ -182,8 +196,10 @@ export function useComposerQueue({
     return true
   }, [activeQueueSessionKey, attachments, clearDraft, draftRef, scope.attachments])
 
-  // All queue drain paths share one lock + send-then-remove sequence.
-  // `pickEntry` lets each caller choose head, by-id, or skip-edited.
+  // All queue drain paths share one lock + send-then-remove sequence, and one
+  // place that books failures against the entry. `pickEntry` lets each caller
+  // choose head, by-id, or skip-edited. Resolves false on failure and NEVER
+  // rejects — every caller fires it with `void`.
   const runDrain = useCallback(
     async (pickEntry: (entries: QueuedPromptEntry[]) => QueuedPromptEntry | undefined): Promise<boolean> => {
       if (drainingQueueRef.current || !activeQueueSessionKey) {
@@ -200,7 +216,32 @@ export function useComposerQueue({
 
       drainingQueueRef.current = true
 
+      // Book the attempt on the PERSISTED entry, so a prompt that can never
+      // succeed is dead-lettered for good instead of spending a fresh budget on
+      // every app launch. Toast only on the pending → stuck edge.
+      const fail = (detail?: string) => {
+        if (recordDrainFailure(drainQueueSessionKey, entry.id, detail)?.becameStuck) {
+          notifyStuck()
+        }
+
+        return false
+      }
+
       try {
+        // Preflight before the send: a queued turn references its attachments
+        // by local path, and a file that has gone away can never be staged.
+        // Dead-letter it here (with the full path) rather than letting the
+        // submit pipeline paint an optimistic bubble it then has to roll back.
+        const missingPath = await firstMissingAttachmentPath(entry.attachments, pathProbe)
+
+        if (missingPath) {
+          if (markQueuedPromptStuck(drainQueueSessionKey, entry.id, 'attachment-missing', missingPath)) {
+            notifyStuck()
+          }
+
+          return false
+        }
+
         const accepted = await Promise.resolve(
           onSubmit(entry.text, {
             attachments: entry.attachments,
@@ -211,27 +252,28 @@ export function useComposerQueue({
         )
 
         if (accepted === false) {
-          return false
+          // A soft "not now" (session busy, context drifted) — no reason to
+          // record beyond the attempt itself.
+          return fail()
         }
 
-        drainFailuresRef.current.delete(entry.id)
         removeQueuedPrompt(drainQueueSessionKey, entry.id)
         resetBrowseState(drainRuntimeSessionId)
 
         return true
+      } catch (err) {
+        // A hard failure carries its reason (e.g. the gateway's own message)
+        // onto the entry, so the queue panel can show it verbatim.
+        return fail((err instanceof Error ? err.message.trim() : '') || undefined)
       } finally {
         drainingQueueRef.current = false
       }
     },
-    [activeQueueSessionKey, onSubmit, sessionId]
+    [activeQueueSessionKey, notifyStuck, onSubmit, pathProbe, sessionId]
   )
 
   const pickDrainHead = useCallback(
-    (entries: QueuedPromptEntry[]) => {
-      const skip = queueEditRef.current?.entryId
-
-      return skip ? entries.find(e => e.id !== skip) : entries[0]
-    },
+    (entries: QueuedPromptEntry[]) => nextDrainableQueuedPrompt(entries, queueEditRef.current?.entryId),
     [queueEditRef] // reads the edit id off a ref so the lock-holder always sees the latest
   )
 
@@ -243,6 +285,11 @@ export function useComposerQueue({
         return false
       }
 
+      // Tapping send/retry clears the dead-letter first, so the entry gets a
+      // fresh attempt budget whichever branch below runs — otherwise a stuck
+      // entry promoted while busy would be skipped again by the auto-drain.
+      retryQueuedPrompt(activeQueueSessionKey, id)
+
       if (busy) {
         // Promote to the head, then interrupt. The gateway always emits a
         // settle (message.complete + session.info running:false) when the
@@ -253,10 +300,6 @@ export function useComposerQueue({
 
         return true
       }
-
-      // A manual send clears the auto-drain backoff so a stuck entry the user
-      // taps gets a fresh attempt (and re-enables auto-retry on success).
-      drainFailuresRef.current.delete(id)
 
       return runDrain(entries => entries.find(e => e.id === id))
     },
@@ -274,32 +317,14 @@ export function useComposerQueue({
 
     const entry = pickDrainHead(queuedPrompts)
 
-    if (!entry || (drainFailuresRef.current.get(entry.id) ?? 0) >= MAX_AUTO_DRAIN_ATTEMPTS) {
+    if (!entry) {
       return
     }
 
-    const onFail = () => {
-      const fails = (drainFailuresRef.current.get(entry.id) ?? 0) + 1
-      drainFailuresRef.current.set(entry.id, fails)
-
-      if (fails >= MAX_AUTO_DRAIN_ATTEMPTS) {
-        notify({
-          id: 'composer-queue-stuck',
-          kind: 'error',
-          title: t.composer.queueStuckTitle,
-          message: t.composer.queueStuckBody
-        })
-      }
-    }
-
+    // runDrain owns the retry bookkeeping (and never rejects), so there is
+    // nothing left to do here but fire it.
     void runDrain(() => entry)
-      .then(sent => {
-        if (!sent) {
-          onFail()
-        }
-      })
-      .catch(onFail)
-  }, [activeQueueSessionKey, busy, pickDrainHead, queuedPrompts, runDrain, t])
+  }, [activeQueueSessionKey, busy, pickDrainHead, queuedPrompts, runDrain])
 
   // Re-key on a runtime session-id change. A stable stored id (queueSessionKey)
   // never churns, so a change there is a real session switch and must NOT
@@ -319,11 +344,13 @@ export function useComposerQueue({
   // Queued turns flow whenever the session is idle — on the busy→false settle
   // edge, on mount/reconnect, and after a re-key — so a swallowed edge can't
   // strand them. To cancel queued turns, the user deletes them from the panel.
+  const drainableCount = drainableQueuedPromptCount(queuedPrompts)
+
   useEffect(() => {
-    if (shouldAutoDrain({ isBusy: busy, queueLength: queuedPrompts.length })) {
+    if (shouldAutoDrain({ isBusy: busy, queueLength: drainableCount })) {
       autoDrainNext()
     }
-  }, [autoDrainNext, busy, queuedPrompts.length])
+  }, [autoDrainNext, busy, drainableCount])
 
   // Queue-edit cleanup: on session swap the scope effect already stashed the
   // edit snapshot; only restore into the composer when still on the same scope.

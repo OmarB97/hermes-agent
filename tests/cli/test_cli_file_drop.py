@@ -4,7 +4,7 @@ dragged/pasted absolute paths from being mistaken for slash commands."""
 
 import pytest
 
-from cli import _detect_file_drop
+from cli import _detect_file_drop, starts_like_path
 
 
 # ---------------------------------------------------------------------------
@@ -247,3 +247,48 @@ class TestEdgeCases:
         result = _detect_file_drop(str(link))
         assert result is not None
         assert result["is_image"] is True
+
+
+# ---------------------------------------------------------------------------
+# Tests: starts_like_path — the cheap "looks like a path" prefilter
+# ---------------------------------------------------------------------------
+
+class TestStartsLikePath:
+    """`starts_like_path` says nothing about whether a path exists — it's the
+    cheap prefilter `_detect_file_drop` uses to decide whether to try
+    resolving at all, and that error callers reuse to describe a path they
+    could not resolve without truncating it at the first space."""
+
+    @pytest.mark.parametrize("text", [
+        "/abs",
+        "~/x",
+        "./x",
+        "../x",
+        "file://x",
+        r"C:\x",
+        "C:/x",
+        '"/x"',
+        "'/x'",
+        '"~/x"',
+        "'~/x'",
+        '"./x"',
+        "'./x'",
+        '"../x"',
+        "'../x'",
+        r'"C:\x"',
+        "'C:/x'",
+    ])
+    def test_true_for_path_like_input(self, text):
+        assert starts_like_path(text) is True
+
+    @pytest.mark.parametrize("text", [
+        "",
+        "   ",
+        "just some words",
+    ])
+    def test_false_for_non_path_input(self, text):
+        assert starts_like_path(text) is False
+
+    @pytest.mark.parametrize("value", [42, None, 3.14, [], {}])
+    def test_false_for_non_string_input(self, value):
+        assert starts_like_path(value) is False

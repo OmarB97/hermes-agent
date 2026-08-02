@@ -107,6 +107,7 @@ import {
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
 import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
+import { pathExistsForIpc } from './path-exists'
 import { createKeepAwake } from './power-save'
 import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRouteProfile } from './profile-delete-routing'
 import { createSessionStoreWatcher } from './session-store-watch'
@@ -9254,6 +9255,8 @@ function disposeTerminalSession(id) {
 }
 
 ipcMain.handle('hermes:fs:readDir', async (_event, dirPath) => readDirForIpc(dirPath))
+
+ipcMain.handle('hermes:fs:pathExists', async (_event, filePath) => pathExistsForIpc(filePath))
 
 ipcMain.handle('hermes:fs:gitRoot', async (_event, startPath) => gitRootForIpc(startPath))
 

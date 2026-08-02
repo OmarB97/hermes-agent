@@ -1858,8 +1858,15 @@ export const en: Translations = {
     queueSendNext: 'Next',
     queueSend: 'Send',
     queueDelete: 'Delete',
+    queueRetry: 'Retry',
     queueStuckTitle: 'Queued message not sent',
-    queueStuckBody: 'A queued turn kept failing to send. It is still in the queue — try sending it again.',
+    queueStuckBody: 'A queued turn stopped trying to send. It is still in the queue — retry or delete it there.',
+    queueStuckReason: {
+      'attachment-missing': 'Attachment file no longer exists',
+      'drain-failed': 'Sending kept failing',
+      expired: 'Queued too long ago to send automatically',
+      'origin-unresolved': 'Original chat could not be opened'
+    },
     previewUnavailable: 'Preview unavailable',
     previewLabel: label => `Preview ${label}`,
     couldNotPreview: label => `Could not preview ${label}`,

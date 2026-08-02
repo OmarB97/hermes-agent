@@ -5,6 +5,8 @@
 // partial locales should use `defineLocale()` so missing desktop-only strings
 // fall back to English while new keys remain type-checked.
 
+import type { QueuedPromptStuckReason } from '@/store/composer-queue'
+
 export type Locale = 'en' | 'zh' | 'zh-hant' | 'ja'
 
 export type ToolTitleKey =
@@ -1547,8 +1549,13 @@ export interface Translations {
     queueSendNext: string
     queueSend: string
     queueDelete: string
+    queueRetry: string
     queueStuckTitle: string
     queueStuckBody: string
+    /** Localized headline per dead-letter reason. Keyed by
+     *  `QueuedPromptStuckReason` from `@/store/composer-queue`; the entry's
+     *  verbatim `lastError` detail is appended after it. */
+    queueStuckReason: Record<QueuedPromptStuckReason, string>
     previewUnavailable: string
     previewLabel: (label: string) => string
     couldNotPreview: (label: string) => string

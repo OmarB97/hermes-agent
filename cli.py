@@ -2990,6 +2990,40 @@ def _resolve_attachment_path(raw_path: str) -> Path | None:
 
 
 
+def starts_like_path(text: str) -> bool:
+    """True when *text* opens with something shaped like a local file path.
+
+    A cheap prefilter — it says nothing about whether the path exists. Shared
+    by ``_detect_file_drop`` (which uses it to decide whether to try resolving
+    at all) and by callers that need to describe a path they could not resolve
+    without truncating it at the first space.
+    """
+    if not isinstance(text, str):
+        return False
+
+    stripped = text.strip()
+    if not stripped:
+        return False
+
+    return (
+        stripped.startswith("/")
+        or stripped.startswith("~")
+        or stripped.startswith("./")
+        or stripped.startswith("../")
+        or stripped.startswith("file://")
+        or (len(stripped) >= 3 and stripped[1] == ":" and stripped[2] in {"\\", "/"} and stripped[0].isalpha())
+        or stripped.startswith('"/')
+        or stripped.startswith('"~')
+        or stripped.startswith("'/")
+        or stripped.startswith("'~")
+        or stripped.startswith('"./')
+        or stripped.startswith('"../')
+        or stripped.startswith("'./")
+        or stripped.startswith("'../")
+        or (len(stripped) >= 4 and stripped[0] in {"'", '"'} and stripped[2] == ":" and stripped[3] in {"\\", "/"} and stripped[1].isalpha())
+    )
+
+
 def _detect_file_drop(user_input: str) -> "dict | None":
     """Detect if *user_input* starts with a real local file path.
 
@@ -3013,24 +3047,7 @@ def _detect_file_drop(user_input: str) -> "dict | None":
     if not stripped:
         return None
 
-    starts_like_path = (
-        stripped.startswith("/")
-        or stripped.startswith("~")
-        or stripped.startswith("./")
-        or stripped.startswith("../")
-        or stripped.startswith("file://")
-        or (len(stripped) >= 3 and stripped[1] == ":" and stripped[2] in {"\\", "/"} and stripped[0].isalpha())
-        or stripped.startswith('"/')
-        or stripped.startswith('"~')
-        or stripped.startswith("'/")
-        or stripped.startswith("'~")
-        or stripped.startswith('"./')
-        or stripped.startswith('"../')
-        or stripped.startswith("'./")
-        or stripped.startswith("'../")
-        or (len(stripped) >= 4 and stripped[0] in {"'", '"'} and stripped[2] == ":" and stripped[3] in {"\\", "/"} and stripped[1].isalpha())
-    )
-    if not starts_like_path:
+    if not starts_like_path(stripped):
         return None
 
     direct_path = _resolve_attachment_path(stripped)
