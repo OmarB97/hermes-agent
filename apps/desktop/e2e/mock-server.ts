@@ -28,6 +28,46 @@ const CANNED_REPLY = 'Hello from the mock inference server! The full boot chain 
 const MAX_TOOL_CALLS = 3
 
 /**
+ * A tool name the agent cannot possibly have.
+ *
+ * Naming one is how this mock produces a round that finishes a real API call —
+ * usage and all — without any tool ever running: the agent rejects the name
+ * before it reaches the executor, appends a result saying so, and keeps going.
+ * That is the one round shape where reporting occupancy per API response
+ * differs from reporting it per completed tool.
+ *
+ * `zz_`-prefixed and deliberately unlike any real tool: the agent repairs a
+ * near-miss name by fuzzy match, and a name that got repaired into a REAL tool
+ * would execute, complete, and quietly turn this back into an ordinary round.
+ */
+export const PROBE_TOOL_NAME = 'zz_e2e_probe_missing'
+const PROBE_CALL_ID = 'mock-probe-1'
+
+/** Opt-in (MOCK_TOOL_FREE_ROUND): off by default so the other specs are untouched. */
+function toolFreeRoundEnabled(): boolean {
+  const raw = process.env.MOCK_TOOL_FREE_ROUND
+
+  return raw === '1' || raw === 'true'
+}
+
+let probeRoundPromptTokens: number | null = null
+
+/**
+ * The prompt count served on the tool-free round, or null if it hasn't run.
+ *
+ * Read by the spec instead of hardcoding a number: the usage schedule is a
+ * function of conversation length, so a literal in the test would drift the
+ * moment the system prompt or tool list changes size.
+ */
+export function probeRoundPromptCount(): number | null {
+  return probeRoundPromptTokens
+}
+
+export function resetProbeRoundPromptCount(): void {
+  probeRoundPromptTokens = null
+}
+
+/**
  * Pause before answering a tool-call request, in ms (MOCK_TOOL_CALL_DELAY_MS).
  *
  * Off by default so the ordinary specs stay fast. A test that has to observe
@@ -177,14 +217,48 @@ export function startMockServer(): Promise<{ port: number; url: string; close: (
 
           const messages = Array.isArray(parsed.messages) ? parsed.messages : []
           const tools = Array.isArray(parsed.tools) ? parsed.tools : []
-          const toolResultCount = messages.filter((message: any) => message?.role === 'tool').length
-          const shouldCallTool = toolResultCount < MAX_TOOL_CALLS && tools.length > 0
+
+          // Count only THIS turn's rounds, not the whole conversation. Counting
+          // every `tool` message ever sent meant a second turn in the same chat
+          // started already over budget and collapsed to a single round — so a
+          // test that meant to watch a multi-round turn silently watched a
+          // one-round one.
+          const lastUserIndex = messages.map((message: any) => message?.role).lastIndexOf('user')
+          const turnToolResults = messages
+            .slice(lastUserIndex + 1)
+            .filter((message: any) => message?.role === 'tool').length
+
+          if (toolFreeRoundEnabled() && tools.some((t: any) => t?.function?.name === PROBE_TOOL_NAME)) {
+            // The probe only works while the agent has no such tool. If one ever
+            // appears under this name it would really execute and complete, and
+            // the round would quietly stop being tool-free — the test would go
+            // on passing while testing nothing. Answer with an error instead of
+            // throwing: this runs inside an async request handler, where a throw
+            // becomes an unhandled rejection in the test process rather than a
+            // legible failure, and leaves the request hanging.
+            res.writeHead(500, { 'Content-Type': 'application/json' })
+            res.end(
+              JSON.stringify({
+                error: { message: `${PROBE_TOOL_NAME} is a real tool — pick a name the agent cannot have` },
+              }),
+            )
+            return
+          }
+
+          // One round mid-turn names a tool that does not exist. It is a full
+          // API round trip that reports usage and completes no tool.
+          const shouldProbe = toolFreeRoundEnabled() && turnToolResults === 1 && tools.length > 0
+          const shouldCallTool = shouldProbe || (turnToolResults < MAX_TOOL_CALLS && tools.length > 0)
 
           if (shouldCallTool) {
             const tool = tools.find((t: any) => t?.function?.name === 'todo') || tools[0]
-            const toolName = tool?.function?.name || 'unknown'
-            const toolArgs = buildToolArguments(tool?.function?.parameters)
-            const toolCallId = `mock-tool-call-${toolResultCount + 1}`
+            const toolName = shouldProbe ? PROBE_TOOL_NAME : tool?.function?.name || 'unknown'
+            const toolArgs = shouldProbe ? {} : buildToolArguments(tool?.function?.parameters)
+            const toolCallId = shouldProbe ? PROBE_CALL_ID : `mock-tool-call-${turnToolResults + 1}`
+
+            if (shouldProbe) {
+              probeRoundPromptTokens = usageFor(messages).prompt_tokens
+            }
             const argsJson = JSON.stringify(toolArgs)
             const delayMs = toolCallDelayMs()
 
