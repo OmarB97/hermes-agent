@@ -130,6 +130,201 @@ def test_invalid_stale_timeout_values_return_none(monkeypatch, tmp_path):
     assert get_provider_stale_timeout("openai-codex", "gpt-5.5") is None
 
 
+def test_bare_custom_provider_resolves_entry_timeouts_via_base_url_regression(monkeypatch, tmp_path):
+    """Regression test: resolve_runtime_provider() reports every user-declared
+    endpoint as the bare string "custom" — the resolved billing class, not a
+    routable identity. Before the fix, get_provider_stale_timeout("custom", ...)
+    looked up providers["custom"] (a key that never exists) and silently
+    returned None, so providers.ai-router.stale_timeout_seconds was ignored
+    and a deep-context local turn was killed by the default watchdog instead.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(
+        tmp_path,
+        """\
+        providers:
+          ai-router:
+            api: "http://10.55.0.3:8000/v1"
+            request_timeout_seconds: 120
+            stale_timeout_seconds: 900
+        """,
+    )
+
+    assert get_provider_request_timeout(
+        "custom", base_url="http://10.55.0.3:8000/v1"
+    ) == 120.0
+    assert get_provider_stale_timeout(
+        "custom", base_url="http://10.55.0.3:8000/v1"
+    ) == 900.0
+
+
+def test_bare_custom_provider_model_override_wins_via_base_url_attribution(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(
+        tmp_path,
+        """\
+        providers:
+          ai-router:
+            api: "http://10.55.0.3:8000/v1"
+            request_timeout_seconds: 120
+            stale_timeout_seconds: 900
+            models:
+              deepseek-v4:
+                timeout_seconds: 60
+                stale_timeout_seconds: 1800
+        """,
+    )
+
+    assert get_provider_request_timeout(
+        "custom", "deepseek-v4", base_url="http://10.55.0.3:8000/v1"
+    ) == 60.0
+    assert get_provider_stale_timeout(
+        "custom", "deepseek-v4", base_url="http://10.55.0.3:8000/v1"
+    ) == 1800.0
+
+
+def test_bare_custom_provider_unmatched_base_url_does_not_fall_back_to_config_model_provider(monkeypatch, tmp_path):
+    """Mis-attribution guard: when base_url is present but owns no configured
+    entry, the bare "custom" provider must stay unattributed — it must NOT
+    inherit config.model.provider's timeouts, even though that names a real
+    providers: entry. A genuinely ad-hoc endpoint has no configured timeouts.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(
+        tmp_path,
+        """\
+        providers:
+          ai-router:
+            api: "http://10.55.0.3:8000/v1"
+            request_timeout_seconds: 120
+            stale_timeout_seconds: 900
+        model:
+          provider: ai-router
+          default: deepseek-v4
+        """,
+    )
+
+    assert get_provider_request_timeout(
+        "custom", base_url="http://10.99.99.99:9999/v1"
+    ) is None
+    assert get_provider_stale_timeout(
+        "custom", base_url="http://10.99.99.99:9999/v1"
+    ) is None
+
+
+def test_custom_prefixed_provider_id_resolves_name_directly_with_and_without_base_url(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(
+        tmp_path,
+        """\
+        providers:
+          ai-router:
+            api: "http://10.55.0.3:8000/v1"
+            stale_timeout_seconds: 900
+        """,
+    )
+
+    # "custom:<name>" already carries the entry name — no base_url needed.
+    assert get_provider_stale_timeout("custom:ai-router") == 900.0
+    # An unrelated/mismatched base_url does not change the outcome, proving
+    # this path never consults base_url matching at all.
+    assert get_provider_stale_timeout(
+        "custom:ai-router", base_url="http://unrelated.example:1234/v1"
+    ) == 900.0
+
+
+def test_bare_custom_provider_without_base_url_falls_back_to_config_model_provider(monkeypatch, tmp_path):
+    """Documented behavior: the Desktop/TUI path where base_url was lost.
+    With no base_url at all to reverse-lookup, a bare "custom" provider falls
+    back to config.model.provider when that names a real providers: entry.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(
+        tmp_path,
+        """\
+        providers:
+          ai-router:
+            api: "http://10.55.0.3:8000/v1"
+            stale_timeout_seconds: 900
+        model:
+          provider: ai-router
+          default: deepseek-v4
+        """,
+    )
+
+    assert get_provider_stale_timeout("custom") == 900.0
+
+
+def test_named_provider_lookup_bypasses_custom_recovery_path(monkeypatch, tmp_path):
+    """providers.anthropic resolves via the direct dict lookup and never
+    touches the bare-"custom" recovery path added for the base_url
+    attribution fix — named/built-in providers are unaffected by it."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(
+        tmp_path,
+        """\
+        providers:
+          anthropic:
+            request_timeout_seconds: 30
+            stale_timeout_seconds: 45
+        """,
+    )
+
+    import hermes_cli.timeouts as timeouts_mod
+
+    def _fail_if_called(provider_id, base_url):
+        raise AssertionError(
+            f"_recover_custom_provider_key should not run for named provider {provider_id!r}"
+        )
+
+    monkeypatch.setattr(timeouts_mod, "_recover_custom_provider_key", _fail_if_called)
+
+    assert get_provider_request_timeout("anthropic") == 30.0
+    assert get_provider_stale_timeout("anthropic") == 45.0
+
+
+def test_custom_provider_base_url_match_normalizes_trailing_slash_and_case(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(
+        tmp_path,
+        """\
+        providers:
+          ai-router:
+            api: "http://10.55.0.3:8000/v1"
+            stale_timeout_seconds: 900
+        """,
+    )
+
+    assert get_provider_stale_timeout(
+        "custom", base_url="HTTP://10.55.0.3:8000/V1/"
+    ) == 900.0
+
+
+def test_custom_providers_legacy_list_entry_resolves_via_base_url_attribution(monkeypatch, tmp_path):
+    """find_custom_provider_identity() also matches the legacy custom_providers:
+    LIST shape ({name, base_url, ...}), not just providers: dict entries keyed
+    by api:. providers.ai-router carries no url field here, forcing the
+    reverse lookup to fall through to the custom_providers: list match before
+    _provider_config finds the timeout under providers.ai-router.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_config(
+        tmp_path,
+        """\
+        custom_providers:
+          - name: ai-router
+            base_url: "http://10.55.0.3:8000/v1"
+        providers:
+          ai-router:
+            stale_timeout_seconds: 900
+        """,
+    )
+
+    assert get_provider_stale_timeout(
+        "custom", base_url="http://10.55.0.3:8000/v1"
+    ) == 900.0
+
+
 def test_anthropic_adapter_honors_timeout_kwarg():
     """build_anthropic_client(timeout=X) overrides the 900s default read timeout."""
     pytest = __import__("pytest")

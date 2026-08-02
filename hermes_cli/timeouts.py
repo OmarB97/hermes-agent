@@ -144,6 +144,36 @@ def get_provider_stale_timeout(
     return _coerce_timeout(provider_config.get("stale_timeout_seconds"))
 
 
+def get_provider_first_chunk_timeout(
+    provider_id: str, model: str | None = None, base_url: str | None = None
+) -> float | None:
+    """Return a configured pre-first-chunk stream timeout in seconds, if any.
+
+    ``stale_timeout_seconds`` governs the gap between chunks. The wait BEFORE
+    the first chunk is a different cost: it is dominated by queue admission,
+    a possible model load, and prefill of the whole prompt, so a lane can
+    legitimately need minutes there while still wanting a tight inter-chunk
+    watchdog. This knob separates the two.
+
+    Reads ``providers.<id>.models.<model>.first_chunk_timeout_seconds`` first,
+    then ``providers.<id>.first_chunk_timeout_seconds``. ``base_url`` lets a
+    bare-``custom`` runtime provider be attributed to the ``providers:`` entry
+    that owns the endpoint; pass the agent's live base_url wherever one is
+    available.
+    """
+    provider_config = _provider_config(provider_id, base_url)
+    if provider_config is None:
+        return None
+
+    model_config = _get_model_config(provider_config, model)
+    if model_config is not None:
+        timeout = _coerce_timeout(model_config.get("first_chunk_timeout_seconds"))
+        if timeout is not None:
+            return timeout
+
+    return _coerce_timeout(provider_config.get("first_chunk_timeout_seconds"))
+
+
 def _get_model_config(
     provider_config: dict[str, object], model: str | None
 ) -> dict[str, object] | None:

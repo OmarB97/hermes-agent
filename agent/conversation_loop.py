@@ -1687,8 +1687,11 @@ def run_conversation(
                 # prompt-cache miss can be attributed to the client rewriting
                 # the prefix or ruled out as something evicting the server's.
                 # api_kwargs is final here and the request has not left yet.
-                from agent.prefix_probe import record_request_prefix
-                record_request_prefix(agent, api_kwargs)
+                # Gated at the call site like its sibling above, so the module
+                # is never even imported on the default path.
+                if env_var_enabled("HERMES_PREFIX_PROBE"):
+                    from agent.prefix_probe import record_request_prefix
+                    record_request_prefix(agent, api_kwargs)
 
                 # Always prefer the streaming path — even without stream
                 # consumers.  Streaming gives us fine-grained health

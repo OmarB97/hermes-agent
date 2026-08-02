@@ -47,9 +47,16 @@ _UNSAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]")
 
 
 def prefix_probe_enabled() -> bool:
-    """Return whether the prefix probe is switched on for this process."""
-    raw = os.getenv(_ENV_FLAG, "")
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+    """Return whether the prefix probe is switched on for this process.
+
+    Defers to ``env_var_enabled`` so this flag reads exactly like every other
+    Hermes env toggle — the call site in ``conversation_loop`` gates on the
+    same helper, and two different notions of "truthy" would mean a value that
+    enables one and not the other.
+    """
+    from utils import env_var_enabled
+
+    return env_var_enabled(_ENV_FLAG)
 
 
 def _canonical(value: Any) -> str:
