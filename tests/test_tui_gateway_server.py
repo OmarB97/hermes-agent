@@ -10955,7 +10955,14 @@ class TestResolveRuntimeWithFallback:
         )
         monkeypatch.setattr(
             server,
-            "_load_fallback_model",
+            # _resolve_runtime_with_fallback consults the policy-filtered chain.
+            # _load_effective_fallback_model() only reaches the raw loader when
+            # the ambient fallback_policy is not "off" — on a host whose config
+            # sets "off" it short-circuits to [], this stub is never consulted,
+            # and the test fails for a reason that has nothing to do with it.
+            # Patch what the code calls so the case under test is the one that
+            # runs, on any host.
+            "_load_effective_fallback_model",
             lambda: [
                 {
                     "provider": "deepseek",
@@ -11007,7 +11014,7 @@ class TestResolveRuntimeWithFallback:
         )
         monkeypatch.setattr(
             server,
-            "_load_fallback_model",
+            "_load_effective_fallback_model",
             lambda: [
                 {"provider": "anthropic"},
                 {"provider": "openrouter", "model": "z-ai/glm-5.2"},
@@ -11044,7 +11051,7 @@ class TestResolveRuntimeWithFallback:
         )
         monkeypatch.setattr(
             server,
-            "_load_fallback_model",
+            "_load_effective_fallback_model",
             lambda: [
                 {
                     "provider": "openrouter",
@@ -11072,9 +11079,13 @@ class TestResolveRuntimeWithFallback:
         )
         monkeypatch.setattr(
             server,
-            "_load_fallback_model",
+            "_load_effective_fallback_model",
             lambda: [{"provider": "deepseek", "model": "deepseek-v4-pro"}],
         )
+        # The exhaustion message names the active policy, which is read from
+        # ambient config.  Pin it so this asserts the "any" wording it means to
+        # assert instead of whatever policy the host happens to have.
+        monkeypatch.setattr(server, "_load_cfg", lambda: {"fallback_policy": "any"})
         import pytest
 
         with pytest.raises(AuthError, match="No credentials for openai-codex") as exc_info:
@@ -11101,7 +11112,7 @@ class TestResolveRuntimeWithFallback:
         )
         monkeypatch.setattr(
             server,
-            "_load_fallback_model",
+            "_load_effective_fallback_model",
             lambda: [
                 "invalid-string-entry",
                 {"provider": "anthropic", "model": "claude-sonnet-4-6"},
