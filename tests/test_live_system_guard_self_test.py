@@ -204,51 +204,53 @@ def test_subprocess_killall_hermes_blocked():
 # ──────────────────── pass-through cases (must NOT raise) ──────
 
 
+def assert_guard_allows(argv):
+    """Assert the live-system guard does not block ``argv``.
+
+    The guard raises its ``RuntimeError`` *before* handing the command to the
+    real ``subprocess.run``, so reaching exec at all is what "passes through"
+    means here — whatever the command then does, or fails to do, is not the
+    guard's business.
+
+    That distinction matters off systemd: ``systemctl`` does not exist on
+    macOS (or a systemd-less Linux), so these calls die on ``FileNotFoundError``
+    from exec. Asserting on a CompletedProcess conflated "the guard allowed it"
+    with "the binary is installed" and failed all four of these on any macOS
+    dev machine — a permanently red canary that trains people to ignore the
+    file. Swallowing that one error keeps the guard's own logic — pure string
+    inspection of the command, and identical on every platform — under test
+    everywhere, rather than skipping the checks off Linux and only ever
+    exercising them in CI.
+    """
+    try:
+        subprocess.run(argv, capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        pass  # Guard allowed it; this platform simply has no systemd.
+
+
 def test_systemctl_status_passes_through():
     """Read-only systemctl probes (status/show/list-units) are fine."""
-    # Run with check=False so we don't fail on the gateway's exit code.
-    r = subprocess.run(
-        ["systemctl", "--user", "status", "hermes-gateway", "--no-pager"],
-        capture_output=True,
-        text=True,
-        check=False,
+    # check=False so we don't fail on the gateway's exit code.
+    assert_guard_allows(
+        ["systemctl", "--user", "status", "hermes-gateway", "--no-pager"]
     )
-    assert r is not None  # Did not raise — the guard let it through.
 
 
 def test_systemctl_show_passes_through():
-    r = subprocess.run(
-        ["systemctl", "--user", "show", "hermes-gateway", "--no-pager"],
-        capture_output=True,
-        text=True,
-        check=False,
+    assert_guard_allows(
+        ["systemctl", "--user", "show", "hermes-gateway", "--no-pager"]
     )
-    assert r is not None
 
 
 def test_systemctl_list_units_passes_through():
-    r = subprocess.run(
-        ["systemctl", "--user", "list-units", "fake-not-real-unit*", "--no-pager"],
-        capture_output=True,
-        text=True,
-        check=False,
+    assert_guard_allows(
+        ["systemctl", "--user", "list-units", "fake-not-real-unit*", "--no-pager"]
     )
-    assert r is not None
 
 
 def test_systemctl_unrelated_unit_passes_through():
-    """systemctl restart of a non-hermes unit is allowed (we only protect hermes)."""
-    # Use --dry-run so we don't actually try to restart anything; just
-    # verify the guard doesn't block the call. systemctl supports
-    # --dry-run via the privileged API; on user scope it usually fails
-    # quickly without side effects.
-    r = subprocess.run(
-        ["systemctl", "--user", "show", "fake-not-real-unit"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert r is not None
+    """systemctl of a non-hermes unit is allowed (we only protect hermes)."""
+    assert_guard_allows(["systemctl", "--user", "show", "fake-not-real-unit"])
 
 
 def test_kill_own_subtree_passes_through():
