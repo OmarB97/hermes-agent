@@ -4293,6 +4293,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # so we need a separate, non-resettable clock to bound the worst case.
     _dflash_request_started_at = time.time()
 
+    # Only a LOCAL endpoint can have a liveness signal to ask (the probe returns
+    # None for anything without a gate), so the stale watchdog below asks the
+    # backend before killing a local request. Resolved once: base_url does not
+    # change for the life of the call.
+    _stale_probe_local = bool(
+        getattr(agent, "base_url", None) and is_local_endpoint(agent.base_url)
+    )
+    # Seconds the liveness probe has granted to the CURRENT silent stretch. Reset
+    # the moment a chunk lands, so extensions never carry into the next stretch.
+    _stale_probe_extension = 0.0
+
     t = threading.Thread(target=_call, daemon=True)
     t.start()
     _last_heartbeat = time.time()
@@ -4444,10 +4455,84 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # but delivering no real chunks.  Kill the client so the
         # inner retry loop can start a fresh connection.
         _stale_elapsed = time.time() - last_chunk_time["t"]
+        if _stale_elapsed <= _stream_stale_timeout:
+            # A chunk landed (or a kill reset the clock), so this silent stretch
+            # is over and whatever the probe granted it is forgotten. Extensions
+            # must never accumulate across stretches — that is how a bounded
+            # watchdog turns into an unbounded one.
+            _stale_probe_extension = 0.0
         if (
             (_dflash_first_chunk_timeout is None or first_chunk_seen["yes"])
-            and _stale_elapsed > _stream_stale_timeout
+            and _stale_elapsed > _stream_stale_timeout + _stale_probe_extension
         ):
+            # Before killing anything: ASK THE BACKEND whether it is still
+            # working. This is the same fix the no-first-chunk branch above
+            # already applies (#278) — a client-side stopwatch cannot tell a
+            # wedged server apart from a healthily slow one, and the gate can —
+            # applied to the branch that actually kills a generic local stream.
+            #
+            # It became load-bearing here when #338 gave generic local endpoints
+            # a finite ceiling. Before that their threshold was `inf`, so this
+            # branch could not fire for them at all and there was nothing to ask
+            # about; now a healthy-but-slow local server that overruns the
+            # ceiling gets its connection killed, throwing away the prefill and
+            # inviting a kill -> re-prefill -> kill spiral. Killing a request the
+            # server says it is serving is exactly the failure #278 named.
+            #
+            # Scope is unchanged for everyone else: the probe is only consulted
+            # for a local base_url, and it returns None for any endpoint without
+            # a `/_gate/status` (a remote API, a bare Ollama or llama.cpp), so
+            # only a positive, parsed signal from a gated lane can extend
+            # anything. Both local phases now behave the same way — the DFlash
+            # pre-first-chunk wait above, and every local stall here.
+            if _stale_probe_local:
+                _stale_ceiling = _env_float(
+                    "HERMES_DFLASH_FIRST_CHUNK_CEILING",
+                    _DFLASH_FIRST_CHUNK_CEILING_DEFAULT_S,
+                )
+                # The ceiling bounds THIS SILENT STRETCH, not the request. For
+                # the pre-first-chunk phase those are the same span, which keeps
+                # this identical to the branch above; mid-stream, "how long the
+                # backend has said nothing" is the quantity a stall watchdog is
+                # about, and bounding total request time instead would kill a
+                # long, healthy, chunk-producing generation.
+                if _stale_elapsed < _stale_ceiling and _local_backend_generation_active(
+                    getattr(agent, "base_url", None),
+                    api_kwargs.get("model") or getattr(agent, "model", None),
+                ):
+                    _est_ctx = estimate_request_context_tokens(api_kwargs)
+                    # Re-ask one stale-timeout later (the same cadence the
+                    # first-chunk branch re-probes at), clamped so the next
+                    # check lands ON the ceiling rather than past it. Without
+                    # the clamp a wide threshold — 900s generic local, or a
+                    # prefill-scaled DFlash one — would schedule its next look
+                    # beyond the ceiling and silently outlive the bound.
+                    _stale_probe_extension = (
+                        min(_stale_elapsed + _stream_stale_timeout, _stale_ceiling)
+                        - _stream_stale_timeout
+                    )
+                    logger.info(
+                        "Local stream has sent nothing for %.0fs (threshold "
+                        "%.0fs) but the backend reports an ACTIVE generation — "
+                        "extending instead of killing. model=%s context=~%s "
+                        "tokens ceiling=%.0fs",
+                        _stale_elapsed,
+                        _stream_stale_timeout,
+                        api_kwargs.get("model", "unknown"),
+                        f"{_est_ctx:,}",
+                        _stale_ceiling,
+                    )
+                    agent._buffer_status(
+                        f"⏳ No output for {int(_stale_elapsed)}s on the local "
+                        f"backend (~{_est_ctx:,} tokens). The server reports it "
+                        f"is working — waiting."
+                    )
+                    agent._touch_activity(
+                        f"local backend actively generating "
+                        f"({int(_stale_elapsed)}s silent, ~{_est_ctx:,} tokens)"
+                    )
+                    continue
+
             _est_ctx = estimate_request_context_tokens(api_kwargs)
             logger.warning(
                 "Stream stale for %.0fs (threshold %.0fs) — no chunks received. "

@@ -7,6 +7,7 @@ kills during long prefill phases.
 """
 
 import os
+import re
 import textwrap
 
 import pytest
@@ -1680,6 +1681,13 @@ class TestGenericLocalStaleWatchdogActuallyFires:
             "agent.chat_completion_helpers.threading.Thread", NeverAnswersThread
         )
         monkeypatch.setattr("agent.chat_completion_helpers.time.time", Clock.time)
+        # A bare Ollama has no `/_gate/status`, so the liveness probe yields no
+        # signal and the plain stopwatch decides. Stub it rather than let the
+        # watchdog make a real request to port 11434 from a unit test.
+        monkeypatch.setattr(
+            "agent.chat_completion_helpers._local_backend_generation_active",
+            lambda base_url, model: None,
+        )
 
         agent = Agent()
         try:
@@ -1726,3 +1734,348 @@ class TestGenericLocalStaleWatchdogActuallyFires:
 
         assert kills == []
         assert agent._consecutive_stale_streams == 0
+
+
+class TestLocalStaleWatchdogAsksTheBackend:
+    """The stale branch must ask a local backend before killing its stream.
+
+    #278 established the rule for the no-first-chunk branch: a client-side
+    stopwatch cannot tell a wedged server apart from a healthily slow one, so
+    ask ``/_gate/status`` and only kill a backend that is not working (or one
+    that has blown the absolute ceiling). The stale branch — the one that
+    actually kills a generic local stream — never asked.
+
+    That was harmless while generic local endpoints resolved to ``inf``: the
+    branch could not fire for them. #338 gave them a finite 900s ceiling, which
+    is what makes the question live. A healthy-but-slow local server now has its
+    connection killed and reconnected, throwing away the prefill it had already
+    paid for, which is the first step of a kill -> re-prefill -> kill spiral.
+
+    The probe is unchanged and still conservative: it returns None for any
+    endpoint without a gate, so a bare Ollama or llama.cpp behaves exactly as
+    before and a remote API is never even asked.
+    """
+
+    POLL_SECONDS = 60.0
+
+    @staticmethod
+    def _seconds(message: str, prefix: str) -> int:
+        match = re.search(rf"{prefix} (\d+)s", message)
+        assert match, f"no {prefix!r} figure in {message!r}"
+        return int(match.group(1))
+
+    @classmethod
+    def _kill_after(cls, kills: list) -> int:
+        return cls._seconds(kills[0], "No response from provider for")
+
+    @classmethod
+    def _drive(
+        cls,
+        monkeypatch,
+        tmp_path,
+        *,
+        polls,
+        backend_active,
+        base_url="http://localhost:11434/v1",
+        provider="ollama",
+        model="qwen3.6-27b",
+        saw_first_chunk=False,
+        chunk_at=None,
+        env=None,
+    ):
+        """Poll ``polls`` times on a 60s-per-poll clock, delivering no chunks.
+
+        ``backend_active`` is what the liveness probe reports: True (busy),
+        False (idle), or None (endpoint has no progress signal at all).
+        ``saw_first_chunk`` starts the call in the mid-stream phase, and
+        ``chunk_at`` delivers one real chunk at that poll number.
+
+        Returns ``(agent, kills, waits, probes)`` where ``probes`` records the
+        wall-clock time of every liveness question asked.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / ".env").write_text("", encoding="utf-8")
+        for var in (
+            "HERMES_STREAM_STALE_TIMEOUT",
+            "HERMES_LOCAL_STREAM_STALE_TIMEOUT",
+            "HERMES_DFLASH_PREFILL_SECONDS_PER_1K",
+            "HERMES_DFLASH_FIRST_CHUNK_CEILING",
+            "HERMES_DFLASH_STALE_TIMEOUT",
+            "HERMES_DFLASH_STREAM_STALE_TIMEOUT",
+            "HERMES_STREAM_STALE_GIVEUP",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        for key, value in (env or {}).items():
+            monkeypatch.setenv(key, value)
+
+        class Clock:
+            now = 0.0
+
+            @classmethod
+            def time(cls_):
+                return cls_.now
+
+        class NeverAnswersThread:
+            joins = 0
+
+            def __init__(self, *, target, daemon):
+                self.target = target
+                # Play the part of the streaming worker: the chunk trackers the
+                # poll loop reads live in ``_call_chat_completions``, which
+                # ``_call`` delegates to, so reach them one level down.
+                outer = target.__code__.co_freevars
+                assert "_call_chat_completions" in outer, (
+                    "the streaming worker no longer delegates to "
+                    "_call_chat_completions; this harness must be updated"
+                )
+                inner = target.__closure__[
+                    outer.index("_call_chat_completions")
+                ].cell_contents
+                free = inner.__code__.co_freevars
+                assert {"last_chunk_time", "first_chunk_seen"} <= set(free), (
+                    "the streaming worker no longer closes over the chunk "
+                    "trackers; this harness must be updated to reach them"
+                )
+                self.last_chunk_time = inner.__closure__[
+                    free.index("last_chunk_time")
+                ].cell_contents
+                self.first_chunk_seen = inner.__closure__[
+                    free.index("first_chunk_seen")
+                ].cell_contents
+                if saw_first_chunk:
+                    self.first_chunk_seen["yes"] = True
+
+            def start(self):
+                return None
+
+            def is_alive(self):
+                return NeverAnswersThread.joins < polls
+
+            def join(self, timeout=None):
+                NeverAnswersThread.joins += 1
+                Clock.now += cls.POLL_SECONDS
+                if chunk_at is not None and NeverAnswersThread.joins == chunk_at:
+                    # A real chunk lands: the worker stamps the tracker, exactly
+                    # as it does on every SSE delta.
+                    self.last_chunk_time["t"] = Clock.now
+                    self.first_chunk_seen["yes"] = True
+
+        statuses = []
+        probes = []
+
+        def _probe(probe_base_url, probe_model):
+            probes.append((Clock.now, probe_base_url, probe_model))
+            return backend_active
+
+        class Agent:
+            api_mode = "chat_completions"
+            _interrupt_requested = False
+            _consecutive_stale_streams = 0
+
+            @staticmethod
+            def _touch_activity(_m):
+                return None
+
+            @staticmethod
+            def _buffer_status(m):
+                statuses.append(m)
+
+            @staticmethod
+            def _emit_wait_notice(_m):
+                return None
+
+            @staticmethod
+            def _replace_primary_openai_client(*, reason):
+                return None
+
+        Agent.base_url = base_url
+        Agent.provider = provider
+        Agent.model = model
+
+        monkeypatch.setattr(
+            "agent.chat_completion_helpers.threading.Thread", NeverAnswersThread
+        )
+        monkeypatch.setattr("agent.chat_completion_helpers.time.time", Clock.time)
+        monkeypatch.setattr(
+            "agent.chat_completion_helpers._local_backend_generation_active", _probe
+        )
+
+        agent = Agent()
+        try:
+            interruptible_streaming_api_call(
+                agent,
+                {"model": model, "messages": [{"role": "user", "content": "hi"}]},
+            )
+        except AssertionError:
+            # A guard from the fake worker above: a harness that has gone blind
+            # must fail loudly, not report an empty status list as a result.
+            raise
+        except BaseException:  # noqa: BLE001
+            pass
+        kills = [s for s in statuses if "No response from provider" in s]
+        waits = [s for s in statuses if "The server reports it is working" in s]
+        return agent, kills, waits, probes
+
+    def test_busy_backend_extends_instead_of_killing(self, monkeypatch, tmp_path):
+        """THE fix: a local server that says it is generating keeps its socket.
+
+        Without it the 900s ceiling fires at the first poll past it (960s) and
+        the prefill already paid for is thrown away.
+        """
+        agent, kills, waits, probes = self._drive(
+            monkeypatch, tmp_path, polls=20, backend_active=True
+        )
+
+        assert waits, (
+            "the watchdog killed a stream the backend reported as ACTIVE — it "
+            "never asked, or asked and ignored the answer"
+        )
+        assert kills == [], kills
+        assert agent._consecutive_stale_streams == 0, (
+            "an extended stream must not count toward the give-up breaker"
+        )
+        # It asked about the endpoint and model actually in flight.
+        assert probes and probes[0][1:] == (
+            "http://localhost:11434/v1",
+            "qwen3.6-27b",
+        )
+        # And it asked at the threshold, not before it.
+        assert self._seconds(waits[0], "No output for") == 960
+
+    def test_idle_backend_is_still_killed_promptly(self, monkeypatch, tmp_path):
+        """A backend that reports nothing in flight is genuinely wedged."""
+        agent, kills, waits, probes = self._drive(
+            monkeypatch, tmp_path, polls=20, backend_active=False
+        )
+
+        assert waits == []
+        assert len(kills) == 1, kills
+        assert self._kill_after(kills) == 960
+        assert probes, "killed without asking"
+        assert agent._consecutive_stale_streams == 1
+
+    def test_endpoint_with_no_gate_keeps_the_plain_stopwatch(
+        self, monkeypatch, tmp_path
+    ):
+        """A bare Ollama/llama.cpp has no progress signal: unchanged behavior.
+
+        This is the same outcome as before this change, and it is the common
+        case — the probe only ever helps a gated lane.
+        """
+        agent, kills, waits, _probes = self._drive(
+            monkeypatch, tmp_path, polls=20, backend_active=None
+        )
+
+        assert waits == []
+        assert len(kills) == 1, kills
+        assert self._kill_after(kills) == 960
+        assert agent._consecutive_stale_streams == 1
+
+    def test_remote_endpoint_is_never_asked(self, monkeypatch, tmp_path):
+        """Only a local endpoint can have a gate — never probe a remote API.
+
+        ``backend_active=True`` here would extend forever if the guard were
+        missing, so this pins the guard and not just the probe's None default.
+        """
+        # Six polls = 360s: one pass of the remote 180s threshold, so exactly
+        # one kill to look at (it re-arms every 180s after that).
+        _agent, kills, waits, probes = self._drive(
+            monkeypatch,
+            tmp_path,
+            polls=6,
+            backend_active=True,
+            base_url="https://api.example-cloud.com/v1",
+            provider="openai",
+            model="acme-chat-1",
+        )
+
+        assert probes == [], "asked a remote provider for a local liveness signal"
+        assert waits == []
+        assert len(kills) == 1, kills
+
+    def test_a_backend_that_never_stops_saying_busy_is_still_bounded(
+        self, monkeypatch, tmp_path
+    ):
+        """The ceiling is the backstop for a gate that lies (or is stuck).
+
+        The invariant: one silent stretch can never outlast the ceiling by more
+        than the poll interval that discovers it.
+        """
+        ceiling = 1200.0
+        _agent, kills, waits, _probes = self._drive(
+            monkeypatch,
+            tmp_path,
+            polls=40,
+            backend_active=True,
+            env={"HERMES_DFLASH_FIRST_CHUNK_CEILING": str(int(ceiling))},
+        )
+
+        assert waits, "never extended, so this proves nothing about the ceiling"
+        assert len(kills) == 1, kills
+        killed_after = self._kill_after(kills)
+        assert ceiling < killed_after <= ceiling + self.POLL_SECONDS, (
+            f"silent stretch ran {killed_after}s against a {ceiling:.0f}s ceiling"
+        )
+
+    def test_dflash_mid_stream_stall_is_asked_about_too(self, monkeypatch, tmp_path):
+        """The DFlash stale branch gets the same treatment, not just the generic one.
+
+        DFlash local already had the probe before its first chunk. Once that
+        chunk arrived it fell back to the same unconditional kill, so the answer
+        to "is the server still working?" was authoritative for one phase of a
+        request and ignored for the next. The branch is shared, so both phases
+        now ask.
+        """
+        dflash = {
+            "base_url": "http://10.10.20.211:8080/v1",
+            "provider": "taro",
+            "model": "deepseek-v4-flash-w2",
+            "saw_first_chunk": True,
+        }
+        # Seven polls = 420s: past the 180s DFlash stale timeout, and short of
+        # the re-arm that would give the no-signal arm below a second kill.
+        _agent, kills, waits, probes = self._drive(
+            monkeypatch, tmp_path, polls=7, backend_active=True, **dflash
+        )
+
+        assert waits, "a mid-stream DFlash stall was killed without asking"
+        assert kills == []
+        assert probes[0][1:] == (
+            "http://10.10.20.211:8080/v1",
+            "deepseek-v4-flash-w2",
+        )
+
+        # Same stall, no progress signal: the 180s DFlash stale timeout still
+        # kills, so the extension above is the probe's doing and not a widened
+        # threshold.
+        _agent, kills, waits, _probes = self._drive(
+            monkeypatch, tmp_path, polls=7, backend_active=None, **dflash
+        )
+        assert waits == []
+        assert len(kills) == 1, kills
+        assert self._kill_after(kills) == 240
+
+    def test_extension_does_not_carry_into_the_next_silent_stretch(
+        self, monkeypatch, tmp_path
+    ):
+        """Each stall is judged on its own; grants must not accumulate.
+
+        If the extension survived the chunk that ended the stall, every
+        extension would raise the bar for the rest of the request and the
+        watchdog would drift toward never firing.
+        """
+        chunk_at = 20  # a real chunk at t=1200s, after the first extension
+        _agent, _kills, _waits, probes = self._drive(
+            monkeypatch,
+            tmp_path,
+            polls=40,
+            backend_active=True,
+            chunk_at=chunk_at,
+        )
+
+        chunk_at_seconds = chunk_at * self.POLL_SECONDS
+        asked_after_chunk = [t for (t, _u, _m) in probes if t > chunk_at_seconds]
+        assert asked_after_chunk, "the post-chunk stretch never reached a probe"
+        # The fresh stretch is measured from the chunk and gets the whole 900s
+        # threshold back — not 900s plus what the previous stretch was granted.
+        assert asked_after_chunk[0] - chunk_at_seconds == 960
