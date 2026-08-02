@@ -9,15 +9,73 @@
  *   GET  /v1/models             → { data: [{ id, ... }] }
  *   POST /v1/chat/completions   → streaming (SSE) or non-streaming response
  *
- * The canned response is a short, deterministic assistant message. Tool-call
- * requests are not simulated — the E2E tests only need the chat surface to
- * prove the full boot → gateway → inference → renderer chain works.
+ * The canned response is a short, deterministic assistant message. If the
+ * request advertises tools and fewer than MAX_TOOL_CALLS `tool` messages
+ * have come back yet, the server instead makes another tool call
+ * (preferring a `todo` tool, else the first tool offered) with minimal
+ * arguments derived from its JSON schema, so an E2E test can observe several
+ * round trips within a single agent turn. Once enough tool results have
+ * round-tripped back as `role: 'tool'` messages, the server falls through to
+ * the canned reply below, ending the turn.
  */
 
 import http from 'node:http'
 
 /** A canned assistant reply used for every chat completion request. */
 const CANNED_REPLY = 'Hello from the mock inference server! The full boot chain is working.'
+
+/** More than one: several round trips in a single turn let a test watch mid-turn state change. */
+const MAX_TOOL_CALLS = 3
+
+/**
+ * Pause before answering a tool-call request, in ms (MOCK_TOOL_CALL_DELAY_MS).
+ *
+ * Off by default so the ordinary specs stay fast. A test that has to observe
+ * state changing *during* a turn needs that turn to outlast its polling
+ * interval — otherwise the whole turn lands between two samples and the test
+ * would pass whether or not the behaviour it checks is there.
+ */
+function toolCallDelayMs(): number {
+  const raw = Number(process.env.MOCK_TOOL_CALL_DELAY_MS)
+
+  return Number.isFinite(raw) && raw > 0 ? raw : 0
+}
+
+/** A trivially valid value for a JSON schema property, honoring `enum` and `type`. */
+function trivialValueFor(propSchema: any): unknown {
+  if (Array.isArray(propSchema?.enum) && propSchema.enum.length > 0) {
+    return propSchema.enum[0]
+  }
+
+  switch (propSchema?.type) {
+    case 'string':
+      return 'e2e'
+    case 'number':
+    case 'integer':
+      return 1
+    case 'boolean':
+      return true
+    case 'array':
+      return []
+    case 'object':
+      return {}
+    default:
+      return 'e2e'
+  }
+}
+
+/** Build minimal valid arguments for a tool call from its JSON schema. */
+function buildToolArguments(schema: any): Record<string, unknown> {
+  const properties = schema?.properties || {}
+  const required: string[] = Array.isArray(schema?.required) ? schema.required : []
+  const args: Record<string, unknown> = {}
+
+  for (const key of required) {
+    args[key] = trivialValueFor(properties[key])
+  }
+
+  return args
+}
 
 /**
  * Start the mock server on an ephemeral port.
@@ -66,7 +124,7 @@ export function startMockServer(): Promise<{ port: number; url: string; close: (
           body += chunk.toString()
         })
 
-        req.on('end', () => {
+        req.on('end', async () => {
           let parsed: any = {}
 
           try {
@@ -77,6 +135,109 @@ export function startMockServer(): Promise<{ port: number; url: string; close: (
 
           const stream = parsed.stream === true
           const model = parsed.model || 'mock-model'
+
+          const messages = Array.isArray(parsed.messages) ? parsed.messages : []
+          const tools = Array.isArray(parsed.tools) ? parsed.tools : []
+          const toolResultCount = messages.filter((message: any) => message?.role === 'tool').length
+          const shouldCallTool = toolResultCount < MAX_TOOL_CALLS && tools.length > 0
+
+          if (shouldCallTool) {
+            const tool = tools.find((t: any) => t?.function?.name === 'todo') || tools[0]
+            const toolName = tool?.function?.name || 'unknown'
+            const toolArgs = buildToolArguments(tool?.function?.parameters)
+            const toolCallId = `mock-tool-call-${toolResultCount + 1}`
+            const argsJson = JSON.stringify(toolArgs)
+            const delayMs = toolCallDelayMs()
+
+            if (delayMs > 0) {
+              await new Promise((resolveDelay) => setTimeout(resolveDelay, delayMs))
+            }
+
+            if (stream) {
+              res.writeHead(200, {
+                'Content-Type': 'text/event-stream',
+                'Cache-Control': 'no-cache',
+                Connection: 'keep-alive',
+              })
+
+              // One chunk carries the whole tool call, then a final chunk
+              // closes the turn with finish_reason: 'tool_calls'.
+              res.write(
+                `data: ${JSON.stringify({
+                  id: 'mock-completion',
+                  object: 'chat.completion.chunk',
+                  created: 0,
+                  model,
+                  choices: [
+                    {
+                      index: 0,
+                      delta: {
+                        tool_calls: [
+                          {
+                            index: 0,
+                            id: toolCallId,
+                            type: 'function',
+                            function: { name: toolName, arguments: argsJson },
+                          },
+                        ],
+                      },
+                      finish_reason: null,
+                    },
+                  ],
+                })}\n\n`,
+              )
+              res.write(
+                `data: ${JSON.stringify({
+                  id: 'mock-completion',
+                  object: 'chat.completion.chunk',
+                  created: 0,
+                  model,
+                  choices: [
+                    {
+                      index: 0,
+                      delta: {},
+                      finish_reason: 'tool_calls',
+                    },
+                  ],
+                })}\n\n`,
+              )
+              res.write('data: [DONE]\n\n')
+              res.end()
+            } else {
+              res.writeHead(200, { 'Content-Type': 'application/json' })
+              res.end(
+                JSON.stringify({
+                  id: 'mock-completion',
+                  object: 'chat.completion',
+                  created: 0,
+                  model,
+                  choices: [
+                    {
+                      index: 0,
+                      message: {
+                        role: 'assistant',
+                        content: null,
+                        tool_calls: [
+                          {
+                            id: toolCallId,
+                            type: 'function',
+                            function: { name: toolName, arguments: argsJson },
+                          },
+                        ],
+                      },
+                      finish_reason: 'tool_calls',
+                    },
+                  ],
+                  usage: {
+                    prompt_tokens: 10,
+                    completion_tokens: 20,
+                    total_tokens: 30,
+                  },
+                }),
+              )
+            }
+            return
+          }
 
           if (stream) {
             res.writeHead(200, {
