@@ -1659,3 +1659,56 @@ class TestContractAndBackgroundCompose:
             )
         assert verdict == "done"
         assert wait_directive is None
+
+
+class TestGoalStoreHomeScope:
+    """The goal store is process-global on purpose — see goals._get_session_db.
+
+    A goal's writers and its reader straddle the per-turn HERMES_HOME binding.
+    The desktop gateway writes goals from ``session.create`` (spawn --goal) and
+    from ``command.dispatch`` (/goal), neither of which binds a profile home,
+    then reads them back in the post-turn continuation hook, which runs inside
+    ``set_hermes_home_override(profile_home)``. If the store followed the active
+    home, the reader would look in the profile's state.db, find nothing, and the
+    goal loop would silently stop continuing.
+    """
+
+    def test_reader_under_profile_override_still_sees_the_goal(self, hermes_home, tmp_path):
+        from hermes_constants import (
+            get_hermes_home,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from hermes_cli import goals
+
+        profile_home = tmp_path / "profile-b"
+        profile_home.mkdir()
+
+        # Writer: session.create / command.dispatch, no profile home bound.
+        goals.save_goal("scope-sid", goals.GoalState(goal="ship it"))
+
+        # Reader: post-turn hook, bound to a different profile's home.
+        token = set_hermes_home_override(str(profile_home))
+        try:
+            assert get_hermes_home() == profile_home  # the override IS live
+            loaded = goals.load_goal("scope-sid")
+        finally:
+            reset_hermes_home_override(token)
+
+        assert loaded is not None, "goal store followed the per-turn override"
+        assert loaded.goal == "ship it"
+
+    def test_db_path_is_the_process_home_not_an_import_time_constant(
+        self, hermes_home, tmp_path, monkeypatch
+    ):
+        from hermes_cli import goals
+
+        first = goals._get_session_db().db_path
+        assert first == hermes_home / "state.db"
+
+        second_home = tmp_path / "second"
+        second_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(second_home))
+        goals._DB_CACHE.clear()
+
+        assert goals._get_session_db().db_path == second_home / "state.db"
