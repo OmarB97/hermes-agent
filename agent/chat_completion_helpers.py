@@ -322,6 +322,16 @@ _DFLASH_COLD_START_ALLOWANCE_DEFAULT_S = 180.0
 # Absolute ceiling. The watchdog exists so a request cannot park forever; even
 # with a live progress signal saying the backend is working, we stop eventually.
 _DFLASH_FIRST_CHUNK_CEILING_DEFAULT_S = 1800.0
+# Stale-stream ceiling for GENERIC local endpoints — anything local that is not
+# the DFlash family (Ollama, oMLX, llama.cpp, vLLM). Deliberately far more
+# generous than any cloud default, because a self-hosted model can legitimately
+# prefill for many minutes; deliberately FINITE, because an infinite disable
+# means a crashed or deadlocked local server parks the session forever with no
+# reconnect, no fallback, and no error the user can act on.
+#
+# 900s is the number ``agent.local_stream_stale_timeout`` has defaulted to, and
+# the docs have promised, since this ceiling was introduced.
+_LOCAL_STREAM_STALE_TIMEOUT_DEFAULT_S = 900.0
 
 
 def _dflash_context_timeout_default(api_payload: Any) -> float:
@@ -387,7 +397,9 @@ def _dflash_prefill_scaled_timeout(api_payload: Any, base: float) -> float:
 
     So only the first term generalizes. Every local DFlash route gets context
     scaling; the cold-start allowance and the managed-W2 floor stay gated to
-    the route they were measured on.
+    the route they were measured on. The generic (non-DFlash) local ceiling
+    rides on the same term for the same reason — see
+    :func:`_generic_local_stale_timeout`.
 
     Widen-only: the result is never below *base*. It is NOT idempotent —
     ``f(payload, f(payload, base))`` adds the prefill term twice — so *base*
@@ -521,10 +533,12 @@ def _normalize_watchdog_timeout(timeout: float) -> float:
 def _dflash_local_stale_timeout(api_payload: Any, model: Any) -> float | None:
     """Return a bounded local-provider stale timeout for DFlash models.
 
-    Generic local endpoints retain their generous unbounded default because
-    large self-hosted models can legitimately prefill for a long time. The
-    DFlash family instead gets a finite default so an accepted request cannot
-    park forever without giving retry/fallback handling a chance to run.
+    The DFlash family gets a tight finite default (180s + context scaling) so
+    an accepted request cannot park forever without giving retry/fallback
+    handling a chance to run. Generic local endpoints are also bounded, but far
+    more loosely — see :func:`_generic_local_stale_timeout` — because a
+    self-hosted model of unknown size can legitimately prefill for much longer
+    than this family's measured cold start.
     """
     if not _is_dflash_like_model(model):
         return None
@@ -575,6 +589,70 @@ def _dflash_local_first_chunk_timeout(api_payload: Any, model: Any) -> float | N
     return _dflash_context_timeout_default(api_payload)
 
 
+def _configured_local_stream_stale_ceiling() -> float:
+    """Read the generic-local stale ceiling: env, then config.yaml, then default.
+
+    ``HERMES_LOCAL_STREAM_STALE_TIMEOUT`` is the documented escape hatch and
+    outranks ``agent.local_stream_stale_timeout``, which is the canonical
+    setting. Returns the raw configured number — the caller applies the
+    non-positive-disables convention.
+    """
+    raw_env = os.getenv("HERMES_LOCAL_STREAM_STALE_TIMEOUT")
+    if raw_env is not None:
+        try:
+            return float(raw_env)
+        except (TypeError, ValueError):
+            # Unusable value — fall through to config.yaml rather than treat a
+            # typo as an explicit override.
+            pass
+
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+        agent_config = config.get("agent") if isinstance(config, dict) else None
+        if isinstance(agent_config, dict):
+            configured = agent_config.get("local_stream_stale_timeout")
+            if isinstance(configured, (int, float)) and not isinstance(
+                configured, bool
+            ):
+                return float(configured)
+    except Exception:
+        pass
+    return _LOCAL_STREAM_STALE_TIMEOUT_DEFAULT_S
+
+
+def _generic_local_stale_timeout(api_payload: Any) -> float:
+    """Return the stale-stream ceiling for a non-DFlash local endpoint.
+
+    This is what ``agent.local_stream_stale_timeout`` /
+    ``HERMES_LOCAL_STREAM_STALE_TIMEOUT`` configure. Both were documented and
+    defaulted but read by nothing: the reader was dropped in #263, which
+    replaced the inline ``local_stream_stale_timeout`` block with
+    :func:`resolve_stream_stale_timeout` and never reinstated the ceiling,
+    leaving generic local endpoints on the infinite disable the 900s default
+    was introduced to replace. It left the config default and the docs behind,
+    so the knob kept promising a bound that no longer existed — which is worse
+    than no knob, because an investigation into a wedged local turn starts from
+    the premise that a ceiling is already in force.
+
+    Non-positive disables the watchdog (``inf``) — the shared convention every
+    other timeout here follows, and the reason the infinite wait stays
+    reachable for an operator running an exotically slow local model.
+
+    The ceiling is then widened by this request's context-scaled prefill cost,
+    never narrowed. A flat deadline is exactly how the DFlash ladder killed
+    healthy prefills mid-flight (#278, #334): prompt size is the one thing that
+    genuinely scales the wait, so it has to scale the deadline too. The same
+    ``HERMES_DFLASH_FIRST_CHUNK_CEILING`` bound (1800s) still caps the result,
+    so a wedged endpoint remains bounded at any prompt size.
+    """
+    ceiling = _normalize_watchdog_timeout(_configured_local_stream_stale_ceiling())
+    if ceiling == float("inf"):
+        return ceiling
+    return _dflash_prefill_scaled_timeout(api_payload, ceiling)
+
+
 def resolve_stream_stale_timeout(agent, api_kwargs: dict) -> float:
     """Resolve the no-chunk timeout for streaming chat completions."""
     effective_model = api_kwargs.get("model") or agent.model
@@ -609,11 +687,15 @@ def resolve_stream_stale_timeout(agent, api_kwargs: dict) -> float:
                 dflash_timeout,
             )
             return dflash_timeout
+        local_timeout = _generic_local_stale_timeout(api_kwargs)
         logger.debug(
-            "Local provider detected (%s) — stale stream timeout disabled",
+            "Local provider detected (%s) — stale stream timeout %s",
             agent.base_url,
+            "disabled"
+            if local_timeout == float("inf")
+            else f"set to {local_timeout:.0f}s",
         )
-        return float("inf")
+        return local_timeout
 
     if estimated_tokens > 100_000:
         return max(stale_timeout_base, 300.0)
@@ -790,10 +872,10 @@ def _derive_stream_stale_timeout(agent, api_kwargs: dict) -> float:
 
     Mirrors the main streaming path's derivation — provider config → env base
     → context-size scaling → reasoning-model floor — minus the local-endpoint
-    ``float('inf')``/900s disable branch, which cannot apply to Bedrock (its
-    endpoint is always the AWS cloud). Factored so the Bedrock streaming
-    watchdog shares the exact same patience budget as the OpenAI/Anthropic
-    stale-stream detector below.
+    ceiling branch (``agent.local_stream_stale_timeout``), which cannot apply
+    to Bedrock (its endpoint is always the AWS cloud). Factored so the Bedrock
+    streaming watchdog shares the exact same patience budget as the
+    OpenAI/Anthropic stale-stream detector below.
     """
     _cfg_stale = get_provider_stale_timeout(
         agent.provider, agent.model, base_url=getattr(agent, "base_url", None)

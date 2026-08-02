@@ -863,13 +863,13 @@ Hermes has separate timeout layers for streaming, plus a stale detector for non-
 | Timeout | Default | Local providers | Config / env |
 |---------|---------|----------------|--------------|
 | Socket read timeout | 120s | Auto-raised to 1800s | `HERMES_STREAM_READ_TIMEOUT` |
-| Stale stream detection | 180s | Auto-disabled | `HERMES_STREAM_STALE_TIMEOUT` |
+| Stale stream detection | 180s | Auto-raised to a 900s ceiling | `agent.local_stream_stale_timeout` / `HERMES_STREAM_STALE_TIMEOUT` |
 | Stale non-stream detection | 300s | Auto-disabled when left implicit | `providers.<id>.stale_timeout_seconds` or `HERMES_API_CALL_STALE_TIMEOUT` |
 | API call (non-streaming) | 1800s | Unchanged | `providers.<id>.request_timeout_seconds` / `timeout_seconds` or `HERMES_API_TIMEOUT` |
 
 The **socket read timeout** controls how long httpx waits for the next chunk of data from the provider. Local LLMs can take minutes for prefill on large contexts before producing the first token, so Hermes raises this to 30 minutes when it detects a local endpoint. If you explicitly set `HERMES_STREAM_READ_TIMEOUT`, that value is always used regardless of endpoint detection.
 
-The **stale stream detection** kills connections that receive SSE keep-alive pings but no actual content. This is disabled entirely for local providers since they don't send keep-alive pings during prefill.
+The **stale stream detection** kills connections that receive SSE keep-alive pings but no actual content. Local providers get a far more generous ceiling instead of the 180s default — `agent.local_stream_stale_timeout` (900s), widened further by the request's context-scaled prefill cost so a large prompt on slow hardware is not killed mid-prefill. It stays finite on purpose: a crashed or deadlocked local server has to eventually trip the detector so reconnect and fallback can run, rather than parking the session forever. Set it to `0` if you want the old unbounded wait back, or set `HERMES_STREAM_STALE_TIMEOUT` / `providers.<id>.stale_timeout_seconds` to pin one value everywhere.
 
 The **stale non-stream detection** kills non-streaming calls that produce no response for too long. By default Hermes disables this on local endpoints to avoid false positives during long prefills. If you explicitly set `providers.<id>.stale_timeout_seconds`, `providers.<id>.models.<model>.stale_timeout_seconds`, or `HERMES_API_CALL_STALE_TIMEOUT`, that explicit value is honored even on local endpoints.
 

@@ -638,10 +638,33 @@ class TestLocalDflashStaleTimeout:
         assert provider_stream_timeout == 320.0
         assert provider_first_chunk_timeout == 320.0
 
-    def test_generic_local_stream_stale_timeout_still_disables_by_default(self, monkeypatch, tmp_path):
+    def test_generic_local_stream_stale_timeout_is_bounded_but_looser(
+        self, monkeypatch, tmp_path
+    ):
+        """A non-DFlash local model is bounded too — just far more loosely.
+
+        This test previously asserted ``inf`` under the name
+        ``..._still_disables_by_default``. That was not the intended contract:
+        ``agent.local_stream_stale_timeout`` (default 900) and
+        ``HERMES_LOCAL_STREAM_STALE_TIMEOUT`` were shipped and documented as a
+        finite ceiling replacing exactly that infinite disable, and #263 dropped
+        the code that read them while leaving the default and the docs in place.
+        So the old assertion pinned the regression, not the design.
+
+        900s rather than this family's 180s because a generic local endpoint may
+        be serving a much larger model than DFlash on unknown hardware; finite
+        rather than ``inf`` because a wedged local server must eventually let
+        reconnect/fallback run instead of parking the session forever.
+        """
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         (tmp_path / ".env").write_text("", encoding="utf-8")
-        monkeypatch.delenv("HERMES_STREAM_STALE_TIMEOUT", raising=False)
+        for var in (
+            "HERMES_STREAM_STALE_TIMEOUT",
+            "HERMES_LOCAL_STREAM_STALE_TIMEOUT",
+            "HERMES_DFLASH_STALE_TIMEOUT",
+            "HERMES_DFLASH_STREAM_STALE_TIMEOUT",
+        ):
+            monkeypatch.delenv(var, raising=False)
 
         agent = self._make_agent(model="qwen3.6-27b")
 
@@ -650,7 +673,13 @@ class TestLocalDflashStaleTimeout:
             {"model": "qwen3.6-27b", "messages": [{"role": "user", "content": "hi"}]},
         )
 
-        assert timeout == float("inf")
+        assert timeout == 900.0
+
+        # The DFlash family keeps its own, tighter budget on the same endpoint.
+        assert resolve_stream_stale_timeout(
+            agent,
+            {"model": "dflash", "messages": [{"role": "user", "content": "hi"}]},
+        ) == 180.0
 
     def test_default_local_dflash_non_stream_stale_timeout_is_bounded(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -1358,3 +1387,342 @@ class TestFirstChunkBudgetThroughRealProviderResolution:
         assert (
             resolve_dflash_local_first_chunk_timeout(agent, other_model) == 1200.0
         )
+
+
+class TestGenericLocalStreamStaleCeiling:
+    """The generic (non-DFlash) local ceiling, end to end through config.
+
+    ``agent.local_stream_stale_timeout`` and ``HERMES_LOCAL_STREAM_STALE_TIMEOUT``
+    were defaulted in ``DEFAULT_CONFIG``, documented in
+    ``website/docs/reference/environment-variables.md``, and read by NOTHING:
+    #263 replaced the inline block that read them with
+    ``resolve_stream_stale_timeout`` and never reinstated the ceiling. A knob
+    that is defaulted and documented but inert is worse than no knob — it costs
+    an investigation the time it takes to discover the bound it promises is not
+    in force. These tests resolve through the real config loader so the reader
+    cannot be dropped again without going red.
+    """
+
+    @staticmethod
+    def _payload(model: str, tokens: int = 0) -> dict:
+        # A list of raw strings estimates to EXACTLY ``tokens`` (chars // 4),
+        # with none of the dict-repr overhead the message-dict form carries.
+        return {"model": model, "messages": ["x" * (tokens * 4)]}
+
+    @staticmethod
+    def _agent(monkeypatch, tmp_path, *, config_body: str = "", model="qwen3.6-27b"):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / ".env").write_text("", encoding="utf-8")
+        (tmp_path / "config.yaml").write_text(
+            textwrap.dedent(config_body), encoding="utf-8"
+        )
+        for var in (
+            "HERMES_STREAM_STALE_TIMEOUT",
+            "HERMES_LOCAL_STREAM_STALE_TIMEOUT",
+            "HERMES_DFLASH_PREFILL_SECONDS_PER_1K",
+            "HERMES_DFLASH_FIRST_CHUNK_CEILING",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+        from run_agent import AIAgent
+
+        with patch(
+            "agent.context_compressor.get_model_context_length",
+            return_value=256_000,
+        ):
+            return AIAgent(
+                api_key="sk-dummy",
+                base_url="http://localhost:11434/v1",
+                provider="ollama",
+                model=model,
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                platform="cli",
+            )
+
+    def test_default_ceiling_comes_from_default_config(self, monkeypatch, tmp_path):
+        """No user config at all -> the 900 in ``DEFAULT_CONFIG`` is in force."""
+        agent = self._agent(monkeypatch, tmp_path)
+
+        assert resolve_stream_stale_timeout(agent, self._payload(agent.model)) == 900.0
+
+    def test_config_yaml_value_is_honored(self, monkeypatch, tmp_path):
+        agent = self._agent(
+            monkeypatch,
+            tmp_path,
+            config_body="""\
+            agent:
+              local_stream_stale_timeout: 1200
+            """,
+        )
+
+        assert resolve_stream_stale_timeout(agent, self._payload(agent.model)) == 1200.0
+
+    def test_env_var_overrides_config_yaml(self, monkeypatch, tmp_path):
+        """The documented escape hatch outranks the canonical setting."""
+        agent = self._agent(
+            monkeypatch,
+            tmp_path,
+            config_body="""\
+            agent:
+              local_stream_stale_timeout: 1200
+            """,
+        )
+        monkeypatch.setenv("HERMES_LOCAL_STREAM_STALE_TIMEOUT", "300")
+
+        assert resolve_stream_stale_timeout(agent, self._payload(agent.model)) == 300.0
+
+    def test_unparseable_env_value_falls_through_to_config(
+        self, monkeypatch, tmp_path
+    ):
+        """A typo is not an explicit override, and must not disable the bound."""
+        agent = self._agent(
+            monkeypatch,
+            tmp_path,
+            config_body="""\
+            agent:
+              local_stream_stale_timeout: 1200
+            """,
+        )
+        monkeypatch.setenv("HERMES_LOCAL_STREAM_STALE_TIMEOUT", "not-a-number")
+
+        assert resolve_stream_stale_timeout(agent, self._payload(agent.model)) == 1200.0
+
+    @pytest.mark.parametrize("disable_value", ["0", "-1"])
+    def test_non_positive_env_value_restores_the_infinite_wait(
+        self, monkeypatch, tmp_path, disable_value
+    ):
+        """The escape hatch for an exotically slow local model stays reachable.
+
+        Bounding the generic local endpoint is a real behavior change, so the
+        previous unbounded wait must remain available deliberately — via the
+        same non-positive-disables convention every other watchdog here uses.
+        """
+        agent = self._agent(monkeypatch, tmp_path)
+        monkeypatch.setenv("HERMES_LOCAL_STREAM_STALE_TIMEOUT", disable_value)
+
+        timeout = resolve_stream_stale_timeout(agent, self._payload(agent.model))
+
+        assert timeout == float("inf")
+
+    def test_zero_in_config_yaml_also_disables(self, monkeypatch, tmp_path):
+        agent = self._agent(
+            monkeypatch,
+            tmp_path,
+            config_body="""\
+            agent:
+              local_stream_stale_timeout: 0
+            """,
+        )
+
+        assert resolve_stream_stale_timeout(
+            agent, self._payload(agent.model)
+        ) == float("inf")
+
+    def test_ceiling_widens_with_prompt_size(self, monkeypatch, tmp_path):
+        """A big prompt costs more to prefill, so it gets a bigger budget.
+
+        900s + 4s per 1k prompt tokens — the same measured prefill rate the
+        DFlash budget uses, and the same widen-only rule. A FLAT deadline is
+        precisely how the old ladder killed healthy prefills mid-flight
+        (#278, #334); repeating that mistake here would trade "hangs forever"
+        for "kills work that was fine", which is the worse of the two.
+        """
+        agent = self._agent(monkeypatch, tmp_path)
+
+        # 900 + 4 * 90 = 1260. Widen-only: a small prompt never goes below 900.
+        assert resolve_stream_stale_timeout(
+            agent, self._payload(agent.model, 90_000)
+        ) == 1260.0
+        assert resolve_stream_stale_timeout(
+            agent, self._payload(agent.model, 1_000)
+        ) == 904.0
+
+    def test_wedged_endpoint_stays_bounded_at_any_prompt_size(
+        self, monkeypatch, tmp_path
+    ):
+        """Context scaling must not become a back door to an unbounded wait."""
+        agent = self._agent(monkeypatch, tmp_path)
+
+        # 900 + 4 * 400 = 2500, clamped by HERMES_DFLASH_FIRST_CHUNK_CEILING.
+        assert resolve_stream_stale_timeout(
+            agent, self._payload(agent.model, 400_000)
+        ) == 1800.0
+
+    def test_explicit_stream_stale_timeout_still_wins(self, monkeypatch, tmp_path):
+        """An operator who pins the global stale timeout gets exactly it."""
+        agent = self._agent(monkeypatch, tmp_path)
+        monkeypatch.setenv("HERMES_STREAM_STALE_TIMEOUT", "45")
+
+        assert resolve_stream_stale_timeout(agent, self._payload(agent.model)) == 45.0
+
+    def test_provider_config_still_wins(self, monkeypatch, tmp_path):
+        """``providers.<id>.stale_timeout_seconds`` remains canonical."""
+        agent = self._agent(
+            monkeypatch,
+            tmp_path,
+            config_body="""\
+            agent:
+              local_stream_stale_timeout: 1200
+            providers:
+              ollama:
+                stale_timeout_seconds: 60
+            """,
+        )
+
+        assert resolve_stream_stale_timeout(agent, self._payload(agent.model)) == 60.0
+
+    def test_remote_endpoint_is_untouched(self, monkeypatch, tmp_path):
+        """The ceiling is local-only; cloud providers keep the 180s default."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / ".env").write_text("", encoding="utf-8")
+        monkeypatch.delenv("HERMES_STREAM_STALE_TIMEOUT", raising=False)
+        monkeypatch.setenv("HERMES_LOCAL_STREAM_STALE_TIMEOUT", "300")
+
+        from run_agent import AIAgent
+
+        with patch(
+            "agent.context_compressor.get_model_context_length",
+            return_value=256_000,
+        ):
+            agent = AIAgent(
+                api_key="sk-dummy",
+                base_url="https://api.openai.com/v1",
+                provider="openai",
+                model="gpt-5.2",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                platform="cli",
+            )
+
+        assert resolve_stream_stale_timeout(agent, self._payload("gpt-5.2")) == 180.0
+
+
+class TestGenericLocalStaleWatchdogActuallyFires:
+    """The ceiling has to reach the watchdog, not just the resolver.
+
+    The resolution tests above prove the number. This one drives the real poll
+    loop in ``interruptible_streaming_api_call`` against a local endpoint that
+    accepts the request and then never sends a chunk — the wedged-server shape
+    the ceiling exists for — and asserts the connection is actually killed.
+    Before the fix that branch was unreachable for a generic local endpoint:
+    its threshold was ``inf``, so ``_stale_elapsed > _stream_stale_timeout``
+    could never be true and the turn parked until the user gave up.
+    """
+
+    @staticmethod
+    def _drive(monkeypatch, tmp_path, *, polls, env=None):
+        """Poll ``polls`` times with a 60s-per-poll clock and no chunks ever."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / ".env").write_text("", encoding="utf-8")
+        for var in (
+            "HERMES_STREAM_STALE_TIMEOUT",
+            "HERMES_LOCAL_STREAM_STALE_TIMEOUT",
+            "HERMES_DFLASH_PREFILL_SECONDS_PER_1K",
+            "HERMES_STREAM_STALE_GIVEUP",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        for key, value in (env or {}).items():
+            monkeypatch.setenv(key, value)
+
+        class Clock:
+            now = 0.0
+
+            @classmethod
+            def time(cls):
+                return cls.now
+
+        class NeverAnswersThread:
+            joins = 0
+
+            def __init__(self, *, target, daemon):
+                self.target = target
+
+            def start(self):
+                return None
+
+            def is_alive(self):
+                return NeverAnswersThread.joins < polls
+
+            def join(self, timeout=None):
+                NeverAnswersThread.joins += 1
+                Clock.now += 60.0
+
+        statuses = []
+
+        class Agent:
+            api_mode = "chat_completions"
+            base_url = "http://localhost:11434/v1"
+            provider = "ollama"
+            model = "qwen3.6-27b"
+            _interrupt_requested = False
+            _consecutive_stale_streams = 0
+
+            @staticmethod
+            def _touch_activity(_m):
+                return None
+
+            @staticmethod
+            def _buffer_status(m):
+                statuses.append(m)
+
+            @staticmethod
+            def _emit_wait_notice(_m):
+                return None
+
+            @staticmethod
+            def _replace_primary_openai_client(*, reason):
+                return None
+
+        monkeypatch.setattr(
+            "agent.chat_completion_helpers.threading.Thread", NeverAnswersThread
+        )
+        monkeypatch.setattr("agent.chat_completion_helpers.time.time", Clock.time)
+
+        agent = Agent()
+        try:
+            interruptible_streaming_api_call(
+                agent,
+                {
+                    "model": "qwen3.6-27b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+        except BaseException:  # noqa: BLE001
+            pass
+        kills = [s for s in statuses if "No response from provider" in s]
+        return agent, kills
+
+    def test_wedged_local_endpoint_is_killed_at_the_ceiling(
+        self, monkeypatch, tmp_path
+    ):
+        """20 polls = 1200s of silence: the 900s ceiling must trip inside it."""
+        agent, kills = self._drive(monkeypatch, tmp_path, polls=20)
+
+        assert len(kills) == 1, kills
+        # First poll past 900s on a 60s-per-poll clock.
+        assert "960s" in kills[0]
+        # The kill counts toward the cross-turn give-up breaker, so a
+        # persistently wedged endpoint escalates instead of looping forever.
+        assert agent._consecutive_stale_streams == 1
+
+    def test_explicit_disable_reproduces_the_old_unbounded_wait(
+        self, monkeypatch, tmp_path
+    ):
+        """Also the pre-fix behavior, kept reachable on purpose.
+
+        Same 1200s of silence, ceiling disabled: nothing is killed and nothing
+        is counted. That is exactly what EVERY generic local endpoint did
+        before this fix — an operator who wants it back still has it.
+        """
+        agent, kills = self._drive(
+            monkeypatch,
+            tmp_path,
+            polls=20,
+            env={"HERMES_LOCAL_STREAM_STALE_TIMEOUT": "0"},
+        )
+
+        assert kills == []
+        assert agent._consecutive_stale_streams == 0
