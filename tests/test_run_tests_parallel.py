@@ -359,3 +359,160 @@ def test_file_retry_does_not_launder_deterministic_failure(tmp_path: Path) -> No
     assert proc.returncode == 1, proc.stdout
     assert "deterministic regression" in proc.stdout
     assert "FLAKY file" not in proc.stdout
+
+
+# ── Node-id targets, and targets that select nothing ─────────────────────────
+#
+# AGENTS.md documents ``scripts/run_tests.sh tests/agent/test_foo.py::test_x``
+# as the way to run a single test. The runner used to stat every positional as
+# a filesystem path; ``path::nodeid`` doesn't exist on disk, so the target was
+# dropped — printing "No test files to run" when it was the only target, and
+# silently running something else when it wasn't. Both shapes let a developer
+# "verify" a change against a test that never executed.
+#
+# These are behavior contracts: a node id selects exactly its test, and a
+# target that selects nothing is loud and non-zero rather than quietly skipped.
+
+
+def _make_nodeid_probe(tmp_path: Path) -> Path:
+    """One file, three tests: two module-level, one inside a class."""
+    probe = tmp_path / "test_nodeid_probe.py"
+    probe.write_text(
+        "def test_alpha():\n    assert True\n\n"
+        "def test_beta():\n    assert True\n\n"
+        "class TestGamma:\n"
+        "    def test_inner(self):\n        assert True\n"
+    )
+    return probe
+
+
+def _run_targets(*targets: str) -> subprocess.CompletedProcess:
+    """Invoke the runner with positional targets (paths and/or node ids)."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    return subprocess.run(
+        [sys.executable, str(runner), *targets,
+         "-j", "1", "--file-timeout", "60", "-q"],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=120,
+    )
+
+
+def test_node_id_runs_exactly_that_one_test(tmp_path: Path) -> None:
+    """The form AGENTS.md documents: ``file.py::test_x`` runs one test."""
+    probe = _make_nodeid_probe(tmp_path)
+    proc = _run_targets(f"{probe}::test_alpha")
+    assert proc.returncode == 0, proc.stdout
+    assert "No test files to run" not in proc.stdout, proc.stdout
+    # One of three tests — the node id narrowed the file, it wasn't ignored.
+    assert "Summary: 1 files, 1 tests passed" in proc.stdout, proc.stdout
+
+
+def test_three_part_node_id_selects_the_class_test(tmp_path: Path) -> None:
+    """``file.py::SomeClass::test_x`` splits on the FIRST ``::``, not the last."""
+    probe = _make_nodeid_probe(tmp_path)
+    proc = _run_targets(f"{probe}::TestGamma::test_inner")
+    assert proc.returncode == 0, proc.stdout
+    assert "Summary: 1 files, 1 tests passed" in proc.stdout, proc.stdout
+
+
+def test_two_node_ids_in_one_file_share_one_subprocess(tmp_path: Path) -> None:
+    """Both tests run, and per-file isolation is untouched: one file, one pytest.
+
+    The scheduling unit stays the FILE — node ids are extra targets on that
+    file's single pytest command line, not a second subprocess.
+    """
+    probe = _make_nodeid_probe(tmp_path)
+    proc = _run_targets(f"{probe}::test_alpha", f"{probe}::test_beta")
+    assert proc.returncode == 0, proc.stdout
+    assert "Summary: 1 files, 2 tests passed" in proc.stdout, proc.stdout
+
+
+def test_directory_root_wins_over_a_node_id_for_the_same_file(
+    tmp_path: Path,
+) -> None:
+    """Naming a dir AND a node id inside it runs the whole file, like pytest."""
+    probe = _make_nodeid_probe(tmp_path)
+    proc = _run_targets(str(tmp_path), f"{probe}::test_alpha")
+    assert proc.returncode == 0, proc.stdout
+    assert "Summary: 1 files, 3 tests passed" in proc.stdout, proc.stdout
+
+
+def test_unresolvable_target_is_rejected_loudly(tmp_path: Path) -> None:
+    """A target naming nothing exits non-zero and says exactly what it dropped."""
+    proc = _run_targets(str(tmp_path / "test_not_here.py"))
+    assert proc.returncode != 0, proc.stdout
+    assert "test_not_here.py" in proc.stdout, proc.stdout
+    assert "no such file or directory" in proc.stdout, proc.stdout
+
+
+def test_bad_target_hidden_behind_a_good_one_still_fails(tmp_path: Path) -> None:
+    """The original silent no-op: a dropped target masked by a working one.
+
+    Discovery used to skip the unresolvable target and run only the good one,
+    exiting 0 — so a typo in the test you cared about produced a green run
+    that never executed it.
+    """
+    probe = _make_nodeid_probe(tmp_path)
+    proc = _run_targets(str(probe), str(tmp_path / "test_typo.py"))
+    assert proc.returncode != 0, proc.stdout
+    assert "test_typo.py" in proc.stdout, proc.stdout
+
+
+def test_malformed_node_id_is_rejected(tmp_path: Path) -> None:
+    """``file.py::`` has no selector — reject it instead of guessing."""
+    probe = _make_nodeid_probe(tmp_path)
+    proc = _run_targets(f"{probe}::")
+    assert proc.returncode != 0, proc.stdout
+    assert "malformed node id" in proc.stdout, proc.stdout
+
+
+def test_no_test_files_to_run_is_never_a_zero_exit(tmp_path: Path) -> None:
+    """An empty discovery root must not be indistinguishable from a pass."""
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    proc = subprocess.run(
+        [sys.executable, str(runner), "--paths", str(empty), "-j", "1", "-q"],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode != 0, proc.stdout
+
+
+def test_run_that_collects_no_tests_is_not_green(tmp_path: Path) -> None:
+    """A ``-k`` expression matching nothing must not report a clean pass.
+
+    pytest exits 5 (nothing collected) and the runner counts that as a
+    per-file pass — right when marker filtering empties one file out of
+    hundreds, catastrophic when it's the entire run: instant, clean, exit 0,
+    zero tests executed.
+    """
+    probe = _make_nodeid_probe(tmp_path)
+    proc = _run_targets(str(probe), "-k", "no_such_test_name_anywhere")
+    assert proc.returncode != 0, proc.stdout
+    assert "verified nothing" in proc.stdout, proc.stdout
+
+
+def test_node_id_run_does_not_poison_the_duration_cache(tmp_path: Path) -> None:
+    """A one-test run must not tell ``--slice`` the whole file is that fast.
+
+    Durations are keyed by file path, so caching a narrowed run's timing
+    would have LPT believe a 90s file costs 0.3s and pile the slow tail into
+    a single CI job.
+    """
+    probe = _make_nodeid_probe(tmp_path)
+    narrowed = _run_targets(f"{probe}::test_alpha")
+    assert narrowed.returncode == 0, narrowed.stdout
+    assert "Durations NOT cached" in narrowed.stdout, narrowed.stdout
+    # The same file run whole is a complete measurement — still cached.
+    whole = _run_targets(str(probe))
+    assert whole.returncode == 0, whole.stdout
+    assert "Durations cached to" in whole.stdout, whole.stdout

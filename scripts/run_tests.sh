@@ -19,10 +19,17 @@
 #   scripts/run_tests.sh tests/agent/               # discover only here
 #   scripts/run_tests.sh tests/agent/ tests/acp/    # multiple roots
 #   scripts/run_tests.sh tests/foo.py               # single file
+#   scripts/run_tests.sh tests/foo.py::test_x       # single test (node id)
+#   scripts/run_tests.sh tests/foo.py::Cls::test_x  # single test in a class
 #   scripts/run_tests.sh tests/foo.py -q            # path + bare pytest flag
 #   scripts/run_tests.sh tests/foo.py -v --tb=long  # bare flags "just work"
 #   scripts/run_tests.sh -k 'pattern'               # value flags pass through too
 #   scripts/run_tests.sh tests/foo.py -- --tb=long  # explicit '--' still works
+#
+# A target that selects nothing (typo'd path, node id naming no such test)
+# is a hard error, not a quiet skip: the runner names what it dropped and
+# exits non-zero. A run that collects zero tests overall also exits
+# non-zero — a green run that verified nothing is worse than a red one.
 #
 # Bare pytest flags (anything starting with '-' that isn't one of this
 # runner's own options: -j/--jobs, --paths, --slice, --file-timeout, etc.)
