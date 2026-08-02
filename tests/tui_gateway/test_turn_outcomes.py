@@ -798,3 +798,148 @@ def test_outcome_without_persisted_prompt_still_projects_as_visible_system_row()
             },
         }
     ]
+
+
+# ── Turn isolation (compute host) ────────────────────────────────────────
+#
+# Under turn isolation the turn body runs in the `python -m
+# tui_gateway.compute_host` child.  _run_real_turn() re-enters this same
+# module -- server._start_inflight_turn() then server._run_prompt_submit() --
+# so the terminal outcome #270 guarantees is emitted and persisted by the
+# CHILD, on the ordinary in-process path.  The parent only mirrors metadata
+# and drains the queue.  These pin that ownership split, because the obvious
+# misreading (the parent's completion handler looks like it should finalize)
+# produces a second outcome under a different turn id, which the per-session
+# dedupe cannot catch across processes.
+
+
+def _isolated_frame(**overrides):
+    frame = {
+        "type": "turn.start",
+        "sid": "runtime-session",
+        "request_id": "request-1",
+        "session_key": "stored-session",
+        "text": "run the turn",
+    }
+    frame.update(overrides)
+    return frame
+
+
+@pytest.fixture()
+def compute_host(monkeypatch, turn_harness):
+    """A ComputeHost wired to a session the parent already created."""
+    import io
+
+    from tui_gateway.compute_host import ComputeHost
+
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_persist_branch_seed", lambda *_a, **_k: None)
+
+    host = ComputeHost(stdout=io.StringIO(), max_workers=1, heartbeat_secs=0)
+
+    def start(agent, *, sid="runtime-session"):
+        session = _session(agent)
+        # _run_real_turn refuses a session already marked running.
+        session["running"] = False
+        server._sessions[sid] = session
+        return session
+
+    try:
+        yield types.SimpleNamespace(host=host, start=start)
+    finally:
+        server._sessions.pop("runtime-session", None)
+        host.close()
+
+
+def test_compute_host_child_emits_and_persists_the_terminal_outcome(
+    turn_harness, compute_host
+):
+    agent = _Agent(
+        {
+            "completed": True,
+            "final_response": "done",
+            "messages": [
+                {"role": "user", "content": "run the turn"},
+                {"role": "assistant", "content": "done"},
+            ],
+        }
+    )
+    session = compute_host.start(agent)
+
+    compute_host.host._run_real_turn(_isolated_frame())
+
+    outcomes = [args[2] for args in turn_harness.emitted if args[0] == "turn.outcome"]
+    assert len(outcomes) == 1
+    assert outcomes[0]["status"] == "completed"
+    # Persisted from inside the child, not by the parent after the fact.
+    assert [row["turn_id"] for row in turn_harness.db.rows] == [outcomes[0]["id"]]
+    assert session["inflight_turn"] is None
+
+
+def test_compute_host_child_reports_session_info_already_emitted(
+    turn_harness, compute_host
+):
+    """The turn.end frame tells the parent the child covered session.info.
+
+    The parent skips its own session.info on this flag; if the child stopped
+    setting it the client would see the event twice per isolated turn.
+    """
+    emitted_frames = []
+    compute_host.host.emit = emitted_frames.append
+    compute_host.start(
+        _Agent({"completed": True, "final_response": "done", "messages": []})
+    )
+
+    compute_host.host._run_real_turn(_isolated_frame())
+
+    ends = [f for f in emitted_frames if f.get("type") == "turn.end"]
+    assert len(ends) == 1
+    assert ends[0]["session_info_emitted"] is True
+
+
+def test_compute_host_child_failure_is_a_failed_outcome(turn_harness, compute_host):
+    compute_host.start(_Agent(None, error=RuntimeError("provider exploded")))
+
+    compute_host.host._run_real_turn(_isolated_frame())
+
+    outcomes = [args[2] for args in turn_harness.emitted if args[0] == "turn.outcome"]
+    assert len(outcomes) == 1
+    assert outcomes[0]["status"] == "failed"
+
+
+def test_parent_completion_handler_does_not_publish_a_second_outcome(turn_harness):
+    """The parent must not finalize a turn the child already closed.
+
+    The parent holds its own inflight turn with a *different* id, so a
+    _finalize_turn_outcome() call here would publish a duplicate terminal
+    record that _finalize's per-session dedupe cannot suppress — the child
+    lives in another process with its own session dict.
+    """
+    session = _session(None)
+    session["_compute_host_active"] = True
+    server._start_inflight_turn(session, "run the turn")
+    parent_turn_id = session["inflight_turn"]["id"]
+
+    server._on_compute_host_turn_done(
+        "request-1",
+        "runtime-session",
+        session,
+        {
+            "type": "turn.end",
+            "sid": "runtime-session",
+            "request_id": "request-1",
+            "session_key": "stored-session",
+            "history_version": 1,
+            "message_count": 2,
+            # The child already emitted both of these.
+            "session_info": {"model": "gold-model", "provider": "gold-provider"},
+            "session_info_emitted": True,
+        },
+    )
+
+    assert [args for args in turn_harness.emitted if args[0] == "turn.outcome"] == []
+    assert turn_harness.db.rows == []
+    # The parent still releases its own turn state.
+    assert session["inflight_turn"] is None
+    assert session["running"] is False
+    assert parent_turn_id
