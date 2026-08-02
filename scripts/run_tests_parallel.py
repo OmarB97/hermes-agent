@@ -75,12 +75,14 @@ _SKIP_PARTS = {"integration", "e2e", "docker"}
 # Per-file wall-clock cap. Override
 # via --file-timeout or HERMES_TEST_FILE_TIMEOUT.
 #
-# Set to 300s (5 min) deliberately generous: the per-test subprocess
-# isolation plugin spawns a fresh Python process per test, so a
-# large-collection file pays N × (interpreter startup + import) of
-# overhead before any test logic runs — and that overhead dilates under
-# load on shared CI runners, producing false "no tests ran" timeouts on
-# files that finish in ~100s on a quiet box. The Docker build matrix jobs
+# Set to 300s (5 min) deliberately generous. Isolation is per FILE, not
+# per test (see module docstring), so the fixed cost is one interpreter
+# startup + import per file — measured at ~0.25s, not the dominant term.
+# What actually eats the budget is contention: under an oversubscribed
+# runner a file that finishes in ~5s standalone can dilate past 300s,
+# producing a timeout that looks like a hung file and is really just
+# queueing. Keep the worker count at one per core (see --jobs) and this
+# headroom is never touched. The Docker build matrix jobs
 # take 7-10 min anyway, so this headroom costs nothing on total CI wall
 # time while keeping a genuinely hung file bounded.
 _DEFAULT_FILE_TIMEOUT_SECONDS = 300.0
@@ -654,8 +656,21 @@ def main() -> int:
         "-j",
         "--jobs",
         type=int,
-        default=int(os.environ.get("HERMES_TEST_WORKERS") or (os.cpu_count() or 4) * 2),
-        help="Parallel worker count (default: $HERMES_TEST_WORKERS or cpu_count*2)",
+        # One worker per core, NOT cpu_count*2. Each worker is a full pytest
+        # process doing CPU-bound work, so 2x oversubscription doesn't overlap
+        # I/O — it just multiplies context switching and memory pressure.
+        # Measured on a 16-core macOS box over the whole tests/agent/ tree:
+        #
+        #   -j 32   462.7s wall, 13974s total subprocess CPU-wall, 5 files
+        #           blew the 300s per-file cap and had to be retried
+        #   -j 16   276.7s wall,  4202s total subprocess CPU-wall, 0 retries
+        #
+        # 40% faster wall-clock, 3.3x less CPU burned, and the per-file
+        # timeouts disappear: files that take 5s standalone were dilating
+        # past 300s purely from contention. Raise it only for an I/O-bound
+        # runner via $HERMES_TEST_WORKERS.
+        default=int(os.environ.get("HERMES_TEST_WORKERS") or (os.cpu_count() or 4)),
+        help="Parallel worker count (default: $HERMES_TEST_WORKERS or cpu_count)",
     )
     parser.add_argument(
         "--paths",
