@@ -389,10 +389,11 @@ def _dflash_prefill_scaled_timeout(api_payload: Any, base: float) -> float:
     scaling; the cold-start allowance and the managed-W2 floor stay gated to
     the route they were measured on.
 
-    Widen-only and idempotent: the result is never below *base*, and applying
-    it twice to the same payload yields the same number, so a caller may
-    re-assert the floor without double-counting. Bounded by the same ceiling as
-    the full budget so a wedged backend is still bounded.
+    Widen-only: the result is never below *base*. It is NOT idempotent —
+    ``f(payload, f(payload, base))`` adds the prefill term twice — so *base*
+    must always be a fixed starting point (a constant or a configured value),
+    never a figure this function already produced. Bounded by the same ceiling
+    as the full budget so a wedged backend is still bounded.
     """
     if base == float("inf"):
         return base
