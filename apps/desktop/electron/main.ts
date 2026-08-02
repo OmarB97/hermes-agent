@@ -33,7 +33,7 @@ import nodePty from 'node-pty'
 import { stopBackendChild as stopBackendChildImpl } from './backend-child'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
-import { buildDesktopBackendEnv, normalizeHermesHomeRoot } from './backend-env'
+import { buildDesktopBackendEnv, normalizeHermesHomeRoot, venvRootForInterpreter } from './backend-env'
 import { canImportHermesCli, verifyHermesCli } from './backend-probes'
 import { waitForDashboardPortAnnouncement } from './backend-ready'
 import { shouldLatchBackendStartFailure } from './backend-start-failure'
@@ -3456,7 +3456,17 @@ function createPythonBackend(root, label, backendArgs, options: any = {}) {
     return null
   }
 
-  const venvRoot = path.join(root, 'venv')
+  // findPythonForRoot() prefers `.venv` over `venv`, so the environment has to
+  // follow the interpreter it actually picked. Hardcoding `venv` here handed a
+  // `.venv` interpreter the other environment's site-packages whenever a
+  // checkout carried both.
+  const interpreterVenvRoot = venvRootForInterpreter(python)
+
+  const venvRoot =
+    interpreterVenvRoot && fileExists(path.join(interpreterVenvRoot, 'pyvenv.cfg'))
+      ? interpreterVenvRoot
+      : path.join(root, 'venv')
+
   const venvPython = getVenvPython(venvRoot)
   const command = IS_WINDOWS && fileExists(venvPython) ? venvPython : python
 

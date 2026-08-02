@@ -9,7 +9,8 @@ import {
   buildDesktopBackendPath,
   normalizeHermesHomeRoot,
   pathEnvKey,
-  POSIX_SANE_PATH_ENTRIES
+  POSIX_SANE_PATH_ENTRIES,
+  venvRootForInterpreter
 } from './backend-env'
 
 test('desktop backend PATH adds Hermes-managed bins and missing POSIX sane entries', () => {
@@ -103,4 +104,46 @@ test('Windows PATH casing and delimiter are preserved without POSIX sane entries
 
 test('appendUniquePathEntries drops empty entries and keeps first occurrence', () => {
   assert.equal(appendUniquePathEntries([':/a::/b', ['/a', '/c']], { delimiter: ':' }), '/a:/b:/c')
+})
+
+test('venvRootForInterpreter follows the interpreter that was actually picked', () => {
+  // A checkout carrying both environments must not mix them: `.venv` may hold a
+  // different Python version than `venv`, and crossing the two makes compiled
+  // extensions (pydantic_core) unimportable.
+  assert.equal(
+    venvRootForInterpreter('/Users/test/.hermes/hermes-agent/.venv/bin/python', {
+      platform: 'darwin',
+      pathModule: path.posix
+    }),
+    '/Users/test/.hermes/hermes-agent/.venv'
+  )
+  assert.equal(
+    venvRootForInterpreter('/Users/test/.hermes/hermes-agent/venv/bin/python', {
+      platform: 'darwin',
+      pathModule: path.posix
+    }),
+    '/Users/test/.hermes/hermes-agent/venv'
+  )
+  assert.equal(
+    venvRootForInterpreter('C:\\repo\\hermes-agent\\.venv\\Scripts\\python.exe', {
+      platform: 'win32',
+      pathModule: path.win32
+    }),
+    'C:\\repo\\hermes-agent\\.venv'
+  )
+})
+
+test('venvRootForInterpreter declines interpreters that are not venv-shaped', () => {
+  // System interpreters have no venv site-packages to inject; the caller falls
+  // back rather than pointing PYTHONPATH at an unrelated tree.
+  assert.equal(venvRootForInterpreter('/usr/bin/python3', { platform: 'darwin', pathModule: path.posix }), '/usr')
+  assert.equal(
+    venvRootForInterpreter('/opt/homebrew/opt/python/libexec/python3', {
+      platform: 'darwin',
+      pathModule: path.posix
+    }),
+    null
+  )
+  assert.equal(venvRootForInterpreter('', { platform: 'darwin', pathModule: path.posix }), null)
+  assert.equal(venvRootForInterpreter(null, { platform: 'darwin', pathModule: path.posix }), null)
 })
