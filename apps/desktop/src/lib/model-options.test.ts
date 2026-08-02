@@ -1,18 +1,20 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { getGlobalModelOptions } from '@/hermes'
+import { apiRequestProfile, getGlobalModelOptions } from '@/hermes'
 
 import { manualPickRemoved, requestModelOptions } from './model-options'
 
 const globalOptions = { model: 'hermes-4', provider: 'nous', providers: [] }
 
 vi.mock('@/hermes', () => ({
+  apiRequestProfile: vi.fn(() => null),
   getGlobalModelOptions: vi.fn(() => Promise.resolve(globalOptions))
 }))
 
 describe('requestModelOptions', () => {
   afterEach(() => {
     vi.clearAllMocks()
+    vi.mocked(apiRequestProfile).mockReturnValue(null)
   })
 
   it('uses the connected gateway even before a session exists', async () => {
@@ -38,6 +40,37 @@ describe('requestModelOptions', () => {
     expect(gateway.request).toHaveBeenCalledWith('model.options', {
       explicit_only: true,
       refresh: true,
+      session_id: 'session-1'
+    })
+  })
+
+  it('scopes the picker to the active profile when there is no session yet', async () => {
+    // Provider names are per-profile vocabulary. Without this the backend has
+    // nothing to derive a profile from and lists the LAUNCH profile's
+    // providers, so a pick made here produces a session whose first turn dies
+    // on "Unknown provider".
+    vi.mocked(apiRequestProfile).mockReturnValue('worker')
+
+    const gateway = { request: vi.fn(() => Promise.resolve(globalOptions)) }
+
+    await requestModelOptions({ gateway: gateway as never, sessionId: null })
+
+    expect(gateway.request).toHaveBeenCalledWith('model.options', {
+      explicit_only: true,
+      profile: 'worker'
+    })
+  })
+
+  it('still sends the session id when one exists — the backend prefers it', async () => {
+    vi.mocked(apiRequestProfile).mockReturnValue('worker')
+
+    const gateway = { request: vi.fn(() => Promise.resolve(globalOptions)) }
+
+    await requestModelOptions({ gateway: gateway as never, sessionId: 'session-1' })
+
+    expect(gateway.request).toHaveBeenCalledWith('model.options', {
+      explicit_only: true,
+      profile: 'worker',
       session_id: 'session-1'
     })
   })

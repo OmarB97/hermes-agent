@@ -1,4 +1,9 @@
-import { getGlobalModelOptions, type HermesGateway, type ModelOptionsResponse } from '@/hermes'
+import {
+  apiRequestProfile,
+  getGlobalModelOptions,
+  type HermesGateway,
+  type ModelOptionsResponse
+} from '@/hermes'
 import type { ModelOptionProvider } from '@/types/hermes'
 
 /**
@@ -55,6 +60,19 @@ export function requestModelOptions({
 
     if (sessionId) {
       params.session_id = sessionId
+    }
+
+    // Scope the picker the same way the REST twin already is. A live session
+    // carries its own profile and the backend prefers that; this is what keeps
+    // the no-session picker (a chat not created yet — the gateway-first path
+    // this helper takes even with no sessionId) from listing the launch
+    // profile's providers while the window is on another profile. Picking one
+    // of those would produce a session whose first turn dies on "Unknown
+    // provider".
+    const profile = apiRequestProfile()
+
+    if (profile) {
+      params.profile = profile
     }
 
     if (refresh) {
