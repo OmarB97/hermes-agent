@@ -22,6 +22,37 @@ function pathModuleForPlatform(platform = process.platform) {
   return platform === 'win32' ? path.win32 : path.posix
 }
 
+// The interpreter we launch and the site-packages we inject have to come from
+// the SAME environment. A checkout can carry both `.venv` and `venv` (AGENTS.md
+// says prefer `.venv`, fall back to `venv`), and the two routinely hold
+// different Python versions. Injecting one environment's site-packages into the
+// other's interpreter makes every compiled extension unimportable: pydantic_core
+// resolves to a wheel built for the wrong ABI and the backend dies at import
+// with "No module named 'pydantic_core._pydantic_core'".
+//
+// Returns null when the interpreter is not laid out like a venv
+// (`<root>/bin/python`, `<root>/Scripts/python.exe`) so the caller keeps control
+// of its own fallback.
+function venvRootForInterpreter(
+  pythonPath,
+  { platform = process.platform, pathModule = pathModuleForPlatform(platform) }: any = {}
+) {
+  if (!pythonPath) {
+    return null
+  }
+
+  const binDir = pathModule.dirname(String(pythonPath))
+  const expectedBinName = platform === 'win32' ? 'scripts' : 'bin'
+
+  if (pathModule.basename(binDir).toLowerCase() !== expectedBinName) {
+    return null
+  }
+
+  const venvRoot = pathModule.dirname(binDir)
+
+  return venvRoot && venvRoot !== binDir ? venvRoot : null
+}
+
 function pathEnvKey(env = process.env, platform = process.platform) {
   if (platform !== 'win32') {
     return 'PATH'
@@ -121,5 +152,6 @@ export {
   delimiterForPlatform,
   normalizeHermesHomeRoot,
   pathEnvKey,
-  POSIX_SANE_PATH_ENTRIES
+  POSIX_SANE_PATH_ENTRIES,
+  venvRootForInterpreter
 }
