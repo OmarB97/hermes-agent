@@ -21,8 +21,8 @@ function makeRepo() {
 
   tempDirs.push(dir)
   execFileSync('git', ['init', '-q'], { cwd: dir })
-  execFileSync('git', ['config', 'user.email', 'hermes-test@example.com'], { cwd: dir })
-  execFileSync('git', ['config', 'user.name', 'Hermes Test'], { cwd: dir })
+  // Identity comes from the hermetic env in vitest.setup.electron.ts, so this
+  // fixture spawns three git processes instead of five.
   fs.writeFileSync(path.join(dir, 'tracked.txt'), 'tracked\n')
   execFileSync('git', ['add', 'tracked.txt'], { cwd: dir })
   execFileSync('git', ['commit', '-qm', 'initial'], { cwd: dir })
