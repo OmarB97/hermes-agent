@@ -7,6 +7,9 @@ Covers the CLI half of the desktop spawn control channel:
   - control file present but corrupt / missing required fields
   - --delegated / --delegated-timeout: wire shape and the flag combinations
     argparse cannot express
+  - profile routing: the control file is read from the ROOT home (one app
+    process serves every profile), and the requested profile is recovered
+    from HERMES_HOME because the global pre-parse strips the flag
   - 401 (stale token), connection refused (stale file), 503 (no window),
     a generic non-202 status, and a generic 4xx with server-supplied detail
 
@@ -46,10 +49,17 @@ def _ns(**kw):
 
 
 def _write_control_file(*, port=51234, token="tok_abc", schema_version=1):
-    """Write a valid control.json under the (already-isolated) HERMES_HOME."""
-    from hermes_constants import get_hermes_home
+    """Write a valid control.json where the desktop app really publishes one.
 
-    desktop_dir = get_hermes_home() / "desktop"
+    The app resolves its own HERMES_HOME through ``normalizeHermesHomeRoot``
+    (apps/desktop/electron/backend-env.ts) before writing, so the file always
+    lands at the ROOT home even when a profile is active. Writing it at
+    ``get_hermes_home()`` instead would let a profile-scoped test pass against
+    a file no app would ever have created there.
+    """
+    from hermes_constants import get_default_hermes_root
+
+    desktop_dir = get_default_hermes_root() / "desktop"
     desktop_dir.mkdir(parents=True, exist_ok=True)
     path = desktop_dir / "control.json"
     path.write_text(
@@ -143,6 +153,129 @@ class TestHappyPath:
             ds.cmd_desktop_spawn(_ns(toolsets=" , ,"))
 
         assert "toolsets" not in captured["body"]
+
+
+def _use_profile_home(monkeypatch, name="meshboard-worker"):
+    """Point HERMES_HOME at ``<root>/profiles/<name>`` and return both paths.
+
+    This is what the real command line does. ``--profile <name>`` never
+    reaches argparse — ``_apply_profile_override`` (hermes_cli/main.py) scans
+    raw sys.argv first, rewrites HERMES_HOME to exactly this path, and strips
+    the flag. A sticky ``hermes profile use <name>`` lands the same way.
+    Reproducing the rewrite is what makes these tests exercise the real
+    invocation instead of an ``args.profile`` no command line can produce.
+    """
+    from hermes_constants import get_default_hermes_root
+
+    root = get_default_hermes_root()
+    profile_home = root / "profiles" / name
+    profile_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    return root, profile_home
+
+
+class TestProfileRouting:
+    """One app process owns every profile, so one control channel serves all.
+
+    Regression cover for `hermes desktop spawn --profile <p>` reporting the
+    app as not running whenever <p> was not the app's active profile.
+    """
+
+    def test_reads_control_file_from_the_root_while_scoped_to_a_profile(
+        self, monkeypatch
+    ):
+        root, profile_home = _use_profile_home(monkeypatch)
+        _write_control_file(port=7001, token="tok_root")
+        # The app publishes here and only here.
+        assert (root / "desktop" / "control.json").exists()
+        assert not (profile_home / "desktop" / "control.json").exists()
+        captured: dict = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["url"] = req.full_url
+            captured["headers"] = dict(req.header_items())
+            return _fake_http_202()
+
+        with patch.object(ds.urllib.request, "urlopen", side_effect=fake_urlopen):
+            result = ds.cmd_desktop_spawn(_ns())
+
+        assert result == 0
+        assert captured["url"] == "http://127.0.0.1:7001/spawn"
+        assert captured["headers"]["X-hermes-desktop-token"] == "tok_root"
+
+    def test_profile_scoped_home_supplies_the_profile_the_flag_cannot(
+        self, monkeypatch
+    ):
+        _use_profile_home(monkeypatch, "meshboard-worker")
+        _write_control_file()
+        captured: dict = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["body"] = json.loads(req.data.decode())
+            return _fake_http_202()
+
+        # profile=None is what argparse really hands over — the pre-parse ate
+        # the flag. The name has to come back off HERMES_HOME or the session
+        # silently runs under whatever profile the app happens to be on.
+        with patch.object(ds.urllib.request, "urlopen", side_effect=fake_urlopen):
+            ds.cmd_desktop_spawn(_ns(profile=None))
+
+        assert captured["body"]["profile"] == "meshboard-worker"
+
+    def test_root_home_sends_no_profile(self):
+        """No profile in play means "whatever the app has selected"."""
+        _write_control_file()
+        captured: dict = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["body"] = json.loads(req.data.decode())
+            return _fake_http_202()
+
+        with patch.object(ds.urllib.request, "urlopen", side_effect=fake_urlopen):
+            ds.cmd_desktop_spawn(_ns())
+
+        assert "profile" not in captured["body"]
+
+    def test_explicit_profile_argument_wins_over_the_home(self, monkeypatch):
+        _use_profile_home(monkeypatch, "meshboard-worker")
+        _write_control_file()
+        captured: dict = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["body"] = json.loads(req.data.decode())
+            return _fake_http_202()
+
+        with patch.object(ds.urllib.request, "urlopen", side_effect=fake_urlopen):
+            ds.cmd_desktop_spawn(_ns(profile="analyst"))
+
+        assert captured["body"]["profile"] == "analyst"
+
+    def test_success_line_names_the_profile(self, monkeypatch, capsys):
+        _use_profile_home(monkeypatch, "meshboard-worker")
+        _write_control_file()
+
+        with patch.object(
+            ds.urllib.request, "urlopen", side_effect=lambda *a, **k: _fake_http_202()
+        ):
+            ds.cmd_desktop_spawn(_ns())
+
+        out = capsys.readouterr().out
+        assert "profile: meshboard-worker" in out
+
+    def test_missing_control_file_names_the_root_not_the_profile(
+        self, monkeypatch, capsys
+    ):
+        """The old message pointed at a path nothing ever writes."""
+        root, profile_home = _use_profile_home(monkeypatch)
+        # No control file anywhere — the app is genuinely not running.
+
+        with pytest.raises(SystemExit) as exc:
+            ds.cmd_desktop_spawn(_ns())
+
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert str(root / "desktop" / "control.json") in out
+        assert str(profile_home / "desktop" / "control.json") not in out
 
 
 class TestControlFileFailures:

@@ -3,11 +3,18 @@
 The Hermes Electron app starts a small loopback HTTP control server on
 launch (see ``apps/desktop/electron/spawn-control.ts``) and publishes its
 port + a per-launch token in a 0600 file at
-``<HERMES_HOME>/desktop/control.json`` (``get_hermes_home()`` — never a
-hardcoded ``~/.hermes``, that breaks profiles). This module reads that file
-and POSTs the prompt to ``/spawn``, which hands it to the renderer to start
-a new chat exactly as if it had been typed in — streaming, transcript,
-sidebar all go through the existing typed-chat path.
+``<root>/desktop/control.json``. This module reads that file and POSTs the
+prompt to ``/spawn``, which hands it to the renderer to start a new chat
+exactly as if it had been typed in — streaming, transcript, sidebar all go
+through the existing typed-chat path.
+
+One app process serves every profile, so there is exactly one control
+channel per machine and it lives at the ROOT home — see
+:func:`_control_file_path`. Which profile the session runs under is a
+parameter of the request, not a property of the channel: the app already
+carries ``profile`` down to ``session.create``, which binds the session to
+that profile's home. See :func:`_requested_profile` for why that name has
+to be recovered from ``HERMES_HOME`` rather than read off ``args``.
 
 This CLI command is a one-shot fire-and-forget POST, not a client for the
 resulting session: the desktop app owns it from here.
@@ -32,10 +39,59 @@ _REQUEST_TIMEOUT = 10.0
 
 
 def _control_file_path() -> Path:
-    """Return the desktop control file path under the active HERMES_HOME."""
+    """Return the desktop control file path under the ROOT Hermes home.
+
+    The app publishes this file at the root, never under the active profile:
+    Electron main puts every ``HERMES_HOME`` through
+    ``normalizeHermesHomeRoot`` (``apps/desktop/electron/backend-env.ts``),
+    which maps ``<root>/profiles/<name>`` back to ``<root>``. A single app
+    process owns all the profiles, so there is one control channel and it
+    belongs to the machine rather than to a profile.
+
+    Resolving this against ``get_hermes_home()`` instead pointed at
+    ``<root>/profiles/<name>/desktop/control.json``, which nothing writes —
+    so every profile-scoped invocation (``--profile <p>``, or any spawn at
+    all once ``hermes profile use`` had made a profile sticky) reported the
+    desktop app as not running. ``get_default_hermes_root()`` is the Python
+    twin of ``normalizeHermesHomeRoot`` and keeps Docker and custom homes
+    resolving the same way on both sides.
+    """
+    from hermes_constants import get_default_hermes_root
+
+    return get_default_hermes_root() / "desktop" / "control.json"
+
+
+def _requested_profile(args) -> str | None:
+    """Return the profile this spawn should run under, or None for the app's.
+
+    ``--profile`` does not survive to argparse: ``_apply_profile_override``
+    in ``hermes_cli/main.py`` scans raw ``sys.argv`` before any parser runs,
+    rewrites ``HERMES_HOME`` to the named profile's directory, and strips the
+    flag so the parser never sees it. ``args.profile`` is therefore always
+    ``None`` for a real command line, and the resolved home is where the
+    requested name actually survives — recover it from there.
+
+    A sticky ``active_profile`` (from ``hermes profile use``) resolves the
+    same way, so a bare ``hermes desktop spawn`` follows the profile the user
+    already selected instead of silently landing on the app's.
+
+    ``args.profile`` still wins when a caller sets it directly, so the flag
+    stays meaningful if the pre-parse ever stops consuming it.
+    """
+    explicit = getattr(args, "profile", None)
+    if explicit:
+        return str(explicit).strip() or None
+
     from hermes_constants import get_hermes_home
 
-    return get_hermes_home() / "desktop" / "control.json"
+    home = get_hermes_home()
+
+    # Mirrors normalizeHermesHomeRoot's test: a profile home is the child of
+    # a directory literally named "profiles". Anything else is the root, and
+    # the root means "whatever profile the app is on".
+    if home.parent.name == "profiles":
+        return home.name
+    return None
 
 
 def _read_control_file(path: Path) -> dict:
@@ -82,10 +138,14 @@ def _spawn_request_body(args) -> dict:
     Raises RuntimeError for flag combinations argparse cannot express.
     """
     body: dict = {"prompt": args.prompt}
-    for key in ("model", "provider", "profile"):
+    for key in ("model", "provider"):
         value = getattr(args, key, None)
         if value:
             body[key] = value
+
+    profile = _requested_profile(args)
+    if profile:
+        body["profile"] = profile
 
     raw_toolsets = getattr(args, "toolsets", None)
     if raw_toolsets:
@@ -198,8 +258,15 @@ def cmd_desktop_spawn(args) -> int:
         print(f"✗ {exc}")
         sys.exit(1)
 
+    # Name the profile when one was requested: the session opens in the
+    # running app's window whichever profile it runs under, so the transcript
+    # is the only other place that distinction shows up.
+    where = f" (profile: {body['profile']})" if body.get("profile") else ""
     if body.get("delegated"):
-        print("✓ Sent prompt to the Hermes desktop app (delegated — it will not stop to ask).")
+        print(
+            f"✓ Sent prompt to the Hermes desktop app{where} "
+            "(delegated — it will not stop to ask)."
+        )
     else:
-        print("✓ Sent prompt to the Hermes desktop app.")
+        print(f"✓ Sent prompt to the Hermes desktop app{where}.")
     return 0
