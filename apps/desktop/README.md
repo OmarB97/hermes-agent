@@ -68,7 +68,7 @@ Point the app at a specific source checkout, or sandbox it away from your real c
 
 ```bash
 # throwaway HERMES_HOME, separate Electron userData, distinct app name to avoid the single-instance lock
-../scripts/dev-sandbox.sh npm run dev
+../../scripts/dev-sandbox.sh -- npm run dev
 HERMES_DESKTOP_HERMES_ROOT=/path/to/clone npm run dev
 HERMES_HOME=/tmp/throwaway npm run dev
 npm run dev:fake-boot   # exercise the startup overlay with deterministic delays
