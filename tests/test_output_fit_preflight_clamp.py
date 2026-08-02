@@ -9,6 +9,7 @@ sending (and anchors the reactive retry to the same estimate).
 from types import SimpleNamespace
 
 from agent.chat_completion_helpers import _preflight_clamp_output_tokens
+from agent.conversation_loop import _LENGTH_CONTINUE_MIN_HEADROOM_TOKENS
 from agent.model_metadata import (
     _OUTPUT_FIT_MIN_USABLE,
     _OUTPUT_FIT_WINDOW_MARGIN,
@@ -191,9 +192,22 @@ class TestHighFillBandDegradesGracefully:
     round-trip per turn.
 
     So the reservation now degrades to the 1.15x safety contract instead of
-    vanishing.  ``None`` is still the answer past the ``1/1.15`` ceiling, where
-    nothing usable genuinely fits.
+    vanishing.  ``None`` is still the answer past ~85.8% fill, where the
+    contract can no longer clear the usable floor.
     """
+
+    def test_no_reported_cap_is_below_the_continuation_guard(self):
+        # ``_OUTPUT_FIT_MIN_USABLE`` is deliberately the same value as the
+        # length-continuation head-room guard, which refuses to scaffold another
+        # round below it because there is no room left for a useful completion.
+        # A clamp under that threshold would fight it: the truncated response
+        # starts a continuation round, the boost there sizes the next cap to the
+        # real context head-room, and the pre-flight clamp shrinks it straight
+        # back to a value the guard itself calls too small to write into.
+        assert _OUTPUT_FIT_MIN_USABLE >= _LENGTH_CONTINUE_MIN_HEADROOM_TOKENS
+        for tokens in range(1_000, _CTX_200K, 500):
+            fit = output_tokens_that_fit(_CTX_200K, _msgs(tokens))
+            assert fit is None or fit >= _LENGTH_CONTINUE_MIN_HEADROOM_TOKENS
 
     def test_reported_fit_where_the_preferred_cushion_admits_none(self):
         # The case from the report: at est=166,008 in a 200,000 window the 1.2x
@@ -207,10 +221,11 @@ class TestHighFillBandDegradesGracefully:
         assert _fits_for_a_denser_server(msgs, fit, _CTX_200K)
 
     def test_band_is_covered_without_a_hole(self):
-        # Sweep the whole band the old formula gave up on.  Every fill level
-        # from the 1.2x limit (~82.7%) up to the 1.15x ceiling (~86.9%) must
-        # report a real cap, and the caps must taper rather than jump to None.
-        for pct in range(83, 87):
+        # Sweep the band the old formula gave up on.  Every fill level from the
+        # 1.2x limit (~82.7%) up to where the contract stops clearing the usable
+        # floor (~85.8%) must report a real cap, and the caps must taper rather
+        # than jump to None.
+        for pct in range(83, 86):
             msgs = _msgs(int(_CTX_200K * pct / 100))
             fit = output_tokens_that_fit(_CTX_200K, msgs)
             assert fit is not None, f"no cap reported at {pct}% fill"
