@@ -732,6 +732,16 @@ agent:
   # window on /restart, and keep it well under systemd's TimeoutStopSec.
   # restart_drain_timeout: 0
 
+  # Stale-stream ceiling for local endpoints (Ollama, oMLX, llama.cpp), in
+  # seconds. Local providers skip the 180s cloud default because prefill can
+  # legitimately run for minutes, but the wait is still bounded so a crashed or
+  # deadlocked local server eventually trips the detector and lets reconnect /
+  # fallback run instead of parking the session. Widened (never narrowed) by the
+  # request's context-scaled prefill cost, so a large prompt gets more room.
+  # Set 0 for an unbounded wait. A providers.<id>.stale_timeout_seconds or
+  # HERMES_STREAM_STALE_TIMEOUT value wins over this.
+  # local_stream_stale_timeout: 900
+
   # Max app-level retry attempts for API errors (connection drops, provider
   # timeouts, 5xx, etc.) before the agent surfaces the failure. Lower this
   # to 1 if you use fallback providers and want fast failover on flaky
