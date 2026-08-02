@@ -865,6 +865,7 @@ Hermes has separate timeout layers for streaming, plus a stale detector for non-
 | Socket read timeout | 120s | Auto-raised to 1800s | `HERMES_STREAM_READ_TIMEOUT` |
 | Stale stream detection | 180s | Auto-disabled | `HERMES_STREAM_STALE_TIMEOUT` |
 | Stale non-stream detection | 300s | Auto-disabled when left implicit | `providers.<id>.stale_timeout_seconds` or `HERMES_API_CALL_STALE_TIMEOUT` |
+| Pre-first-chunk (local DFlash) | Scales with context | Scales with context | `providers.<id>.first_chunk_timeout_seconds` |
 | API call (non-streaming) | 1800s | Unchanged | `providers.<id>.request_timeout_seconds` / `timeout_seconds` or `HERMES_API_TIMEOUT` |
 
 The **socket read timeout** controls how long httpx waits for the next chunk of data from the provider. Local LLMs can take minutes for prefill on large contexts before producing the first token, so Hermes raises this to 30 minutes when it detects a local endpoint. If you explicitly set `HERMES_STREAM_READ_TIMEOUT`, that value is always used regardless of endpoint detection.
@@ -872,6 +873,10 @@ The **socket read timeout** controls how long httpx waits for the next chunk of 
 The **stale stream detection** kills connections that receive SSE keep-alive pings but no actual content. This is disabled entirely for local providers since they don't send keep-alive pings during prefill.
 
 The **stale non-stream detection** kills non-streaming calls that produce no response for too long. By default Hermes disables this on local endpoints to avoid false positives during long prefills. If you explicitly set `providers.<id>.stale_timeout_seconds`, `providers.<id>.models.<model>.stale_timeout_seconds`, or `HERMES_API_CALL_STALE_TIMEOUT`, that explicit value is honored even on local endpoints.
+
+The **pre-first-chunk timeout** is how long Hermes waits for the *first* streamed token on a local DeepSeek-V4 Flash endpoint. That window covers queue admission, model load, and prefill of the entire prompt, so it grows with the conversation: a 95K-token turn is budgeted far longer than a 20K one. Set `providers.<id>.first_chunk_timeout_seconds` (or `providers.<id>.models.<model>.first_chunk_timeout_seconds`) to pin it yourself — it outranks `stale_timeout_seconds`, because waiting for the first token and waiting between tokens measure different things, and a slow-prefill lane can reasonably want minutes for one and seconds for the other.
+
+Declare these under the **named** provider entry (`providers.ai-router`), not under `custom`. Every user-declared endpoint resolves to the billing class `custom` at runtime; Hermes maps it back to the entry that owns the endpoint URL.
 
 ## Context Pressure Warnings
 
