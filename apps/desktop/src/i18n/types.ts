@@ -1481,6 +1481,8 @@ export interface Translations {
       backgroundRunning: string
       handoffOrigin: (platform: string) => string
       ownedByProfile: (profile: string) => string
+      /** Tooltip on the badge for a chat started to run unattended. */
+      delegatedRun: string
       renamed: string
       renameFailed: string
       renameTitle: string
@@ -2137,6 +2139,8 @@ export interface Translations {
       skip: string
       skipped: string
       continueLabel: string
+      /** Transcript note after an unattended chat answered its own question. */
+      autoAnswered: (wait: string) => string
     }
     tool: {
       code: string

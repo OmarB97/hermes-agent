@@ -4834,7 +4834,9 @@ function deliverSpawnToRenderer(request) {
 
     mainWindow.focus()
     mainWindow.webContents.send('hermes:spawn-session', request)
-    rememberLog(`[spawn-control] delivered spawn (${request.model || 'current model'})`)
+    rememberLog(
+      `[spawn-control] delivered spawn (${request.model || 'current model'}${request.delegated ? ', delegated' : ''})`
+    )
 
     return 'delivered'
   } catch (err) {

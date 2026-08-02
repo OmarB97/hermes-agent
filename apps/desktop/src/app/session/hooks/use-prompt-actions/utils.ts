@@ -239,4 +239,10 @@ export interface SubmitTextOptions {
    *  when submitting into an existing session. Lets a programmatic spawn name
    *  a model without moving (and persisting) the user's composer selection. */
   sessionOverrides?: SessionCreateOverrides
+  /** Called with the runtime session id when this submit had to CREATE the
+   *  session, before the prompt goes out. A programmatic spawn otherwise never
+   *  learns which chat it started — submit resolves to a bare boolean — so it
+   *  has nowhere to hang per-session state like delegated mode. Not called
+   *  when submitting into a session that already existed. */
+  onSessionCreated?: (sessionId: string) => void
 }

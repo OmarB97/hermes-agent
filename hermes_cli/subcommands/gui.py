@@ -110,4 +110,26 @@ def build_gui_parser(
             "to use the app's current toolsets."
         ),
     )
+    spawn_parser.add_argument(
+        "--delegated",
+        action="store_true",
+        help=(
+            "Run unattended: tell the session up front not to ask questions, "
+            "to pick the safest reversible option when the brief leaves a "
+            "choice open, and to deliver its result in the chat. If it asks "
+            "anyway, the app answers the prompt itself after "
+            "--delegated-timeout and notes that in the transcript, so the "
+            "session cannot sit waiting for someone who is not there."
+        ),
+    )
+    spawn_parser.add_argument(
+        "--delegated-timeout",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "How long a delegated session waits for a person before answering "
+            "its own question (default 120). Only meaningful with --delegated."
+        ),
+    )
     spawn_parser.set_defaults(func=cmd_desktop_spawn)

@@ -5,6 +5,8 @@ Covers the CLI half of the desktop spawn control channel:
     and comma-separated --toolsets normalization
   - control file missing (desktop app not running)
   - control file present but corrupt / missing required fields
+  - --delegated / --delegated-timeout: wire shape and the flag combinations
+    argparse cannot express
   - 401 (stale token), connection refused (stale file), 503 (no window),
     a generic non-202 status, and a generic 4xx with server-supplied detail
 
@@ -30,7 +32,15 @@ import hermes_cli.desktop_spawn as ds
 
 
 def _ns(**kw):
-    defaults = dict(prompt="hello", model=None, provider=None, profile=None, toolsets=None)
+    defaults = dict(
+        prompt="hello",
+        model=None,
+        provider=None,
+        profile=None,
+        toolsets=None,
+        delegated=False,
+        delegated_timeout=None,
+    )
     defaults.update(kw)
     return argparse.Namespace(**defaults)
 
@@ -256,3 +266,94 @@ class TestTransportFailures:
                 ds.cmd_desktop_spawn(_ns())
         assert exc.value.code == 1
         assert "200" in capsys.readouterr().out
+
+
+class TestDelegated:
+    """`--delegated` — the unattended spawn.
+
+    The CLI's only job here is the wire shape: the desktop app owns the
+    contract text and the auto-answer (apps/desktop/src/lib/delegated-spawn.ts).
+    """
+
+    def _body_for(self, **kw) -> dict:
+        _write_control_file()
+        captured: dict = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["body"] = json.loads(req.data.decode())
+            return _fake_http_202()
+
+        with patch.object(ds.urllib.request, "urlopen", side_effect=fake_urlopen):
+            ds.cmd_desktop_spawn(_ns(**kw))
+        return captured["body"]
+
+    def test_plain_spawn_sends_no_delegated_keys(self):
+        # An ordinary spawn must stay byte-identical to what it was before the
+        # flag existed, or every attended chat inherits unattended behavior.
+        assert self._body_for(prompt="hi") == {"prompt": "hi"}
+
+    def test_delegated_sends_the_flag_and_no_timeout_by_default(self):
+        # No timeout on the wire means "use the app's default" — the CLI does
+        # not get to hardcode a second copy of that number.
+        assert self._body_for(prompt="hi", delegated=True) == {
+            "prompt": "hi",
+            "delegated": True,
+        }
+
+    def test_timeout_travels_in_milliseconds(self):
+        # Seconds on the command line because that is how people say it;
+        # milliseconds on the wire because that is what the renderer's timer
+        # takes. One conversion, here.
+        body = self._body_for(prompt="hi", delegated=True, delegated_timeout=45)
+        assert body["delegatedTimeoutMs"] == 45000
+
+    def test_fractional_seconds_round_to_whole_milliseconds(self):
+        body = self._body_for(prompt="hi", delegated=True, delegated_timeout=1.5)
+        assert body["delegatedTimeoutMs"] == 1500
+
+    def test_delegated_composes_with_the_other_overrides(self):
+        body = self._body_for(
+            prompt="hi",
+            model="deepseek-v4-flash-0731-ds4",
+            provider="ai-router",
+            delegated=True,
+            delegated_timeout=30,
+        )
+        assert body == {
+            "prompt": "hi",
+            "model": "deepseek-v4-flash-0731-ds4",
+            "provider": "ai-router",
+            "delegated": True,
+            "delegatedTimeoutMs": 30000,
+        }
+
+    def test_timeout_without_delegated_fails_loud(self, capsys):
+        # Accepting it would run an attended session the caller believes is
+        # unattended — exactly the failure the flag exists to prevent.
+        _write_control_file()
+        with patch.object(ds.urllib.request, "urlopen") as urlopen:
+            with pytest.raises(SystemExit) as exc:
+                ds.cmd_desktop_spawn(_ns(delegated_timeout=30))
+
+        assert exc.value.code == 1
+        urlopen.assert_not_called()
+        out = capsys.readouterr().out
+        assert "--delegated-timeout" in out
+        assert "--delegated" in out
+
+    @pytest.mark.parametrize("seconds", [0, -1])
+    def test_non_positive_timeout_fails_loud(self, seconds, capsys):
+        _write_control_file()
+        with patch.object(ds.urllib.request, "urlopen") as urlopen:
+            with pytest.raises(SystemExit) as exc:
+                ds.cmd_desktop_spawn(_ns(delegated=True, delegated_timeout=seconds))
+
+        assert exc.value.code == 1
+        urlopen.assert_not_called()
+        assert "greater than 0" in capsys.readouterr().out
+
+    def test_success_line_says_the_run_is_unattended(self, capsys):
+        self._body_for(prompt="hi", delegated=True)
+        out = capsys.readouterr().out
+        assert "✓" in out
+        assert "delegated" in out

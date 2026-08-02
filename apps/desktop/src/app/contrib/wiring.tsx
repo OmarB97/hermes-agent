@@ -95,6 +95,7 @@ import { UpdatesOverlay } from '../updates-overlay'
 
 import { ContribWiringContext } from './context'
 import { useBackgroundSync } from './hooks/use-background-sync'
+import { useDelegatedClarify } from './hooks/use-delegated-clarify'
 import { useDesktopIntegrations } from './hooks/use-desktop-integrations'
 import { usePetBridge } from './hooks/use-pet-bridge'
 import { useSessionTileDelegate } from './hooks/use-session-tile-delegate'
@@ -574,7 +575,11 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   usePetBridge({ requestGateway, resumeSession, submitText })
 
   // `hermes desktop spawn` -> start the chat here, so it streams like a typed one.
-  useSpawnBridge({ startFreshSession: startFreshSessionDraft, submitText })
+  useSpawnBridge({ startFreshSession: startFreshSessionDraft, submitText, updateSessionState })
+
+  // ...and if that spawn was `--delegated`, never let it sit on a question
+  // nobody is there to answer.
+  useDelegatedClarify({ requestGateway, updateSessionState })
 
   // Clear a failed turn's red error banner. Errors are renderer-local (never
   // persisted): a bare error placeholder is dropped entirely; a partial-output

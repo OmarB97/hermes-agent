@@ -1,10 +1,12 @@
 import { useEffect, useRef } from 'react'
 
+import { applyDelegationContract, normalizeDelegatedTimeoutMs } from '@/lib/delegated-spawn'
 import { $freshDraftReady } from '@/store/session'
 import { isSecondaryWindow } from '@/store/windows'
 
 import type { SubmitTextOptions } from '../../session/hooks/use-prompt-actions/utils'
 import type { SessionCreateOverrides } from '../../session/session-overrides'
+import type { ClientSessionState } from '../../types'
 
 /** How long to wait for a new-chat draft to settle before submitting anyway. */
 export const SPAWN_DRAFT_SETTLE_TIMEOUT_MS = 5000
@@ -59,11 +61,18 @@ interface SpawnPayload {
   provider?: string
   profile?: string
   toolsets?: string[]
+  delegated?: boolean
+  delegatedTimeoutMs?: number
 }
 
 interface SpawnBridgeParams {
   startFreshSession: (options?: boolean | { replaceRoute?: boolean }) => void
   submitText: (rawText: string, options?: SubmitTextOptions) => Promise<boolean>
+  updateSessionState: (
+    sessionId: string,
+    updater: (state: ClientSessionState) => ClientSessionState,
+    storedSessionId?: string | null
+  ) => ClientSessionState
 }
 
 /**
@@ -82,17 +91,24 @@ interface SpawnBridgeParams {
  * Model/provider/profile ride along as per-session overrides rather than being
  * written into the composer's selection stores, which persist — a spawn must
  * not silently change the model the user gets on their next chat.
+ *
+ * A `--delegated` spawn additionally gets the unattended contract prepended to
+ * its prompt, and its session is marked so `useDelegatedClarify` will answer a
+ * clarify prompt rather than let the chat sit waiting for nobody. See
+ * `@/lib/delegated-spawn` for why both halves exist.
  */
-export function useSpawnBridge({ startFreshSession, submitText }: SpawnBridgeParams): void {
+export function useSpawnBridge({ startFreshSession, submitText, updateSessionState }: SpawnBridgeParams): void {
   const startFreshSessionRef = useRef(startFreshSession)
   const submitTextRef = useRef(submitText)
+  const updateSessionStateRef = useRef(updateSessionState)
   // Tail of the serial spawn chain — see the comment at the enqueue site.
   const chainRef = useRef<Promise<void>>(Promise.resolve())
 
   useEffect(() => {
     startFreshSessionRef.current = startFreshSession
     submitTextRef.current = submitText
-  }, [startFreshSession, submitText])
+    updateSessionStateRef.current = updateSessionState
+  }, [startFreshSession, submitText, updateSessionState])
 
   useEffect(() => {
     // Secondary windows render a single chat and own no new-chat route.
@@ -121,6 +137,13 @@ export function useSpawnBridge({ startFreshSession, submitText }: SpawnBridgePar
         overrides.profile = payload.profile
       }
 
+      // The contract goes in the prompt itself so the model reads it before it
+      // does anything; the timeout is hung on the session so the auto-answer
+      // still fires if it ignores the contract and asks anyway.
+      const delegated = payload.delegated === true
+      const delegatedTimeoutMs = delegated ? normalizeDelegatedTimeoutMs(payload.delegatedTimeoutMs) : null
+      const text = delegated ? applyDelegationContract(prompt) : prompt
+
       // Spawns run ONE AT A TIME, chained on the previous one's submit.
       //
       // They cannot be fired concurrently: `createBackendSessionForSend` guards
@@ -147,9 +170,15 @@ export function useSpawnBridge({ startFreshSession, submitText }: SpawnBridgePar
           // Let the new-chat route land before submitting — see the helper.
           await whenFreshDraftReady()
 
-          await submitTextRef.current(prompt, {
+          await submitTextRef.current(text, {
             attachments: [],
-            ...(overrides.model || overrides.provider || overrides.profile ? { sessionOverrides: overrides } : {})
+            ...(overrides.model || overrides.provider || overrides.profile ? { sessionOverrides: overrides } : {}),
+            ...(delegatedTimeoutMs !== null
+              ? {
+                  onSessionCreated: (sessionId: string) =>
+                    void updateSessionStateRef.current(sessionId, state => ({ ...state, delegatedTimeoutMs }))
+                }
+              : {})
           })
         })
         // One spawn failing must not poison the chain for the next.

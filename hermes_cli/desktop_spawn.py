@@ -11,6 +11,12 @@ sidebar all go through the existing typed-chat path.
 
 This CLI command is a one-shot fire-and-forget POST, not a client for the
 resulting session: the desktop app owns it from here.
+
+``--delegated`` marks the spawn unattended. The behaviour that follows from
+that — the contract prepended to the prompt, and answering a clarify prompt
+nobody is there to answer — belongs to the app
+(``apps/desktop/src/lib/delegated-spawn.ts``); this side only carries the
+flag and, optionally, how long to wait.
 """
 
 from __future__ import annotations
@@ -71,7 +77,10 @@ def _read_control_file(path: Path) -> dict:
 
 
 def _spawn_request_body(args) -> dict:
-    """Build the JSON body for POST /spawn, omitting unset optional fields."""
+    """Build the JSON body for POST /spawn, omitting unset optional fields.
+
+    Raises RuntimeError for flag combinations argparse cannot express.
+    """
     body: dict = {"prompt": args.prompt}
     for key in ("model", "provider", "profile"):
         value = getattr(args, key, None)
@@ -83,6 +92,29 @@ def _spawn_request_body(args) -> dict:
         toolsets = [t.strip() for t in raw_toolsets.split(",") if t.strip()]
         if toolsets:
             body["toolsets"] = toolsets
+
+    delegated = bool(getattr(args, "delegated", False))
+    timeout_seconds = getattr(args, "delegated_timeout", None)
+
+    # A timeout with no --delegated would be read by nobody. Say so rather than
+    # accepting the flag and quietly running an attended session.
+    if timeout_seconds is not None and not delegated:
+        raise RuntimeError(
+            "--delegated-timeout only applies to a delegated spawn. Add "
+            "--delegated, or drop the timeout."
+        )
+    if timeout_seconds is not None and timeout_seconds <= 0:
+        raise RuntimeError(
+            f"--delegated-timeout must be greater than 0 seconds (got {timeout_seconds})."
+        )
+
+    if delegated:
+        body["delegated"] = True
+        # Seconds on the command line because that is how people say it;
+        # milliseconds on the wire because that is what every consumer of it
+        # downstream (the renderer's timer) actually wants.
+        if timeout_seconds is not None:
+            body["delegatedTimeoutMs"] = int(round(timeout_seconds * 1000))
     return body
 
 
@@ -154,7 +186,11 @@ def cmd_desktop_spawn(args) -> int:
         print(f"✗ {exc}")
         sys.exit(1)
 
-    body = _spawn_request_body(args)
+    try:
+        body = _spawn_request_body(args)
+    except RuntimeError as exc:
+        print(f"✗ {exc}")
+        sys.exit(1)
 
     try:
         _post_spawn(port=control["port"], token=str(control["token"]), body=body)
@@ -162,5 +198,8 @@ def cmd_desktop_spawn(args) -> int:
         print(f"✗ {exc}")
         sys.exit(1)
 
-    print("✓ Sent prompt to the Hermes desktop app.")
+    if body.get("delegated"):
+        print("✓ Sent prompt to the Hermes desktop app (delegated — it will not stop to ask).")
+    else:
+        print("✓ Sent prompt to the Hermes desktop app.")
     return 0

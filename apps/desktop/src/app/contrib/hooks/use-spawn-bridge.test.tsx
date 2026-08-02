@@ -1,9 +1,11 @@
 import { act, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 
+import { DELEGATED_CLARIFY_TIMEOUT_MS, DELEGATION_CONTRACT } from '@/lib/delegated-spawn'
 import { setFreshDraftReady } from '@/store/session'
 
 import type { SubmitTextOptions } from '../../session/hooks/use-prompt-actions/utils'
+import type { ClientSessionState } from '../../types'
 
 import { SPAWN_DRAFT_SETTLE_TIMEOUT_MS, useSpawnBridge } from './use-spawn-bridge'
 
@@ -51,13 +53,21 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
+// The hook only ever patches an existing state, so a shallow double is enough.
+function stateDouble() {
+  return vi.fn((_sessionId: string, updater: (state: ClientSessionState) => ClientSessionState) =>
+    updater({ delegatedTimeoutMs: null } as ClientSessionState)
+  )
+}
+
 function mount() {
   const startFreshSession = vi.fn()
   const submitText = vi.fn(async (_text: string, _options?: SubmitTextOptions) => true)
+  const updateSessionState = stateDouble()
 
-  renderHook(() => useSpawnBridge({ startFreshSession, submitText }))
+  renderHook(() => useSpawnBridge({ startFreshSession, submitText, updateSessionState }))
 
-  return { startFreshSession, submitText }
+  return { startFreshSession, submitText, updateSessionState }
 }
 
 it('starts a fresh session and submits the prompt through the normal path', async () => {
@@ -84,7 +94,7 @@ it('resets the draft BEFORE submitting', async () => {
     return true
   })
 
-  renderHook(() => useSpawnBridge({ startFreshSession, submitText }))
+  renderHook(() => useSpawnBridge({ startFreshSession, submitText, updateSessionState: stateDouble() }))
 
   await act(async () => {
     spawnHandlers[0]({ prompt: 'go' })
@@ -125,6 +135,74 @@ it('sends no overrides when none were requested', async () => {
   })
 
   expect(submitText.mock.calls[0][1]).toEqual({ attachments: [] })
+})
+
+// ------------------------------------------------------------- delegated mode
+
+// The contract has to reach the model, and it has to reach it BEFORE the brief
+// — an instruction not to ask, read after the thing that prompts the question,
+// is worth nothing.
+it('prepends the unattended contract to a delegated prompt', async () => {
+  const { submitText } = mount()
+
+  await act(async () => {
+    spawnHandlers[0]({ prompt: 'write up the auth flow', delegated: true })
+  })
+
+  const sent = submitText.mock.calls[0][0]
+
+  expect(sent.startsWith(DELEGATION_CONTRACT)).toBe(true)
+  expect(sent.endsWith('write up the auth flow')).toBe(true)
+})
+
+// An ordinary spawn has to stay byte-identical to a typed chat.
+it('leaves an undelegated prompt exactly as sent', async () => {
+  const { submitText, updateSessionState } = mount()
+
+  await act(async () => {
+    spawnHandlers[0]({ prompt: 'write up the auth flow' })
+  })
+
+  expect(submitText.mock.calls[0][0]).toBe('write up the auth flow')
+  expect(submitText.mock.calls[0][1]).not.toHaveProperty('onSessionCreated')
+  expect(updateSessionState).not.toHaveBeenCalled()
+})
+
+// Submit resolves to a bare boolean, so the created session id arrives through
+// this callback or not at all — and without it there is nothing to hang the
+// clarify deadline on.
+it('marks the session it created as delegated, with the requested wait', async () => {
+  const { submitText, updateSessionState } = mount()
+
+  await act(async () => {
+    spawnHandlers[0]({ prompt: 'go', delegated: true, delegatedTimeoutMs: 30_000 })
+  })
+
+  const options = submitText.mock.calls[0][1] as SubmitTextOptions
+
+  options.onSessionCreated?.('runtime-1')
+
+  expect(updateSessionState).toHaveBeenCalledTimes(1)
+  expect(updateSessionState.mock.calls[0][0]).toBe('runtime-1')
+  expect(updateSessionState.mock.results[0].value).toMatchObject({ delegatedTimeoutMs: 30_000 })
+})
+
+// An absent or nonsense wait must still leave the session delegated — falling
+// back to "not delegated" would silently drop the guarantee.
+it('falls back to the default wait when none was given', async () => {
+  const { submitText, updateSessionState } = mount()
+
+  await act(async () => {
+    spawnHandlers[0]({ prompt: 'go', delegated: true })
+  })
+
+  const options = submitText.mock.calls[0][1] as SubmitTextOptions
+
+  options.onSessionCreated?.('runtime-1')
+
+  expect(updateSessionState.mock.results[0].value).toMatchObject({
+    delegatedTimeoutMs: DELEGATED_CLARIFY_TIMEOUT_MS
+  })
 })
 
 it('ignores a spawn with no usable prompt', async () => {
@@ -176,7 +254,7 @@ it('does not start the next spawn until the previous submit resolves', async () 
       })
   )
 
-  renderHook(() => useSpawnBridge({ startFreshSession, submitText }))
+  renderHook(() => useSpawnBridge({ startFreshSession, submitText, updateSessionState: stateDouble() }))
 
   await act(async () => {
     spawnHandlers[0]({ prompt: 'first' })
@@ -209,7 +287,7 @@ it('keeps running later spawns after one fails', async () => {
     return true
   })
 
-  renderHook(() => useSpawnBridge({ startFreshSession, submitText }))
+  renderHook(() => useSpawnBridge({ startFreshSession, submitText, updateSessionState: stateDouble() }))
 
   await act(async () => {
     spawnHandlers[0]({ prompt: 'boom' })
@@ -239,7 +317,10 @@ it('a secondary session window neither subscribes nor signals ready', () => {
 it('unsubscribes on unmount', () => {
   const startFreshSession = vi.fn()
   const submitText = vi.fn(async (_text: string, _options?: SubmitTextOptions) => true)
-  const { unmount } = renderHook(() => useSpawnBridge({ startFreshSession, submitText }))
+
+  const { unmount } = renderHook(() =>
+    useSpawnBridge({ startFreshSession, submitText, updateSessionState: stateDouble() })
+  )
 
   unmount()
 

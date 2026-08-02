@@ -41,6 +41,11 @@ export interface SpawnRequest {
   provider?: string
   profile?: string
   toolsets?: string[]
+  /** Unattended run: nobody is watching, so the session must not stop to ask. */
+  delegated?: boolean
+  /** How long a delegated session waits for a person before answering its own
+   *  question. Omitted means the renderer's default. */
+  delegatedTimeoutMs?: number
 }
 
 export type SpawnDelivery = 'delivered' | 'no-window'
@@ -116,6 +121,34 @@ export function parseSpawnRequest(raw: unknown): { error: string } | { request: 
     if (toolsets.length) {
       request.toolsets = toolsets
     }
+  }
+
+  if (body.delegated !== undefined && body.delegated !== null) {
+    if (typeof body.delegated !== 'boolean') {
+      return { error: 'delegated must be a boolean' }
+    }
+
+    if (body.delegated) {
+      request.delegated = true
+    }
+  }
+
+  if (body.delegatedTimeoutMs !== undefined && body.delegatedTimeoutMs !== null) {
+    if (typeof body.delegatedTimeoutMs !== 'number' || !Number.isFinite(body.delegatedTimeoutMs)) {
+      return { error: 'delegatedTimeoutMs must be a number' }
+    }
+
+    if (body.delegatedTimeoutMs <= 0) {
+      return { error: 'delegatedTimeoutMs must be greater than 0' }
+    }
+
+    // A timeout on an attended spawn would be read by nobody. Reject it here
+    // rather than accept a request whose caller clearly meant something else.
+    if (!request.delegated) {
+      return { error: 'delegatedTimeoutMs requires delegated: true' }
+    }
+
+    request.delegatedTimeoutMs = body.delegatedTimeoutMs
   }
 
   return { request }

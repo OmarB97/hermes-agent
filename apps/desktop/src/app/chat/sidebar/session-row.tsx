@@ -17,7 +17,7 @@ import { cn } from '@/lib/utils'
 import { $backgroundRunningSessionIds } from '@/store/composer-status'
 import { $unreadFinishedSessionIds } from '@/store/session'
 import { $sessionColorById } from '@/store/session-color'
-import { $attentionSessionIds, $stalledSessionIds, openSessionTile } from '@/store/session-states'
+import { $attentionSessionIds, $delegatedSessionIds, $stalledSessionIds, openSessionTile } from '@/store/session-states'
 import { canOpenSessionWindow, openSessionInNewWindow } from '@/store/windows'
 
 import { SidebarRowBody, SidebarRowGrab, SidebarRowLabel, SidebarRowLead, SidebarRowShell } from './chrome'
@@ -111,6 +111,10 @@ export function SidebarSessionRow({
   const handoffLabel = handoffSource ? (sessionSourceLabel(handoffSource) ?? handoffSource) : null
   // True when a clarify prompt in this session is waiting on the user.
   const needsInput = useStore($attentionSessionIds).includes(session.id)
+  // Started by `hermes desktop spawn --delegated` — it runs with nobody
+  // watching and answers its own questions, which is worth knowing before you
+  // read what it decided.
+  const isDelegated = useStore($delegatedSessionIds).includes(session.id)
   // True when the session's most recent turn finished in the background (while
   // the user was viewing a different session) and hasn't been opened since.
   const isUnread = useStore($unreadFinishedSessionIds).includes(session.id)
@@ -342,6 +346,13 @@ export function SidebarSessionRow({
           <SidebarRowLabel className="flex-1 font-normal group-hover:text-foreground group-data-[working=true]:text-foreground/90">
             {title}
           </SidebarRowLabel>
+          {isDelegated && (
+            <Tip label={r.delegatedRun}>
+              <span aria-label={r.delegatedRun} className="shrink-0 text-muted-foreground/55" role="img">
+                <Codicon name="robot" size="0.6875rem" />
+              </span>
+            </Tip>
+          )}
           {showProfile && <ProfileTag profile={session.profile} />}
         </SidebarRowBody>
       </SidebarRowShell>

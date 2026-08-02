@@ -264,6 +264,41 @@ export const $attentionSessionIds = computed(
     ))
 )
 
+// Chats started by `hermes desktop spawn --delegated`. The sidebar marks them
+// so a row that answered its own question is not mistaken for one a person sat
+// through.
+let delegatedIds: readonly string[] = []
+export const $delegatedSessionIds = computed(
+  $sessionStates,
+  states =>
+    (delegatedIds = stableArray(
+      delegatedIds,
+      storedIds(states, s => s.delegatedTimeoutMs !== null)
+    ))
+)
+
+// The same fact keyed by RUNTIME id, with each session's wait, for the clarify
+// auto-answer. Reference-stable like its siblings and for the same reason: this
+// recomputes on every message delta, and a fresh object each time would drag a
+// re-render along with it at streaming rates.
+let delegatedTimeouts: Readonly<Record<string, number>> = {}
+export const $delegatedTimeoutByRuntimeId = computed($sessionStates, states => {
+  const next: Record<string, number> = {}
+
+  for (const [runtimeId, state] of Object.entries(states)) {
+    if (state.delegatedTimeoutMs !== null) {
+      next[runtimeId] = state.delegatedTimeoutMs
+    }
+  }
+
+  const keys = Object.keys(next)
+
+  const unchanged =
+    keys.length === Object.keys(delegatedTimeouts).length && keys.every(key => delegatedTimeouts[key] === next[key])
+
+  return unchanged ? delegatedTimeouts : (delegatedTimeouts = next)
+})
+
 // ---------------------------------------------------------------------------
 // Session tiles.
 // ---------------------------------------------------------------------------
