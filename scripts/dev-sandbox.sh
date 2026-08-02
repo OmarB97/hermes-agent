@@ -7,13 +7,13 @@
 # exit. Use --persistent to keep the sandbox across restarts (stored under
 # .hermes-sandbox/ in the worktree git root).
 #
-# Usage:
+# Usage (paths are relative to the repo root, except where noted):
 #   scripts/dev-sandbox.sh python -m hermes_cli.main
 #   scripts/dev-sandbox.sh hermes desktop
 #   scripts/dev-sandbox.sh electron .
-#   scripts/dev-sandbox.sh -- npm run dev   # from apps/desktop/
 #   scripts/dev-sandbox.sh --persistent hermes desktop
-#   scripts/dev-sandbox.sh --persistent -- npm run dev
+#   ../../scripts/dev-sandbox.sh -- npm run dev               # from apps/desktop/
+#   ../../scripts/dev-sandbox.sh --persistent -- npm run dev  # from apps/desktop/
 #
 # Seed the sandbox HERMES_HOME from an existing directory (e.g. your main
 # ~/.hermes) so config, sessions, skills, etc. are pre-populated:
