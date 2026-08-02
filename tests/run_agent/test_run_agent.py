@@ -5825,10 +5825,11 @@ class TestRunConversation:
         )
         local_available = 200_000 - estimated_request
         expected_cap = max(1, min(50_000, local_available) - 64)
-        # output_tokens_that_fit() over-reserves the input multiplicatively, so
-        # against this near-full window it has no usable cap to offer and
-        # returns None. The retry must then keep the provider-authoritative
-        # arithmetic above rather than collapsing to a 1-token cap.
+        # The window here is ~99.5% full, past the point where even the 1.15x
+        # safety contract admits a usable cap, so output_tokens_that_fit() has
+        # nothing to offer and returns None. The retry must then keep the
+        # provider-authoritative arithmetic above rather than collapsing to a
+        # 1-token cap.
         assert local_available < 50_000
         assert second_call["max_tokens"] == expected_cap
         assert second_call["max_tokens"] > 1
