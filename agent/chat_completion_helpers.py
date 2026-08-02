@@ -1416,6 +1416,20 @@ def interruptible_api_call(agent, api_kwargs: dict):
         agent._codex_stream_last_event_ts = None
         agent._codex_stream_last_progress_ts = None
 
+    # Only a LOCAL endpoint can have a liveness signal to ask (the probe returns
+    # None for anything without a gate), so the stale detector below asks the
+    # backend before killing a local request. Resolved once: base_url does not
+    # change for the life of the call.
+    _stale_probe_local = bool(
+        getattr(agent, "base_url", None) and is_local_endpoint(agent.base_url)
+    )
+    # Seconds the liveness probe has granted to this request. A non-streaming
+    # call has exactly ONE silent stretch — nothing arrives until the whole
+    # response does — so unlike the streaming watchdog there is no chunk that
+    # ends a stretch and resets this. It grows monotonically, clamped to the
+    # ceiling below.
+    _stale_probe_extension = 0.0
+
     _call_start = time.time()
     agent._touch_activity("waiting for non-streaming API response")
 
@@ -1559,7 +1573,83 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
         # Stale-call detector: kill the connection if no response
         # arrives within the configured timeout.
-        if _elapsed > _stale_timeout:
+        if _elapsed > _stale_timeout + _stale_probe_extension:
+            # Before killing anything: ASK THE BACKEND whether it is still
+            # working. This is the same fix both streaming watchdogs already
+            # apply — the DFlash pre-first-chunk wait (#278) and the shared
+            # stale-stream branch (#343) — brought to the third and last
+            # watchdog that kills a local request. A client-side stopwatch
+            # cannot tell a wedged server apart from a healthily slow one; the
+            # gate can.
+            #
+            # It matters MORE here than in either streaming branch. A stream
+            # that is killed mid-generation has at least delivered the chunks
+            # it already produced; a non-streaming call delivers nothing until
+            # it delivers everything, so a kill throws away the whole prefill
+            # AND the whole generation and the retry restarts from zero — the
+            # kill -> re-prefill -> kill spiral with nothing salvaged.
+            #
+            # Narrower than the streaming case, deliberately: a generic local
+            # endpoint left on the implicit default resolves to `inf` in
+            # ``_compute_non_stream_stale_timeout`` and cannot reach this
+            # branch at all. What can: a local DFlash model (~180s + context
+            # scaling), a local model in the reasoning-floor allowlist (300-600s
+            # — the floor sets uses_implicit_default False, which is what skips
+            # the `inf` short-circuit), and any endpoint where the operator
+            # pinned ``stale_timeout_seconds`` / ``HERMES_API_CALL_STALE_TIMEOUT``.
+            #
+            # Scope is unchanged for everyone else: the probe is only consulted
+            # for a local base_url, and it returns None for any endpoint without
+            # a `/_gate/status` (a remote API, a bare Ollama or llama.cpp), so
+            # only a positive, parsed signal from a gated lane extends anything.
+            if _stale_probe_local:
+                _stale_ceiling = _env_float(
+                    "HERMES_DFLASH_FIRST_CHUNK_CEILING",
+                    _DFLASH_FIRST_CHUNK_CEILING_DEFAULT_S,
+                )
+                # The ceiling bounds the silent stretch, which for a
+                # non-streaming call is the whole request — the same span the
+                # pre-first-chunk streaming branch bounds. An operator-pinned
+                # threshold ABOVE the ceiling is still honoured exactly as
+                # configured: the guard is already false when the branch first
+                # fires, so the probe never runs and never shortens anything.
+                if _elapsed < _stale_ceiling and _local_backend_generation_active(
+                    getattr(agent, "base_url", None),
+                    api_kwargs.get("model") or getattr(agent, "model", None),
+                ):
+                    _est_ctx = estimate_request_context_tokens(api_kwargs)
+                    # Re-ask one stale-timeout later (the cadence both streaming
+                    # branches re-probe at), clamped so the next check lands ON
+                    # the ceiling rather than past it. Without the clamp a wide
+                    # threshold — a prefill-scaled DFlash one, or a 600s
+                    # reasoning floor — would schedule its next look beyond the
+                    # ceiling and silently outlive the bound.
+                    _stale_probe_extension = (
+                        min(_elapsed + _stale_timeout, _stale_ceiling)
+                        - _stale_timeout
+                    )
+                    logger.info(
+                        "Local non-streaming call has returned nothing for %.0fs "
+                        "(threshold %.0fs) but the backend reports an ACTIVE "
+                        "generation — extending instead of killing. model=%s "
+                        "context=~%s tokens ceiling=%.0fs",
+                        _elapsed,
+                        _stale_timeout,
+                        api_kwargs.get("model", "unknown"),
+                        f"{_est_ctx:,}",
+                        _stale_ceiling,
+                    )
+                    agent._buffer_status(
+                        f"⏳ No response for {int(_elapsed)}s on the local "
+                        f"backend (~{_est_ctx:,} tokens). The server reports it "
+                        f"is working — waiting."
+                    )
+                    agent._touch_activity(
+                        f"local backend actively generating "
+                        f"({int(_elapsed)}s silent, ~{_est_ctx:,} tokens)"
+                    )
+                    continue
+
             _est_ctx = estimate_request_context_tokens(api_kwargs)
             _silent_hint: Optional[str] = None
             _hint_fn = getattr(agent, "_codex_silent_hang_hint", None)
