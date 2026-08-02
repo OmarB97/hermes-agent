@@ -1066,6 +1066,28 @@ def record_canonical_usage(
         getattr(agent, "session_reasoning_tokens", 0)
     ) + usage_dict["reasoning_tokens"]
 
+    # Occupancy just moved, on the provider's own count rather than an estimate,
+    # and the session counters above now include this response — the one honest
+    # moment to publish a live context meter. Sampled here rather than in the
+    # chat loop so runtimes that account outside it (the codex app-server path)
+    # are covered too.
+    #
+    # The host sets this hook; the TUI gateway does, per session. It is absent
+    # on a CLI agent, and absent on delegate subagents, which build their own
+    # AIAgent and must never report their much smaller window on the parent's
+    # gauge. Auxiliary calls (goal judge, title, compaction) never reach this
+    # recorder at all — they account through `record_aux_usage`.
+    #
+    # It takes no arguments on purpose: the compressor is the authoritative
+    # reading now, and a host formatting its own payload out of duplicated
+    # numbers is one rename away from quietly showing a stale one.
+    emit = getattr(agent, "_emit_token_usage", None)
+    if callable(emit):
+        try:
+            emit()
+        except Exception:
+            logger.debug("could not emit live token usage", exc_info=True)
+
     priced = priced_usage if priced_usage is not None else canonical_usage
     cost_result = estimate_usage_cost(
         pricing_model or getattr(agent, "model", None),

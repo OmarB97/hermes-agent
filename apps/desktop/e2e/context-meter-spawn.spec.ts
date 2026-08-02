@@ -6,10 +6,16 @@
  * just before `message.start`, `message.complete` at the end. A chat someone
  * types turns over often enough that the gauge looks live; a spawned
  * `--delegated` run is ONE long agentic turn, so nothing arrived between its
- * two ends and the meter sat frozen for the whole run. The gateway now also
- * pushes `token.usage` as each tool completes.
+ * two ends and the meter sat frozen for the whole run.
  *
- * The mock backend is told to take its time over each tool round trip so a
+ * The gateway now pushes `token.usage` once per usage-bearing API response, as
+ * the provider's real prompt count lands, plus a cheap sample as each tool
+ * completes. That is why the mock answers `stream_options: {include_usage}`
+ * with a real, GROWING prompt count: a mock that reports nothing (or a
+ * constant) exercises none of the recorder path, and cannot tell a working
+ * meter from a frozen one.
+ *
+ * The mock backend is also told to take its time over each tool round trip so a
  * single turn lasts long enough to sample; without that the turn finishes
  * inside one poll and the test could pass without the fix.
  *
@@ -23,8 +29,14 @@ import { expect, test } from '@playwright/test'
 
 import { type MockBackendFixture, setupMockBackend, waitForAppReady } from './fixtures'
 
-/** Long enough that one turn spans several polls below. */
-const TOOL_ROUND_TRIP_MS = 900
+/**
+ * Long enough that one turn spans several polls below, and longer than the
+ * gateway's minimum interval between usage frames — a real agentic round trip
+ * takes seconds to minutes, so a round that outlives that floor is the shape
+ * being reproduced. Below the floor the loop would still be reported, just at
+ * the floor's rate rather than once per round.
+ */
+const TOOL_ROUND_TRIP_MS = 1_400
 
 let fixture: MockBackendFixture | null = null
 
@@ -126,6 +138,32 @@ function gaugeReadings(series: string[]): string[] {
   return series.filter(Boolean)
 }
 
+/** "16.3k/256k [█░░░] 6%" -> 16300. Only the occupancy side is compared. */
+function occupancyOf(reading: string): number {
+  const [, digits, suffix = ''] = /^([\d.]+)([kmb]?)\//i.exec(reading) ?? []
+
+  if (!digits) {
+    throw new Error(`unparseable gauge reading: "${reading}"`)
+  }
+
+  return Number(digits) * { '': 1, b: 1e9, k: 1e3, m: 1e6 }[suffix.toLowerCase()]!
+}
+
+/**
+ * A turn's context only grows: each round appends the last tool's result to the
+ * prompt. A reading that goes BACKWARDS means something other than this
+ * session's own main-agent calls reached the gauge — an auxiliary call such as
+ * the goal judge, or a delegate subagent reporting its own much smaller window.
+ * Compaction is the one legitimate drop and cannot happen at these sizes.
+ */
+function expectNeverDips(readings: string[]): void {
+  const occupancies = readings.map(occupancyOf)
+
+  for (let i = 1; i < occupancies.length; i += 1) {
+    expect(occupancies[i], `dipped: ${readings.join(' -> ')}`).toBeGreaterThanOrEqual(occupancies[i - 1])
+  }
+}
+
 test.describe('statusbar context meter', () => {
   test('tracks a spawned session while its single turn is still running', async () => {
     expect(await postSpawn('Use your tools and then report back.', { delegated: true })).toBe(202)
@@ -140,6 +178,7 @@ test.describe('statusbar context meter', () => {
     expect(readings.length).toBeGreaterThanOrEqual(2)
     // A real gauge, not a bare token count: "16.3k/256k [█░░░░░░░░░] 6%".
     expect(readings[0]).toMatch(/^[\d.]+[kmb]?\/[\d.]+[kmb]?\s+\[[█░]+\]\s+\d+%$/i)
+    expectNeverDips(readings)
   })
 
   test('still tracks a session the user typed', async () => {
@@ -156,5 +195,6 @@ test.describe('statusbar context meter', () => {
     console.log('TYPED readings:', readings)
 
     expect(readings.length).toBeGreaterThanOrEqual(2)
+    expectNeverDips(readings)
   })
 })

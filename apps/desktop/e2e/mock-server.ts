@@ -41,6 +41,45 @@ function toolCallDelayMs(): number {
   return Number.isFinite(raw) && raw > 0 ? raw : 0
 }
 
+/**
+ * Usage for one response, sized from the conversation so far.
+ *
+ * A real provider reports a prompt count that grows every round trip, because
+ * each round appends the last tool's result to the prompt. That growth is the
+ * only thing a live context meter has to read, so a mock that answers with a
+ * constant — or with nothing — cannot tell a working meter from a frozen one.
+ */
+function usageFor(messages: any[]): { completion_tokens: number; prompt_tokens: number; total_tokens: number } {
+  const promptTokens = 12_000 + messages.length * 1_500
+  const completionTokens = 120
+
+  return {
+    completion_tokens: completionTokens,
+    prompt_tokens: promptTokens,
+    total_tokens: promptTokens + completionTokens,
+  }
+}
+
+/**
+ * The final SSE frame of a stream, carrying usage.
+ *
+ * Hermes requests `stream_options: {include_usage: true}` on every streaming
+ * call, and an OpenAI-compatible server answers it with one last chunk whose
+ * `choices` are empty and whose `usage` covers the whole response. Without this
+ * the stream looks usage-less, the usage recorder never runs, and everything
+ * downstream of it is untested.
+ */
+function usageChunk(model: string, messages: any[]): string {
+  return `data: ${JSON.stringify({
+    id: 'mock-completion',
+    object: 'chat.completion.chunk',
+    created: 0,
+    model,
+    choices: [],
+    usage: usageFor(messages),
+  })}\n\n`
+}
+
 /** A trivially valid value for a JSON schema property, honoring `enum` and `type`. */
 function trivialValueFor(propSchema: any): unknown {
   if (Array.isArray(propSchema?.enum) && propSchema.enum.length > 0) {
@@ -201,6 +240,7 @@ export function startMockServer(): Promise<{ port: number; url: string; close: (
                   ],
                 })}\n\n`,
               )
+              res.write(usageChunk(model, messages))
               res.write('data: [DONE]\n\n')
               res.end()
             } else {
@@ -228,11 +268,7 @@ export function startMockServer(): Promise<{ port: number; url: string; close: (
                       finish_reason: 'tool_calls',
                     },
                   ],
-                  usage: {
-                    prompt_tokens: 10,
-                    completion_tokens: 20,
-                    total_tokens: 30,
-                  },
+                  usage: usageFor(messages),
                 }),
               )
             }
@@ -268,6 +304,7 @@ export function startMockServer(): Promise<{ port: number; url: string; close: (
                     ],
                   })}\n\n`,
                 )
+                res.write(usageChunk(model, messages))
                 res.write('data: [DONE]\n\n')
                 res.end()
                 return
@@ -311,11 +348,7 @@ export function startMockServer(): Promise<{ port: number; url: string; close: (
                     finish_reason: 'stop',
                   },
                 ],
-                usage: {
-                  prompt_tokens: 10,
-                  completion_tokens: 20,
-                  total_tokens: 30,
-                },
+                usage: usageFor(messages),
               }),
             )
           }

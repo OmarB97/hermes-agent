@@ -3784,6 +3784,13 @@ def _get_usage(agent) -> dict:
     return usage
 
 
+# Floor between two usage frames for one session. A batch of parallel tools all
+# complete against the same API response, and a fast tool loop turns several
+# round trips a second, so without a floor the status bar is asked to repaint
+# far more often than anyone can read it.
+_TOKEN_USAGE_MIN_INTERVAL_S = 1.0
+
+
 def _emit_token_usage(sid: str) -> None:
     """Push current context occupancy to the client mid-turn.
 
@@ -3797,15 +3804,36 @@ def _emit_token_usage(sid: str) -> None:
     20260802_062726_a24427: one turn, 22 API calls, 40 tool calls, 95,377
     prompt tokens, and not one usage update after the first.
 
-    The desktop has handled ``token.usage`` since before this existed; nothing
-    ever emitted it. Note the payload key names are that handler's flat shape
+    Two callers. ``record_canonical_usage`` fires once per usage-bearing API
+    response, as the provider's own prompt count lands on the compressor — the
+    honest sample, and the only one a round that calls no tool ever gets.
+    ``_on_tool_complete`` fires a cheap second one, which still covers a runtime
+    that accounts outside that recorder.
+
+    Note the payload key names are the desktop handler's flat shape
     (``context_tokens``/``context_length``/``context_pct``), not ``_get_usage``'s.
+    A rename on either side silently stops the meter.
 
     Silent when the window is still unknown — a fresh compressor reports
     ``last_prompt_tokens`` 0 and ``_get_usage`` deliberately omits the gauge
     rather than fabricating 0%.
+
+    Two suppressions keep a fast tool loop from thrashing the status bar. A
+    frame whose gauge is identical to the last one sent for this session is
+    dropped outright — that costs nothing, because every tool in a parallel
+    batch reads the same occupancy. Beyond that a moved gauge waits out
+    ``_TOKEN_USAGE_MIN_INTERVAL_S``; dropping one is safe because occupancy only
+    climbs within a turn, so a later frame supersedes it and ``message.complete``
+    always carries the turn's final number.
+
+    A compaction is the exception and goes out immediately: it is the one moment
+    the gauge legitimately falls, it is the drop the client's monotonic guard is
+    watching ``compressions`` to authorize, and it is far too visible to sit on.
     """
-    agent = (_sessions.get(sid) or {}).get("agent")
+    session = _sessions.get(sid)
+    if session is None:
+        return
+    agent = session.get("agent")
     if agent is None:
         return
     try:
@@ -3814,6 +3842,28 @@ def _emit_token_usage(sid: str) -> None:
         return
     if "context_used" not in usage:
         return
+
+    gauge = (
+        usage["context_used"],
+        usage["context_max"],
+        usage["context_percent"],
+        usage.get("compressions", 0),
+    )
+    previous = session.get("token_usage_last_gauge")
+    if previous == gauge:
+        return
+
+    now = time.monotonic()
+    last_at = session.get("token_usage_emitted_at")
+    compacted = previous is not None and gauge[3] != previous[3]
+    # `is None` rather than a 0.0 sentinel: an unset float compared against
+    # monotonic() measures host UPTIME, which would make the first frame of a
+    # session depend on how long the box has been up (#327).
+    if not compacted and last_at is not None and (now - last_at) < _TOKEN_USAGE_MIN_INTERVAL_S:
+        return
+
+    session["token_usage_last_gauge"] = gauge
+    session["token_usage_emitted_at"] = now
     _emit(
         "token.usage",
         sid,
@@ -4287,13 +4337,16 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
             payload["inline_diff"] = "\n".join(rendered)
     except Exception:
         pass
+    # Ahead of the tool card, and outside the tool-progress gate, on purpose.
+    # The meter must track a long turn even for a client that streams no tool
+    # cards, and `tool.complete` below is the one emit here that is NOT wrapped
+    # in try/except — a tool result that fails to serialize raises through it,
+    # the tool executor swallows that, and a usage frame sequenced afterwards
+    # would be silently lost with it. Cheap either way: the frame is dropped as
+    # a duplicate unless a response has since moved the gauge.
+    _emit_token_usage(sid)
     if _tool_progress_enabled(sid) or payload.get("inline_diff"):
         _emit("tool.complete", sid, payload)
-    # Outside the tool-progress gate on purpose: the context meter must track a
-    # long turn even for a client that streams no tool cards. Each completed
-    # tool follows an API response, which is exactly when the compressor's
-    # occupancy moved, so this is one small frame per round trip.
-    _emit_token_usage(sid)
 
 
 def _on_tool_progress(
@@ -5027,6 +5080,12 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
         # a pin the user never sees and cannot clear.
         session.pop("create_toolsets_override", None)
         session.pop("one_turn_model_restore", None)
+        # The context meter's de-duplication state describes the conversation
+        # that is ending, not the sid, which /new keeps. Carrying it across the
+        # boundary would let the fresh agent's first reading be mistaken for a
+        # repeat of the old one's.
+        session.pop("token_usage_last_gauge", None)
+        session.pop("token_usage_emitted_at", None)
         new_agent = _make_agent(
             sid,
             session["session_key"],
@@ -5367,7 +5426,7 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
-    return AIAgent(
+    agent = AIAgent(
         model=runtime.get("model") or model,
         max_iterations=_cfg_max_turns(cfg, 90),
         provider=runtime.get("provider"),
@@ -5425,6 +5484,26 @@ def _make_agent(
         initial_fallback_entry=resolution.initial_fallback_entry,
         **_agent_cbs(sid),
     )
+    # Called once per usage-bearing API response, from the one place that sees
+    # the provider's real prompt count land on the compressor
+    # (`record_canonical_usage`). Occupancy used to reach the meter only when a
+    # TOOL finished, which reports the request that *produced* that tool call and
+    # says nothing at all for a reasoning-only round.
+    #
+    # Deliberately a post-construction attribute, never an AIAgent constructor
+    # kwarg: `delegate_tool` forwards ~30 constructor kwargs from parent to
+    # child, so a kwarg is the one way a subagent could inherit this and start
+    # reporting its own much smaller window on the parent's gauge. An auxiliary
+    # call (goal judge, title, compaction) never reaches this hook either — it
+    # accounts through `record_aux_usage`, which touches neither the compressor
+    # nor the session counters.
+    #
+    # The kwargs are ignored on purpose. Reading live state back through
+    # _get_usage keeps one source of truth for the payload — the flat wire shape
+    # is easy to drift from _get_usage's own key names, and a rename on either
+    # side silently stops the meter.
+    agent._emit_token_usage = lambda **_kwargs: _emit_token_usage(sid)
+    return agent
 
 
 def _init_session(

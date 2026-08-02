@@ -600,10 +600,24 @@ def _length_continuation_headroom(agent: Any, request_pressure_tokens: int) -> O
     return context_length - prompt_tokens - max(completion_tokens, 0)
 
 
-def _emit_preflight_token_usage(
+def _raise_preflight_context_estimate(
     agent: Any, request_tokens: int, messages_len: int | None = None
 ) -> None:
-    """Send the current request-size estimate through the live usage channel."""
+    """Raise tracked occupancy to the size of the request about to be sent.
+
+    This estimate exists so compression decisions and the status bar have a
+    figure before the provider answers. It does NOT publish that figure to the
+    live usage channel, and deliberately so: ``estimate_messages_tokens_rough``
+    assumes ~4 chars/token, while the dense tool-call/JSON transcripts of an
+    agentic session tokenize nearer ~3.4, so it reads materially LOW against the
+    server (measured on deepseek-v4-flash-w2: est 58,039 vs server >=65,797 —
+    see the over-reservation note in ``model_metadata``). Publishing it would
+    put a number on the context meter that under-reads the real window by ~13%,
+    then correct downward-looking against the client's monotonic guard.
+
+    The meter is fed from ``record_canonical_usage`` instead, which is where the
+    provider's real prompt count lands, once per usage-bearing response.
+    """
     if request_tokens <= 0:
         return
     compressor = getattr(agent, "context_compressor", None)
@@ -618,25 +632,6 @@ def _emit_preflight_token_usage(
                 compressor.last_prompt_messages_len = messages_len
     except Exception:
         logger.debug("could not update preflight context estimate", exc_info=True)
-
-    emit = getattr(agent, "_emit_token_usage", None)
-    if not callable(emit):
-        return
-
-    try:
-        emit(
-            input_tokens=getattr(agent, "session_input_tokens", 0)
-            or getattr(agent, "session_prompt_tokens", 0)
-            or 0,
-            output_tokens=getattr(agent, "session_output_tokens", 0)
-            or getattr(agent, "session_completion_tokens", 0)
-            or 0,
-            total_tokens=getattr(agent, "session_total_tokens", 0) or 0,
-            context_tokens=request_tokens,
-            context_length=getattr(compressor, "context_length", 0) or 0,
-        )
-    except Exception:
-        logger.debug("could not emit preflight token usage", exc_info=True)
 
 
 # Continuation nudge for Codex/Responses turns that came back with only
@@ -1383,9 +1378,11 @@ def run_conversation(
         request_pressure_tokens = approx_tokens + (
             _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
         )
-        # Live context bar: surface the request-size estimate BEFORE the API
-        # call so long tool batches show movement (#126 desktop feature).
-        _emit_preflight_token_usage(
+        # Carry the request-size estimate BEFORE the API call so compression
+        # decisions and the status bar have a figure to read while it is in
+        # flight. It is an estimate and stays local: the live context meter is
+        # fed from the provider's real count instead (see the docstring).
+        _raise_preflight_context_estimate(
             agent, request_pressure_tokens, messages_len=len(messages)
         )
         total_chars = approx_tokens * 4
