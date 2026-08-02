@@ -110,6 +110,7 @@ import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
 import { createKeepAwake } from './power-save'
 import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRouteProfile } from './profile-delete-routing'
 import { createSessionStoreWatcher } from './session-store-watch'
+import { startSpawnControlServer } from './spawn-control'
 import {
   buildSessionWindowUrl,
   chatWindowWebPreferences,
@@ -4803,6 +4804,87 @@ function registerSessionStoreWatcher() {
     // renderer's focused poll still covers it.
     rememberLog(`[session-store-watch] disabled: ${error?.message ?? error}`)
   }
+}
+
+// Local spawn channel: a CLI on this machine asks the RUNNING app to start a
+// chat, so the app owns and streams it exactly like a typed one. See
+// electron/spawn-control.ts for why this cannot live on the Python backend.
+let spawnControlServer = null
+let _pendingSpawn = null
+let _rendererReadyForSpawn = false
+
+// Hand a spawn to the renderer, or park it until the renderer says it is
+// listening. Mirrors the deep-link flush so a spawn that races app boot is not
+// dropped on the floor — the CLI already got its 202, so silently losing it
+// here would be a lie.
+function deliverSpawnToRenderer(request) {
+  if (!_rendererReadyForSpawn || !mainWindow || mainWindow.isDestroyed()) {
+    // Only one parked spawn: this covers the boot race, not a queue. A second
+    // spawn before the renderer is up replaces the first rather than growing
+    // unboundedly, and the caller can retry.
+    _pendingSpawn = request
+
+    return mainWindow && !mainWindow.isDestroyed() ? 'delivered' : 'no-window'
+  }
+
+  try {
+    if (mainWindow.isMinimized()) {
+      mainWindow.restore()
+    }
+
+    mainWindow.focus()
+    mainWindow.webContents.send('hermes:spawn-session', request)
+    rememberLog(`[spawn-control] delivered spawn (${request.model || 'current model'})`)
+
+    return 'delivered'
+  } catch (err) {
+    rememberLog(`[spawn-control] delivery failed: ${err?.message ?? err}`)
+
+    return 'no-window'
+  }
+}
+
+ipcMain.handle('hermes:spawn-ready', () => {
+  _rendererReadyForSpawn = true
+
+  if (_pendingSpawn) {
+    const queued = _pendingSpawn
+    _pendingSpawn = null
+    deliverSpawnToRenderer(queued)
+  }
+
+  return { ok: true }
+})
+
+async function registerSpawnControlServer() {
+  if (spawnControlServer) {
+    return
+  }
+
+  try {
+    spawnControlServer = await startSpawnControlServer({
+      hermesHome: HERMES_HOME,
+      deliver: deliverSpawnToRenderer,
+      onLog: rememberLog
+    })
+  } catch (error) {
+    // No spawn channel is a missing convenience, never a failed boot.
+    rememberLog(`[spawn-control] disabled: ${error?.message ?? error}`)
+  }
+}
+
+function stopSpawnControlServer() {
+  if (!spawnControlServer) {
+    return
+  }
+
+  try {
+    spawnControlServer.close()
+  } catch {
+    void 0
+  }
+
+  spawnControlServer = null
 }
 
 function stopSessionStoreWatcher() {
@@ -9915,6 +9997,7 @@ app.whenReady().then(() => {
   configureSpellChecker()
   registerPowerResumeListeners()
   registerSessionStoreWatcher()
+  void registerSpawnControlServer()
   keepAwake.set(readPersistedKeepAwake())
   createWindow()
 
@@ -9978,6 +10061,7 @@ app.on('before-quit', () => {
   closePetOverlay()
 
   stopSessionStoreWatcher()
+  stopSpawnControlServer()
 
   // Quitting mid-install should stop the installer, not orphan it.
   if (bootstrapAbortController) {

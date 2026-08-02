@@ -198,6 +198,17 @@ declare global {
       onNotificationAction?: (callback: (payload: { actionId: string; sessionId?: string }) => void) => () => void
       onPreviewFileChanged: (callback: (payload: HermesPreviewFileChanged) => void) => () => void
       onBackendExit: (callback: (payload: BackendExit) => void) => () => void
+      // A local CLI (`hermes desktop spawn`) asked this app to start a chat.
+      onSpawnSession?: (
+        callback: (payload: {
+          prompt: string
+          model?: string
+          provider?: string
+          profile?: string
+          toolsets?: string[]
+        }) => void
+      ) => () => void
+      signalSpawnReady?: () => Promise<{ ok: boolean }>
       // A profile's session store changed on disk without this app causing it
       // (headless `hermes -z …`, cron, a CLI session elsewhere). Re-pull the
       // sidebar list. Optional: an older preload won't expose it.

@@ -858,12 +858,7 @@ describe('resumeSession failure recovery', () => {
     } satisfies MutableRefObject<Map<string, string>>
 
     const sessionStateByRuntimeIdRef = {
-      current: new Map([
-        [
-          'runtime-stale',
-          createClientSessionState('stored-1')
-        ]
-      ])
+      current: new Map([['runtime-stale', createClientSessionState('stored-1')]])
     } satisfies MutableRefObject<Map<string, ClientSessionState>>
 
     setSessions([storedSession({ message_count: 4 })])
@@ -1241,5 +1236,112 @@ describe('createBackendSessionForSend workspace target', () => {
     )
 
     expect(params).toMatchObject({ cwd: '/clicked-workspace' })
+  })
+})
+
+// A `hermes desktop spawn` names its model without touching the composer's
+// persisted selection, so the choice has to travel as a per-session override
+// all the way into session.create. Setting the sticky atoms instead would
+// change the model for every chat the user starts afterwards.
+describe('createBackendSessionForSend per-session overrides', () => {
+  afterEach(() => {
+    cleanup()
+    $newChatProfile.set(null)
+    $activeGatewayProfile.set('default')
+    $currentCwd.set('')
+    $currentModel.set('')
+    $currentProvider.set('')
+    vi.restoreAllMocks()
+  })
+
+  async function createWithOverrides(
+    setup: () => void,
+    overrides?: { model?: string; profile?: string; provider?: string }
+  ): Promise<Record<string, unknown> | undefined> {
+    let createParams: Record<string, unknown> | undefined
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.create') {
+        createParams = params
+
+        return { session_id: RUNTIME_SESSION_ID, stored_session_id: null } as never
+      }
+
+      return {} as never
+    })
+
+    setCurrentCwd('')
+    setNewChatWorkspaceTarget(undefined)
+    setup()
+
+    let handle: HarnessHandle | null = null
+    render(<Harness onReady={h => (handle = h)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.createBackendSessionForSend(null, overrides)
+    })
+
+    return createParams
+  }
+
+  it('sends the overridden model and provider instead of the live selection', async () => {
+    const params = await createWithOverrides(
+      () => {
+        setCurrentModel('anthropic/claude-sonnet-4.6')
+        setCurrentProvider('anthropic')
+      },
+      { model: 'deepseek-v4-flash-0731-ds4', provider: 'ai-router' }
+    )
+
+    expect(params).toMatchObject({ model: 'deepseek-v4-flash-0731-ds4', provider: 'ai-router' })
+  })
+
+  it('does not mutate the persisted composer selection', async () => {
+    await createWithOverrides(
+      () => {
+        setCurrentModel('anthropic/claude-sonnet-4.6')
+        setCurrentProvider('anthropic')
+      },
+      { model: 'deepseek-v4-flash-0731-ds4', provider: 'ai-router' }
+    )
+
+    expect($currentModel.get()).toBe('anthropic/claude-sonnet-4.6')
+    expect($currentProvider.get()).toBe('anthropic')
+  })
+
+  it('routes an overridden profile', async () => {
+    const params = await createWithOverrides(
+      () => {
+        $activeGatewayProfile.set('default')
+      },
+      { profile: 'analyst' }
+    )
+
+    expect(params).toMatchObject({ profile: 'analyst' })
+  })
+
+  // An override that names only the model must not silently inherit an
+  // unrelated provider from the live selection.
+  it('clears the inherited provider when only a model is overridden', async () => {
+    const params = await createWithOverrides(
+      () => {
+        setCurrentModel('anthropic/claude-sonnet-4.6')
+        setCurrentProvider('anthropic')
+      },
+      { model: 'deepseek-v4-flash-0731-ds4' }
+    )
+
+    expect(params).toMatchObject({ model: 'deepseek-v4-flash-0731-ds4' })
+    expect(params).not.toHaveProperty('provider')
+  })
+
+  it('falls back to the live selection when no override is given', async () => {
+    const params = await createWithOverrides(() => {
+      setCurrentModel('anthropic/claude-sonnet-4.6')
+      setCurrentProvider('anthropic')
+    })
+
+    expect(params).toMatchObject({ model: 'anthropic/claude-sonnet-4.6', provider: 'anthropic' })
   })
 })

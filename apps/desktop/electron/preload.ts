@@ -209,6 +209,15 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
 
     return () => ipcRenderer.removeListener('hermes:backend-exit', listener)
   },
+  // A local CLI asked the running app to start a chat. The renderer runs it
+  // through its own new-chat + submit path, so it streams like a typed one.
+  onSpawnSession: callback => {
+    const listener = (_event, payload) => callback(payload)
+    ipcRenderer.on('hermes:spawn-session', listener)
+
+    return () => ipcRenderer.removeListener('hermes:spawn-session', listener)
+  },
+  signalSpawnReady: () => ipcRenderer.invoke('hermes:spawn-ready'),
   // A session store on disk changed in a way this window did not cause — most
   // often a headless `hermes -z …` run or a CLI session in another terminal
   // writing its transcript. The renderer re-pulls the sidebar list.

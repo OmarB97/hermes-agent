@@ -44,6 +44,7 @@ import type {
   ImageAttachResponse,
   SessionSteerResponse
 } from '../../../types'
+import type { SessionCreateOverrides } from '../../session-overrides'
 
 import {
   applyBranchVisibility,
@@ -172,7 +173,10 @@ interface PromptActionsOptions {
   activeSessionIdRef: MutableRefObject<string | null>
   busyRef: MutableRefObject<boolean>
   branchCurrentSession: () => Promise<boolean>
-  createBackendSessionForSend: (preview?: string | null) => Promise<string | null>
+  createBackendSessionForSend: (
+    preview?: string | null,
+    overrides?: SessionCreateOverrides
+  ) => Promise<string | null>
   getRoutedStoredSessionId: () => null | string
   getRuntimeIdForStoredSession: (storedSessionId: string) => null | string
   getRouteToken: () => string
@@ -764,6 +768,7 @@ export function usePromptActions({
       setMutableRef(busyRef, true)
       setBusy(true)
       setAwaitingResponse(true)
+
       const editState = updateSessionState(sessionId, state =>
         applyRewindOptimistic(state, plan.sourceIndex, plan.editedMessage)
       )

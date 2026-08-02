@@ -17,6 +17,7 @@ import { requestDesktopOnboarding } from '@/store/onboarding'
 import { $localDeviceName, setAwaitingResponse, setBusy, setMessages } from '@/store/session'
 
 import type { ClientSessionState } from '../../../types'
+import type { SessionCreateOverrides } from '../../session-overrides'
 
 import {
   _submitInFlight,
@@ -40,7 +41,10 @@ interface SubmitPromptDeps {
   activeSessionIdRef: MutableRefObject<string | null>
   busyRef: MutableRefObject<boolean>
   copy: Translations['desktop']
-  createBackendSessionForSend: (preview?: string | null) => Promise<string | null>
+  createBackendSessionForSend: (
+    preview?: string | null,
+    overrides?: SessionCreateOverrides
+  ) => Promise<string | null>
   getRoutedStoredSessionId: () => null | string
   getRuntimeIdForStoredSession: (storedSessionId: string) => null | string
   getRouteToken: () => string
@@ -392,7 +396,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
       if (!sessionId) {
         try {
-          sessionId = await createBackendSessionForSend(visibleText)
+          sessionId = await createBackendSessionForSend(visibleText, options?.sessionOverrides)
         } catch (err) {
           dropOptimistic(null)
           releaseBusy()

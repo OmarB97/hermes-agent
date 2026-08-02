@@ -6074,6 +6074,13 @@ def cmd_gui(args: argparse.Namespace):
     sys.exit(launch_result.returncode)
 
 
+def cmd_desktop_spawn(args):
+    """Ask the running Hermes desktop app to start a new chat session."""
+    from hermes_cli.desktop_spawn import cmd_desktop_spawn as _impl
+
+    return _impl(args)
+
+
 def _find_stale_dashboard_pids(
     *,
     exclude_pids: set[int] | None = None,
@@ -15250,7 +15257,7 @@ def main():
     # =========================================================================
     # gui command  (parser built in hermes_cli/subcommands/gui.py)
     # =========================================================================
-    build_gui_parser(subparsers, cmd_gui=cmd_gui)
+    build_gui_parser(subparsers, cmd_gui=cmd_gui, cmd_desktop_spawn=cmd_desktop_spawn)
 
     # =========================================================================
     # logs command  (parser built in hermes_cli/subcommands/logs.py)

@@ -70,7 +70,6 @@ SINGLE_HANDLER_CASES = [
     ("version", build_version_parser, "cmd_version", ["version"]),
     ("update", build_update_parser, "cmd_update", ["update"]),
     ("uninstall", build_uninstall_parser, "cmd_uninstall", ["uninstall"]),
-    ("gui", build_gui_parser, "cmd_gui", ["gui"]),
     ("logs", build_logs_parser, "cmd_logs", ["logs"]),
     ("prompt-size", build_prompt_size_parser, "cmd_prompt_size", ["prompt-size"]),
 ]
@@ -114,6 +113,20 @@ def test_dashboard_builder_two_handlers():
     assert parser.parse_args(["dashboard"]).func is dash
     # dashboard register -> register handler
     assert parser.parse_args(["dashboard", "register"]).func is reg
+
+
+def test_gui_builder_two_handlers():
+    parser = argparse.ArgumentParser(prog="hermes")
+    sub = parser.add_subparsers(dest="command")
+    gui, spawn = _h("gui"), _h("desktop_spawn")
+    build_gui_parser(sub, cmd_gui=gui, cmd_desktop_spawn=spawn)
+    # bare desktop (and its "gui" alias) -> build/launch handler
+    assert parser.parse_args(["gui"]).func is gui
+    assert parser.parse_args(["desktop"]).func is gui
+    # desktop spawn "<prompt>" -> spawn handler
+    ns = parser.parse_args(["desktop", "spawn", "hi"])
+    assert ns.func is spawn
+    assert ns.prompt == "hi"
 
 
 # ── deprecated `hermes login` fails gracefully, not with argparse error ────

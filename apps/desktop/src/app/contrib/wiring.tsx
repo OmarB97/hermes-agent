@@ -98,6 +98,7 @@ import { useBackgroundSync } from './hooks/use-background-sync'
 import { useDesktopIntegrations } from './hooks/use-desktop-integrations'
 import { usePetBridge } from './hooks/use-pet-bridge'
 import { useSessionTileDelegate } from './hooks/use-session-tile-delegate'
+import { useSpawnBridge } from './hooks/use-spawn-bridge'
 import { $restartPreviewServer, useTitlebarToolContributions } from './panes'
 import { ChatRoutesSurface, SidebarSurface, StatusbarSurface, TerminalSurface } from './surfaces'
 import type { WiringActions, WiringApi } from './types'
@@ -571,6 +572,9 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
   // The popped-out pet overlay's bridge back into the app.
   usePetBridge({ requestGateway, resumeSession, submitText })
+
+  // `hermes desktop spawn` -> start the chat here, so it streams like a typed one.
+  useSpawnBridge({ startFreshSession: startFreshSessionDraft, submitText })
 
   // Clear a failed turn's red error banner. Errors are renderer-local (never
   // persisted): a bare error placeholder is dropped entirely; a partial-output
