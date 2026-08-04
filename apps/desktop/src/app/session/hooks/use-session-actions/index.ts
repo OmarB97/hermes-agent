@@ -58,8 +58,8 @@ import {
   setResumeFailedSessionId,
   setSelectedStoredSessionId,
   setSessions,
-  setSessionsTotal,
   setSessionStartedAt,
+  setSessionsTotal,
   setTurnStartedAt,
   setYoloActive
 } from '@/store/session'
@@ -1074,6 +1074,7 @@ export function useSessionActions({
 
         setActiveSessionId(resumed.session_id)
         activeSessionIdRef.current = resumed.session_id
+
         const runtimeInfo = applyRuntimeInfo(resumed.info, {
           usageFallback: stored ? storedSessionUsagePreview(stored) : undefined
         })

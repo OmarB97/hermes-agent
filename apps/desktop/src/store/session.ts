@@ -548,6 +548,7 @@ export const setSessionProfilesTruncated = (next: Updater<Record<string, boolean
   updateAtom($sessionProfilesTruncated, next)
 export const setSessionProfileTotals = (next: Updater<Record<string, number>>) =>
   updateAtom($sessionProfileTotals, next)
+
 export const adjustSessionProfileTotal = (profileKey: string, delta: number) => {
   const current = $sessionProfileTotals.get()
 
@@ -558,6 +559,7 @@ export const adjustSessionProfileTotal = (profileKey: string, delta: number) => 
     })
   }
 }
+
 export const adjustMessagingPlatformTotal = (sourceId: string, delta: number) => {
   const current = $messagingPlatformTotals.get()
 
@@ -568,6 +570,7 @@ export const adjustMessagingPlatformTotal = (sourceId: string, delta: number) =>
     })
   }
 }
+
 export const setSessionsLoading = (next: Updater<boolean>) => updateAtom($sessionsLoading, next)
 export const setActiveSessionId = (next: Updater<string | null>) => updateAtom($activeSessionId, next)
 export const setActiveSessionStoredIdRotation = (next: Updater<ActiveSessionStoredIdRotation | null>) =>

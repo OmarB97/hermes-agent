@@ -22,9 +22,9 @@ import {
   listSidebarSessions,
   resetSidebarBatchCapability,
   setApiRequestProfile,
+  setSessionArchived,
   speakText,
-  transcribeAudio,
-  setSessionArchived
+  transcribeAudio
 } from './hermes'
 import { refreshActiveProfile } from './store/profile'
 

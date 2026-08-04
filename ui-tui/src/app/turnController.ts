@@ -156,10 +156,7 @@ class TurnController {
     this.activeTurnId = String(turnId ?? '').trim()
   }
 
-  hydrateTurnOutcomes(
-    inflight?: null | SessionInflightTurn,
-    messages: GatewayTranscriptMessage[] = []
-  ) {
+  hydrateTurnOutcomes(inflight?: null | SessionInflightTurn, messages: GatewayTranscriptMessage[] = []) {
     const activeTurnId = String(inflight?.turn_id ?? '').trim()
 
     this.activeTurnId = activeTurnId

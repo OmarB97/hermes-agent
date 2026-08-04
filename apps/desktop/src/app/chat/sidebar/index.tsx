@@ -9,8 +9,8 @@ import type { SessionDragPayload } from '@/app/chat/composer/inline-refs'
 import { PlatformAvatar } from '@/app/messaging/platform-icon'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
-import { ContextMenu, ContextMenuContent, ContextMenuTrigger } from '@/components/ui/context-menu'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+import { ContextMenu, ContextMenuContent, ContextMenuTrigger } from '@/components/ui/context-menu'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { KbdGroup } from '@/components/ui/kbd'
 import { SearchField } from '@/components/ui/search-field'
@@ -137,8 +137,8 @@ import { SidebarBlankState, SidebarPinnedEmptyState, SidebarSessionSkeletons } f
 import { SelectionActionBar } from './selection-action-bar'
 import { buildSessionByAnyId } from './session-index'
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
-import { CONTEXT_SPLIT_KIT, SplitSubmenu } from './split-submenu'
 import { sharedSessionSectionId, useSharedSessionDnd } from './shared-session-dnd'
+import { CONTEXT_SPLIT_KIT, SplitSubmenu } from './split-submenu'
 import { placeSessionIdAtAnchor, previewItemsAtAnchor, useSessionDropZone } from './use-session-drop-zone'
 
 // Non-session groups (messaging platforms) stay compact: show a few rows up
@@ -1491,8 +1491,8 @@ export function ChatSidebar({
                   sectionKey="pinned"
                   sessionDndId={sharedSessionSectionId('pinned')}
                   sessions={renderedPinnedSessions}
-                  showProfileTags={showAllProfiles}
                   sharedSessionDnd={flatSessionDndEnabled}
+                  showProfileTags={showAllProfiles}
                   sortable={flatSessionDndEnabled ? pinnedSessions.length > 0 : pinnedSessions.length > 1}
                   workingSessionIdSet={workingSessionIdSet}
                 />

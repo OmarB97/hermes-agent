@@ -174,7 +174,6 @@ import {
   revalidateRemoteConnection
 } from './remote-liveness'
 import { createSessionStoreWatcher } from './session-store-watch'
-import { startSpawnControlServer } from './spawn-control'
 import {
   buildSessionWindowUrl,
   chatWindowWebPreferences,
@@ -183,6 +182,7 @@ import {
   SESSION_WINDOW_MIN_HEIGHT,
   SESSION_WINDOW_MIN_WIDTH
 } from './session-windows'
+import { startSpawnControlServer } from './spawn-control'
 import { ensureSpawnHelperExecutable } from './spawn-helper-perms'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
 import { collectSshConfigHosts, parseSshGOutput } from './ssh-config'
@@ -2302,6 +2302,7 @@ function readDesktopUpdateConfig() {
     const parsed = JSON.parse(fs.readFileSync(DESKTOP_UPDATE_CONFIG_PATH, 'utf8'))
     const branch = typeof parsed?.branch === 'string' ? parsed.branch.trim() : ''
     const remote = typeof parsed?.remote === 'string' ? parsed.remote.trim() : ''
+
     return { branch: branch || DEFAULT_UPDATE_BRANCH, remote: remote || null }
   } catch {
     return { branch: DEFAULT_UPDATE_BRANCH, remote: null }
@@ -2428,6 +2429,7 @@ const firstLine = text => (text || '').split('\n').find(Boolean) || ''
 function splitTrackingRef(ref) {
   const value = String(ref || '').trim()
   const slash = value.indexOf('/')
+
   if (slash <= 0 || slash === value.length - 1) {
     return null
   }
@@ -2443,14 +2445,17 @@ async function resolveCurrentTrackingRef(updateRoot) {
   const result = await runGit(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}'], {
     cwd: updateRoot
   })
+
   if (result.code !== 0) {
     return null
   }
+
   return splitTrackingRef(firstLine(result.stdout))
 }
 
 async function getOriginUrl(updateRoot) {
   const origin = await runGit(['remote', 'get-url', 'origin'], { cwd: updateRoot })
+
   return origin.code === 0 ? origin.stdout.trim() : ''
 }
 
@@ -2475,12 +2480,14 @@ async function resolveHealedBranch(updateRoot, branch, remote = 'origin') {
   }
 
   const probe = await runGit(['ls-remote', '--exit-code', '--heads', remote, branch], { cwd: updateRoot })
+
   if (probe.code !== 2) {
     return branch
   }
 
   rememberLog(`[updates] ${remote}/${branch} is gone (merged?); falling back to main`)
   const config = readDesktopUpdateConfig()
+
   if (config.branch !== 'main') {
     writeDesktopUpdateConfig({ ...config, branch: 'main' })
   }
@@ -2502,6 +2509,7 @@ async function resolveUpdateTarget(updateRoot, configuredBranch, configuredRemot
   if (!configuredRemote && tracking && tracking.remote !== 'origin') {
     // Verify the non-origin remote actually tracks the configured branch
     const probe = await runGit(['ls-remote', '--exit-code', '--heads', tracking.remote, branch], { cwd: updateRoot })
+
     if (probe.code === 0) {
       effectiveRemote = tracking.remote
     }
@@ -2514,6 +2522,7 @@ async function resolveUpdateTarget(updateRoot, configuredBranch, configuredRemot
     // If tracking a non-origin remote, prefer it as the effective remote
     // for the update target label/ref
     const targetRemote = (!configuredRemote && tracking.remote !== 'origin') ? tracking.remote : effectiveRemote
+
     return {
       branch: tracking.branch,
       currentBranch,
@@ -2524,6 +2533,7 @@ async function resolveUpdateTarget(updateRoot, configuredBranch, configuredRemot
   }
 
   const healedBranch = await resolveHealedBranch(updateRoot, branch, effectiveRemote)
+
   return {
     branch: healedBranch,
     currentBranch,
@@ -2537,6 +2547,7 @@ async function checkUpdates() {
   const updateRoot = resolveUpdateRoot()
   let { branch, remote } = readDesktopUpdateConfig()
   const gitDir = path.join(updateRoot, '.git')
+
   if (!directoryExists(gitDir)) {
     return {
       supported: false,
@@ -2550,15 +2561,19 @@ async function checkUpdates() {
   const target = await resolveUpdateTarget(updateRoot, branch, remote)
   branch = target.label
   const originUrl = await getOriginUrl(updateRoot)
+
   if (!remote && target.remote === 'origin' && isOfficialSshRemote(originUrl)) {
     const git = args => runGit(args, { cwd: updateRoot }).then(r => r.stdout.trim())
+
     const [currentSha, targetLs, dirtyStr, currentBranch] = await Promise.all([
       git(['rev-parse', 'HEAD']),
       runGit(['ls-remote', OFFICIAL_REPO_HTTPS_URL, `refs/heads/${target.branch}`], { cwd: updateRoot }),
       git(['status', '--porcelain']),
       git(['rev-parse', '--abbrev-ref', 'HEAD'])
     ])
+
     const targetSha = firstLine(targetLs.stdout).split(/\s+/)[0] || ''
+
     if (targetLs.code !== 0 || !targetSha) {
       return {
         supported: true,
@@ -2585,6 +2600,7 @@ async function checkUpdates() {
   }
 
   const fetched = await runGit(['fetch', '--quiet', target.remote, target.branch], { cwd: updateRoot })
+
   if (fetched.code !== 0) {
     return {
       supported: true,
@@ -2597,6 +2613,7 @@ async function checkUpdates() {
   }
 
   const git = args => runGit(args, { cwd: updateRoot }).then(r => r.stdout.trim())
+
   const [currentSha, targetSha, dirtyStr, shallowStr, mergeBaseStr] = await Promise.all([
     git(['rev-parse', 'HEAD']),
     git(['rev-parse', target.ref]),
@@ -2625,6 +2642,7 @@ async function checkUpdates() {
     isShallow,
     hasMergeBase
   })
+
   const commits = behind > 0 ? await readCommitLog(updateRoot, target.ref) : []
 
   return {
@@ -2644,6 +2662,7 @@ async function checkUpdates() {
 async function readCommitLog(cwd, targetRef) {
   const SEP = '\x1f'
   const REC = '\x1e'
+
   const { stdout } = await runGit(
     ['log', `HEAD..${targetRef}`, `--pretty=format:%H${SEP}%s${SEP}%an${SEP}%at${REC}`, '-n', '40'],
     { cwd }
@@ -10340,9 +10359,11 @@ async function interceptSessionRequestForRemote(request) {
   //    route there and KEEP the profile param so it opens the right state.db.
   const isPerSessionRequest = /^\/api\/sessions\/[^/]+(\/messages)?$/.test(pathname)
   const isBulkArchiveRequest = method === 'POST' && pathname === '/api/sessions/bulk-archive'
+
   if (isPerSessionRequest || isBulkArchiveRequest) {
     const bodyProfile = typeof request.body?.profile === 'string' ? request.body.profile : ''
     const profile = (searchParams.get('profile') || request.profile || bodyProfile || '').trim()
+
     if (!profile) {
       return undefined
     }
@@ -11631,11 +11652,13 @@ ipcMain.handle('hermes:updates:branch:set', async (_event, name) => {
   const branch = typeof name === 'string' && name.trim() ? name.trim() : DEFAULT_UPDATE_BRANCH
   const config = readDesktopUpdateConfig()
   writeDesktopUpdateConfig({ branch, remote: config.remote })
+
   return { branch, remote: config.remote }
 })
 
 ipcMain.handle('hermes:updates:remote:get', async () => {
   const config = readDesktopUpdateConfig()
+
   return { remote: config.remote }
 })
 
@@ -11643,6 +11666,7 @@ ipcMain.handle('hermes:updates:remote:set', async (_event, name) => {
   const remote = typeof name === 'string' && name.trim() ? name.trim() : null
   const config = readDesktopUpdateConfig()
   writeDesktopUpdateConfig({ branch: config.branch, remote })
+
   return { branch: config.branch, remote }
 })
 

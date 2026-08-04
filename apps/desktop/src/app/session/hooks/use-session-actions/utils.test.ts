@@ -777,6 +777,7 @@ describe('preserveLocalPendingTurnMessages', () => {
     'does not duplicate the optimistic %s turn when the persisted turn carries its directive',
     kind => {
       const ref = `@${kind}:X`
+
       const previous = [
         msg('1-user', 'user', 'first'),
         msg('2-assistant', 'assistant', 'first answer'),
@@ -815,6 +816,7 @@ describe('preserveLocalPendingTurnMessages', () => {
 
   it('does not duplicate a turn with multiple CRLF directives and Unicode payloads', () => {
     const refs = ['@file:`資料/über notes.md`', '@url:`https://example.com/café?q=✓`']
+
     const previous = [
       msg('1-user', 'user', 'first'),
       msg('2-assistant', 'assistant', 'first answer'),

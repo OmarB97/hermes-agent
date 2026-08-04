@@ -1540,16 +1540,13 @@ describe('createGatewayEventHandler', () => {
     const appended: Msg[] = []
     const onEvent = createGatewayEventHandler(buildCtx(appended))
 
-    turnController.hydrateTurnOutcomes(
-      { streaming: true, turn_id: 'live-turn' },
-      [
-        {
-          role: 'system',
-          text: 'turn:failed · provider/model · stored failure',
-          turn_outcome: { id: 'stored-turn' }
-        }
-      ]
-    )
+    turnController.hydrateTurnOutcomes({ streaming: true, turn_id: 'live-turn' }, [
+      {
+        role: 'system',
+        text: 'turn:failed · provider/model · stored failure',
+        turn_outcome: { id: 'stored-turn' }
+      }
+    ])
     patchUiState({ busy: true })
 
     onEvent({

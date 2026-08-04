@@ -523,12 +523,12 @@ export function SidebarSessionsSection({
         onToggleSelect={sectionKey ? handleToggleSelect : undefined}
         pinned={pinned}
         rows={flatRows}
-        showProfileTags={showProfileTags}
         sectionKey={sectionKey}
         selectable={selectable}
         selectedIds={selectedIdSet}
         selectedSessionIds={selection.ids}
         selectionActive={selectionActive}
+        showProfileTags={showProfileTags}
         sortable={sessionsDraggable}
         workingSessionIdSet={workingSessionIdSet}
       />
