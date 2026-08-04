@@ -11,8 +11,12 @@ import pytest
 from agent.auxiliary_client import (
     call_llm,
     async_call_llm,
+    resolve_provider_client,
+    _NOUS_MODEL,
+    _OPENROUTER_MODEL,
     _read_codex_access_token,
     _resolve_xai_oauth_for_aux,
+    _try_openrouter,
 )
 
 from tests.agent.auxiliary_client.conftest import (
@@ -498,7 +502,7 @@ class TestAuxiliaryPoolAwareness:
             client, model = _try_nous()
 
         assert client is not None
-        assert model == "google/gemini-3-flash-preview"
+        assert model == _NOUS_MODEL
         assert mock_openai.call_args.kwargs["api_key"] == pooled_token
         assert mock_openai.call_args.kwargs["base_url"] == "https://inference.pool.example/v1"
 
@@ -545,7 +549,7 @@ class TestAuxiliaryPoolAwareness:
 
         assert pool.refreshed is True
         assert client is not None
-        assert model == "google/gemini-3-flash-preview"
+        assert model == _NOUS_MODEL
         assert mock_openai.call_args.kwargs["api_key"] == fresh_token
         assert mock_openai.call_args.kwargs["base_url"] == "https://inference.pool.example/v1"
 
@@ -609,14 +613,14 @@ class TestAuxiliaryPoolAwareness:
         with (
             patch("agent.auxiliary_client._read_nous_auth", return_value={"access_token": "***"}),
             patch("agent.auxiliary_client._resolve_nous_runtime_api", return_value=("fresh-agent-key", fresh_base)),
-            patch("hermes_cli.models.get_nous_recommended_aux_model", return_value="google/gemini-3-flash-preview") as mock_rec,
+            patch("hermes_cli.models.get_nous_recommended_aux_model", return_value=_NOUS_MODEL) as mock_rec,
             patch("agent.auxiliary_client.OpenAI"),
         ):
             from agent.auxiliary_client import _try_nous
             client, model = _try_nous(vision=True)
 
         assert client is not None
-        assert model == "google/gemini-3-flash-preview"
+        assert model == _NOUS_MODEL
         assert mock_rec.call_args.kwargs["vision"] is True
 
     def test_try_nous_falls_back_when_recommendation_lookup_raises(self):
@@ -632,7 +636,7 @@ class TestAuxiliaryPoolAwareness:
             client, model = _try_nous()
 
         assert client is not None
-        assert model == "google/gemini-3-flash-preview"
+        assert model == _NOUS_MODEL
 
     def test_call_llm_retries_nous_after_401(self):
         class _Auth401(Exception):
@@ -1040,6 +1044,48 @@ class TestAuxiliaryAuthRefreshRetry:
         assert stale_client.chat.completions.create.await_count == 1
         assert fresh_client.chat.completions.create.await_count == 1
 
+    def test_refresh_provider_credentials_remints_vertex_token_and_evicts_cache(self):
+        """Vertex tokens live ~1h; on a long-running gateway the cached
+        auxiliary client's bearer token expires mid-session and 401s.
+        _refresh_provider_credentials("vertex") must re-mint the token via
+        the adapter (which refreshes in place when near expiry) and evict
+        the stale cached client so the next call rebuilds with a fresh one —
+        previously there was no "vertex" branch here at all, so this fell
+        through to the final `return False` and the stale client (and its
+        dead token) stayed cached until process restart."""
+        stale_client = MagicMock()
+        cache_key = ("vertex", False, None, None, None)
+
+        with (
+            patch("agent.auxiliary_client._client_cache", {cache_key: (stale_client, _NOUS_MODEL, None)}),
+            patch(
+                "agent.vertex_adapter.get_vertex_config",
+                return_value=("ya29.FRESH", "https://aiplatform.googleapis.com/v1beta1/projects/p/locations/global/endpoints/openapi"),
+            ) as mock_get_config,
+        ):
+            from agent.auxiliary_client import _refresh_provider_credentials
+
+            assert _refresh_provider_credentials("vertex") is True
+
+        mock_get_config.assert_called_once()
+        stale_client.close.assert_called_once()
+
+    def test_refresh_provider_credentials_vertex_returns_false_when_unminted(self):
+        """No usable token/base_url (e.g. ADC and the service-account file
+        both failed) — refresh must report failure, not silently evict and
+        pretend the client is fixed."""
+        with patch("agent.vertex_adapter.get_vertex_config", return_value=(None, None)):
+            from agent.auxiliary_client import _refresh_provider_credentials
+
+            assert _refresh_provider_credentials("vertex") is False
+
+    def test_resolve_provider_client_vertex_none_when_no_credentials(self):
+        with patch("agent.vertex_adapter.has_vertex_credentials", return_value=False):
+            client, model = resolve_provider_client("vertex", _NOUS_MODEL)
+
+        assert client is None
+        assert model is None
+
 
 class TestAuxiliaryPoolRotationRetry:
     def test_call_llm_rotates_explicit_codex_pool_on_429(self):
@@ -1285,9 +1331,9 @@ class TestAuxUnhealthyCache:
         nous_client.chat.completions.create.return_value = nous_resp
 
         with patch("agent.auxiliary_client._get_cached_client",
-                    return_value=(primary_client, "google/gemini-3-flash-preview")), \
+                    return_value=(primary_client, _NOUS_MODEL)), \
              patch("agent.auxiliary_client._resolve_task_provider_model",
-                    return_value=("auto", "google/gemini-3-flash-preview", None, None, None)), \
+                    return_value=("auto", _NOUS_MODEL, None, None, None)), \
              patch("agent.auxiliary_client._try_payment_fallback",
                     return_value=(nous_client, "n-model", "nous")), \
              patch("agent.auxiliary_client._build_call_kwargs",
@@ -1472,6 +1518,8 @@ class TestAuxiliaryClientPoisonedCacheEviction:
             ), patch(
                 "agent.auxiliary_client._try_payment_fallback",
                 return_value=(None, None, ""),
+            ), patch(
+                "agent.auxiliary_client._TRANSIENT_RETRY_BACKOFF_BASE", 0.0
             ):
                 with pytest.raises(ConnectionError):
                     call_llm(
@@ -1518,3 +1566,90 @@ class TestAuxiliaryClientPoisonedCacheEviction:
         finally:
             with _client_cache_lock:
                 _client_cache.clear()
+
+
+class TestOpenRouterPaidLaneGuard:
+    """Issue #75803: auxiliary auto-chain OpenRouter fallback must be
+    configurable and never silently engage a PAID model."""
+
+    def test_free_only_skips_paid_default_model(self, monkeypatch):
+        """free_only=true + default (paid) model → OpenRouter skipped."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
+             patch("hermes_cli.config.load_config_readonly", return_value={"auxiliary": {"free_only": True}}), \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            client, model = _try_openrouter()
+        assert client is None
+        assert model is None
+        mock_openai.assert_not_called()
+
+    def test_free_only_allows_free_model(self, monkeypatch):
+        """free_only=true + :free model → OpenRouter used with that model."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
+             patch("hermes_cli.config.load_config_readonly",
+                   return_value={"auxiliary": {"free_only": True,
+                                              "openrouter_model": "nvidia/nemotron-3-ultra-550b-a55b:free"}}), \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_client = MagicMock(name="openrouter_client")
+            mock_openai.return_value = mock_client
+            client, model = _try_openrouter()
+        assert client is mock_client
+        assert model == "nvidia/nemotron-3-ultra-550b-a55b:free"
+
+    def test_configured_model_overrides_hardcoded_default(self, monkeypatch):
+        """auxiliary.openrouter_model replaces _OPENROUTER_MODEL."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
+             patch("hermes_cli.config.load_config_readonly",
+                   return_value={"auxiliary": {"openrouter_model": "some/vendor-model"}}), \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_client = MagicMock(name="openrouter_client")
+            mock_openai.return_value = mock_client
+            client, model = _try_openrouter()
+        assert client is mock_client
+        assert model == "some/vendor-model"
+
+    def test_explicit_caller_model_respects_free_only(self, monkeypatch):
+        """Auxiliary.<task>.model (explicit) is also gated by free_only."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
+             patch("hermes_cli.config.load_config_readonly", return_value={"auxiliary": {"free_only": True}}), \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            client, model = _try_openrouter(model="google/gemini-3.6-flash")
+        assert client is None
+        assert model is None
+        mock_openai.assert_not_called()
+
+    def test_paid_lane_warns_once(self, monkeypatch, caplog):
+        """Engaging the default paid model logs a WARNING (once per model)."""
+        import logging
+        from agent.auxiliary_client import _paid_lane_warned
+        _paid_lane_warned.discard(_OPENROUTER_MODEL)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
+             patch("hermes_cli.config.load_config_readonly", return_value={"auxiliary": {}}), \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_client = MagicMock(name="openrouter_client")
+            mock_openai.return_value = mock_client
+            with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+                client, model = _try_openrouter()
+        assert client is mock_client
+        assert model == _OPENROUTER_MODEL
+        assert any("PAID lane engaged" in r.getMessage() for r in caplog.records)
+        # Second call logs nothing new.
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
+             patch("hermes_cli.config.load_config_readonly", return_value={"auxiliary": {}}), \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+                _try_openrouter()
+        assert not any("PAID lane engaged" in r.getMessage() for r in caplog.records)
+        _paid_lane_warned.discard(_OPENROUTER_MODEL)
+
+    def test_is_free_model(self):
+        from agent.auxiliary_client import _is_free_model
+        assert _is_free_model("nvidia/nemotron-3-ultra-550b-a55b:free")
+        assert not _is_free_model("google/gemini-3.6-flash")
+        assert not _is_free_model("")
+        assert not _is_free_model(None)

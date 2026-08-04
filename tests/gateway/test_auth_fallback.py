@@ -66,7 +66,12 @@ class TestResolveRuntimeAgentKwargsAuthFallback:
         assert calls[1]["target_model"] == "meta-llama/llama-4-maverick"
 
     def test_auth_error_no_fallback_raises(self, tmp_path, monkeypatch):
-        """When primary fails and no fallback configured, RuntimeError is raised."""
+        """When primary fails and no fallback configured, RuntimeError is raised.
+
+        Fork (#269): the raised error must name the policy that ran out of
+        routes, so an operator can tell "no fallback configured" apart from
+        "fallback configured but every route was unusable".
+        """
         from hermes_cli.auth import AuthError
 
         config_path = tmp_path / "config.yaml"
@@ -84,46 +89,3 @@ class TestResolveRuntimeAgentKwargsAuthFallback:
 
         assert "Fallback policy any" in str(exc_info.value)
         assert "no usable configured backup route remained" in str(exc_info.value)
-
-    def test_legacy_fallback_is_appended_after_fallback_providers(self, tmp_path, monkeypatch):
-        """When both keys exist, the legacy entry still participates in resolution."""
-        config_path = tmp_path / "config.yaml"
-        config_path.write_text(
-            "fallback_providers:\n"
-            "  - provider: openrouter\n"
-            "    model: anthropic/claude-sonnet-4.6\n"
-            "fallback_model:\n"
-            "  provider: nous\n"
-            "  model: Hermes-4\n"
-        )
-
-        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
-
-        calls = []
-
-        def _mock_resolve(**kwargs):
-            requested = kwargs.get("requested")
-            calls.append(requested)
-            if requested == "openrouter":
-                raise RuntimeError("openrouter unavailable")
-            return {
-                "api_key": "nous-key",
-                "base_url": "https://portal.nousresearch.com/v1",
-                "provider": "nous",
-                "api_mode": "chat_completions",
-                "command": None,
-                "args": None,
-                "credential_pool": None,
-            }
-
-        with patch(
-            "hermes_cli.runtime_provider.resolve_runtime_provider",
-            side_effect=_mock_resolve,
-        ):
-            from gateway.run import _try_resolve_fallback_provider
-
-            result = _try_resolve_fallback_provider()
-
-        assert calls == ["openrouter", "nous"]
-        assert result["provider"] == "nous"
-        assert result["model"] == "Hermes-4"

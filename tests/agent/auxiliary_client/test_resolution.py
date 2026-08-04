@@ -8,6 +8,7 @@ from unittest.mock import patch, MagicMock
 import pytest
 
 from agent.auxiliary_client import (
+    _NOUS_MODEL,
     get_text_auxiliary_client,
     get_available_vision_backends,
     resolve_vision_provider_client,
@@ -189,6 +190,103 @@ class TestResolveTaskProviderModel:
         assert resolved_provider == "custom"
         assert base_url == "https://explicit.example/v1"
         assert api_key == "explicit-key"
+
+    def test_explicit_provider_moa_unwraps_to_aggregator(self, monkeypatch):
+        """An *explicit* `provider="moa"` arg (e.g. a per-task model override
+        naming a MoA preset) must resolve to the preset's aggregator, not the
+        literal "moa" string — mirrors #53827's fix for the implicit
+        "main provider is moa" case in _resolve_auto(), which this function
+        never went through."""
+        preset = {
+            "aggregator": {"provider": "openrouter", "model": "anthropic/claude-opus-4.8"},
+        }
+        monkeypatch.setattr("agent.auxiliary_client._get_auxiliary_task_config", lambda task: {})
+        monkeypatch.setattr(
+            "hermes_cli.moa_config.resolve_moa_preset",
+            lambda cfg, name: preset,
+        )
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"moa": {}})
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"moa": {}})
+
+        resolved_provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(
+            task="title_generation",
+            provider="moa",
+            model="opus-gpt",
+            base_url="moa://local",
+            api_key="moa-virtual-provider",
+        )
+
+        assert resolved_provider == "openrouter"
+        assert model == "anthropic/claude-opus-4.8"
+        # The virtual moa:// endpoint must not be forwarded to the aggregator.
+        assert base_url is None
+        assert api_key is None
+
+    def test_config_provider_moa_unwraps_to_aggregator(self, monkeypatch):
+        """`auxiliary.<task>.provider: moa` in config.yaml — the same crash,
+        reached via the config path instead of an explicit call-time arg.
+        Before the fix this returned ("moa", ...) verbatim, and
+        resolve_provider_client() would then look up "moa" in
+        PROVIDER_REGISTRY (which has no such entry, it's not a real HTTP
+        provider), fail, and surface a "MOA_API_KEY environment variable"
+        error for a provider that was never meant to be reached over the wire."""
+        preset = {
+            "aggregator": {"provider": "anthropic", "model": "claude-opus-4.8"},
+        }
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda task: {"provider": "moa", "model": "opus-gpt"} if task == "title_generation" else {},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.moa_config.resolve_moa_preset",
+            lambda cfg, name: preset,
+        )
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"moa": {}})
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"moa": {}})
+
+        resolved_provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(
+            task="title_generation",
+        )
+
+        assert resolved_provider == "anthropic"
+        assert model == "claude-opus-4.8"
+        assert base_url is None
+        assert api_key is None
+
+    def test_provider_moa_falls_back_to_literal_when_preset_resolution_fails(self, monkeypatch):
+        """If the MoA preset can't be resolved (e.g. renamed/deleted), the
+        function must not raise — it degrades to the pre-fix behavior
+        (literal "moa") rather than crash resolve_provider_client() harder."""
+        monkeypatch.setattr("agent.auxiliary_client._get_auxiliary_task_config", lambda task: {})
+        monkeypatch.setattr(
+            "hermes_cli.moa_config.resolve_moa_preset",
+            lambda cfg, name: (_ for _ in ()).throw(KeyError("gone-preset")),
+        )
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"moa": {}})
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"moa": {}})
+
+        resolved_provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(
+            task="title_generation",
+            provider="moa",
+            model="gone-preset",
+        )
+
+        assert resolved_provider == "moa"
+        assert model == "gone-preset"
+
+    def test_explicit_model_auto_sentinel_is_normalized(self):
+        """MoA slots (agent/moa_loop.py's _slot_runtime) forward a preset's
+        `model:` field as the explicit `model` kwarg here, not through
+        auxiliary.<task> config. Only cfg_model was normalized before, so a
+        MoA reference/aggregator slot configured with `model: auto` sent the
+        literal string "auto" to the wire as a model id."""
+        resolved_provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(
+            provider="anthropic",
+            model="auto",
+        )
+
+        assert resolved_provider == "anthropic"
+        assert model is None
 
 
 class TestNormalizeAuxProvider:
@@ -624,7 +722,10 @@ class TestVisionClientFallback:
         real_client = SimpleNamespace(messages=messages_api)
         captured_kwargs = {}
 
-        def fake_create_anthropic_message(_client, kwargs):
+        def fake_create_anthropic_message(_client, kwargs, **_options):
+            # ``**_options`` absorbs transport-level extras the aux client now
+            # forwards (on_stream_event, ...); this test is about the resolved
+            # max_tokens, not the call's option surface.
             captured_kwargs.update(kwargs)
             return final_message
 
@@ -706,7 +807,7 @@ class TestVisionAutoSkipsKimiCoding:
 
         def fake_strict(provider, model=None):
             if provider == "openrouter":
-                return fake_or_client, "google/gemini-3-flash-preview"
+                return fake_or_client, _NOUS_MODEL
             if provider == "nous":
                 return None, None
             raise AssertionError(
@@ -721,7 +822,7 @@ class TestVisionAutoSkipsKimiCoding:
         provider, client, model = resolve_vision_provider_client()
         assert provider == "openrouter"
         assert client is fake_or_client
-        assert model == "google/gemini-3-flash-preview"
+        assert model == _NOUS_MODEL
 
     def test_kimi_coding_cn_skipped_too(self, monkeypatch):
         """Same skip applies to the CN variant."""
@@ -981,7 +1082,7 @@ class TestCustomEndpointApiKeyInheritance:
             captured.update(kwargs)
             return MagicMock()
 
-        with patch("hermes_cli.config.load_config", return_value=fake_config), \
+        with patch("hermes_cli.config.load_config", return_value=fake_config), patch("hermes_cli.config.load_config_readonly", return_value=fake_config), \
              patch.object(ac, "_create_openai_client", side_effect=_capture_create):
             client, model = resolve_provider_client(
                 "custom",
@@ -1009,7 +1110,7 @@ class TestCustomEndpointApiKeyInheritance:
             captured.update(kwargs)
             return MagicMock()
 
-        with patch("hermes_cli.config.load_config", return_value=fake_config), \
+        with patch("hermes_cli.config.load_config", return_value=fake_config), patch("hermes_cli.config.load_config_readonly", return_value=fake_config), \
              patch.object(ac, "_create_openai_client", side_effect=_capture_create):
             client, model = resolve_provider_client(
                 "custom",
@@ -1034,7 +1135,7 @@ class TestCustomEndpointApiKeyInheritance:
             captured.update(kwargs)
             return MagicMock()
 
-        with patch("hermes_cli.config.load_config", return_value=fake_config), \
+        with patch("hermes_cli.config.load_config", return_value=fake_config), patch("hermes_cli.config.load_config_readonly", return_value=fake_config), \
              patch.object(ac, "_create_openai_client", side_effect=_capture_create):
             client, model = resolve_provider_client(
                 "custom",
@@ -1060,7 +1161,7 @@ class TestCustomEndpointApiKeyInheritance:
 
         with patch.object(ac, "_RUNTIME_MAIN_API_KEY", "sk-runtime-key"), \
              patch.object(ac, "_RUNTIME_MAIN_BASE_URL", "https://gw.example.com/v1"), \
-             patch("hermes_cli.config.load_config", return_value={"model": {}}), \
+             patch("hermes_cli.config.load_config", return_value={"model": {}}), patch("hermes_cli.config.load_config_readonly", return_value={"model": {}}), \
              patch.object(ac, "_create_openai_client", side_effect=_capture_create):
             client, model = resolve_provider_client(
                 "custom",
@@ -1092,7 +1193,7 @@ class TestCustomEndpointApiKeyInheritance:
             captured.update(kwargs)
             return MagicMock()
 
-        with patch("hermes_cli.config.load_config", return_value=fake_config), \
+        with patch("hermes_cli.config.load_config", return_value=fake_config), patch("hermes_cli.config.load_config_readonly", return_value=fake_config), \
              patch.object(ac, "_create_openai_client", side_effect=_capture_create):
             client, model = resolve_provider_client(
                 "custom",
@@ -1117,7 +1218,7 @@ class TestCustomEndpointApiKeyInheritance:
             captured.update(kwargs)
             return MagicMock()
 
-        with patch("hermes_cli.config.load_config", return_value=fake_config), \
+        with patch("hermes_cli.config.load_config", return_value=fake_config), patch("hermes_cli.config.load_config_readonly", return_value=fake_config), \
              patch.object(ac, "_create_openai_client", side_effect=_capture_create):
             client, model = resolve_provider_client(
                 "custom",
@@ -1127,3 +1228,97 @@ class TestCustomEndpointApiKeyInheritance:
             )
 
         assert captured.get("api_key") == "no-key-required"
+
+
+class TestMoaAggregatorSharedResolution:
+    """The shared MoA→aggregator helper and the layers that consume it.
+
+    Real-config tests: write an actual config.yaml under a temp HERMES_HOME
+    and exercise the genuine load_config() → resolve_moa_preset() boundary —
+    no mocking of the configuration-resolution chain.
+    """
+
+    @staticmethod
+    def _write_moa_config(tmp_path, monkeypatch, default_preset="opus-gpt"):
+        import yaml
+
+        home = tmp_path / ".hermes"
+        home.mkdir(exist_ok=True)
+        (home / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "moa": {
+                        "default_preset": default_preset,
+                        "presets": {
+                            "opus-gpt": {
+                                "enabled": True,
+                                "reference_models": [
+                                    {"provider": "openrouter", "model": "openai/gpt-5.5"}
+                                ],
+                                "aggregator": {
+                                    "provider": "openrouter",
+                                    "model": "anthropic/claude-opus-4.8",
+                                },
+                            },
+                            "nous-mix": {
+                                "enabled": True,
+                                "reference_models": [
+                                    {"provider": "nous", "model": "hermes-4-70b"}
+                                ],
+                                "aggregator": {
+                                    "provider": "nous",
+                                    "model": "hermes-4-405b",
+                                },
+                            },
+                        },
+                    }
+                }
+            )
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        return home
+
+    def test_real_config_explicit_task_provider_moa(self, tmp_path, monkeypatch):
+        """auxiliary.<task>.provider: moa in a REAL config.yaml resolves to the
+        aggregator through the genuine load_config()/resolve_moa_preset() path."""
+        import yaml
+
+        home = self._write_moa_config(tmp_path, monkeypatch)
+        cfg = yaml.safe_load((home / "config.yaml").read_text())
+        cfg["auxiliary"] = {"title_generation": {"provider": "moa", "model": "opus-gpt"}}
+        (home / "config.yaml").write_text(yaml.safe_dump(cfg))
+
+        resolved_provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(
+            task="title_generation",
+        )
+
+        assert resolved_provider == "openrouter"
+        assert model == "anthropic/claude-opus-4.8"
+        assert base_url is None
+        assert api_key is None
+
+
+
+
+
+
+    def test_main_agent_fallback_uses_aggregator_for_moa_main(self, tmp_path, monkeypatch):
+        """_try_main_agent_model_fallback with a moa main resolves the
+        aggregator instead of asking for a literal "moa" client."""
+        from agent.auxiliary_client import _try_main_agent_model_fallback
+
+        self._write_moa_config(tmp_path, monkeypatch)
+        with patch("agent.auxiliary_client._read_main_provider", return_value="moa"), \
+             patch("agent.auxiliary_client._read_main_model", return_value="opus-gpt"), \
+             patch("agent.auxiliary_client._is_provider_unhealthy", return_value=False), \
+             patch("agent.auxiliary_client.resolve_provider_client") as mock_resolve:
+            mock_client = MagicMock()
+            mock_resolve.return_value = (mock_client, "anthropic/claude-opus-4.8")
+
+            client, model, label = _try_main_agent_model_fallback("anthropic", task="compression")
+
+        assert client is mock_client
+        assert model == "anthropic/claude-opus-4.8"
+        assert label == "main-agent(openrouter)"
+        assert mock_resolve.call_args.kwargs["provider"] == "openrouter"
+        assert mock_resolve.call_args.kwargs["model"] == "anthropic/claude-opus-4.8"

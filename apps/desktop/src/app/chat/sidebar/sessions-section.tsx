@@ -10,7 +10,10 @@ import { DisclosureCaret } from '@/components/ui/disclosure-caret'
 import { SidebarGroup, SidebarGroupContent } from '@/components/ui/sidebar'
 import type { HermesGitWorktree } from '@/global'
 import type { SessionInfo } from '@/hermes'
+import { useI18n } from '@/i18n'
 import { flattenSessionsWithBranches } from '@/lib/session-branch-tree'
+import { groupEntriesByRecency, type SidebarListRow, toSessionRows } from '@/lib/session-date-groups'
+import { sessionBucketLabel } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { sessionPinId } from '@/store/session'
 import {
@@ -21,7 +24,7 @@ import {
   toggleSessionSelected
 } from '@/store/sidebar-selection'
 
-import { SidebarCount } from './chrome'
+import { SidebarDateDivider, SidebarSectionMeta } from './chrome'
 import {
   EnteredProjectContent,
   ProjectOverviewRow,
@@ -63,7 +66,7 @@ function SidebarSectionHeader({
     <>
       {icon}
       <SidebarPanelLabel>{label}</SidebarPanelLabel>
-      {meta && <SidebarCount>{meta}</SidebarCount>}
+      {meta && <SidebarSectionMeta>{meta}</SidebarSectionMeta>}
     </>
   )
 
@@ -71,7 +74,9 @@ function SidebarSectionHeader({
     <div className="group/section flex shrink-0 items-center justify-between gap-1 pb-1 pt-1.5">
       {collapsible ? (
         <button
-          className="group/section-label flex w-fit items-center gap-1 bg-transparent text-left leading-none"
+          // min-w-0 lets the label truncate at narrow sidebar widths instead of
+          // pushing the header's trailing action icons out of view.
+          className="group/section-label flex w-fit min-w-0 items-center gap-1 bg-transparent text-left leading-none"
           onClick={onToggle}
           type="button"
         >
@@ -82,7 +87,7 @@ function SidebarSectionHeader({
           />
         </button>
       ) : (
-        <div className="flex w-fit items-center gap-1 leading-none">{labelBody}</div>
+        <div className="flex w-fit min-w-0 items-center gap-1 leading-none">{labelBody}</div>
       )}
       {action}
     </div>
@@ -169,6 +174,11 @@ interface SidebarSessionsSectionProps {
   dropActive?: boolean
   /** Native session-drag drop target handlers, spread onto the section frame. */
   dropHandlers?: Pick<React.DOMAttributes<HTMLDivElement>, 'onDragEnter' | 'onDragLeave' | 'onDragOver' | 'onDrop'>
+  // Insert "Yesterday" / "Last week" date dividers into the chronological
+  // session list (flat recents + entered-project lanes). Off for hand-ordered
+  // lists, pinned, messaging groups, and the project overview, where the order
+  // isn't strictly by recency so a date bucket would be misleading.
+  dateGrouped?: boolean
 }
 
 export function SidebarSessionsSection({
@@ -223,13 +233,16 @@ export function SidebarSessionsSection({
   onSessionDragEnd,
   onSessionDragStart,
   dropActive = false,
-  dropHandlers
+  dropHandlers,
+  dateGrouped = false
 }: SidebarSessionsSectionProps) {
   const { isOver: sharedDropActive, setNodeRef: setSharedDropRef } = useDroppable({
     disabled: !sharedSessionDnd || !sessionDndId,
     id: sessionDndId ?? `disabled:${label}`
   })
 
+  const { t } = useI18n()
+  const dividerLabels = t.sidebar.dateDivider
   const sectionOpen = collapsible ? open : true
   const selection = useStore($sidebarSelection)
   const selectable = Boolean(sectionKey)
@@ -238,22 +251,35 @@ export function SidebarSessionsSection({
   // A defined project list is itself content (even an empty project should
   // render as a drill-in row so the user can see it exists).
   const hasProjectOverview = Boolean(projectOverview?.length)
-  const hasProjectContent = Boolean(projectContent && projectContent.sessionCount > 0)
+
+  // Lanes count as content even with no rows left in them: the backend only
+  // emits a lane that has sessions, so a lane surviving with zero rows means
+  // they were filtered out (pinned) — the branch is real and must still render.
+  // A genuinely empty project has no lanes at all and keeps its empty state.
+  const hasProjectContent = Boolean(
+    projectContent && (projectContent.sessionCount > 0 || projectContent.repos.some(repo => repo.groups.length > 0))
+  )
 
   const showEmptyState =
     forceEmptyState || (!hasGroupedSessions && !hasProjectOverview && !hasProjectContent && sessions.length === 0)
 
   // The flat recents/pinned list is the only place sessions reorder by hand;
-  // grouped/tree views always sort by creation date and never drag.
-  const preservesRootOrder = sortable && (sharedSessionDnd || !!onReorderSessions)
-  const sessionsDraggable = preservesRootOrder && !selectionActive
-  // Pinned and flat Sessions already arrive in their authoritative persisted
-  // order. Branch flattening may nest children, but it must not silently sort
-  // the top-level rows by last_active and undo a successful manual drop.
+  // grouped/tree views always sort by creation date and never drag. Under the
+  // shared Pinned+Sessions DndContext the lane is draggable without owning an
+  // `onReorderSessions` of its own.
+  const handOrdered = sortable && (sharedSessionDnd || !!onReorderSessions)
+  const sessionsDraggable = handOrdered && !selectionActive
+  // Pinned and hand-dragged Sessions already arrive in their authoritative
+  // persisted order. Branch flattening may nest children, but it must not
+  // silently sort the top-level rows by last_active and undo a manual drop —
+  // for pins that let a finishing turn float background tasks over the user's
+  // fixed ranking. A date-grouped list is the exception: its dividers are only
+  // truthful when the roots really are in recency order.
+  const preserveInputOrder = pinned || (handOrdered && !dateGrouped)
 
   const displayEntries = useMemo(
-    () => flattenSessionsWithBranches(sessions, { preserveRootOrder: preservesRootOrder }),
-    [preservesRootOrder, sessions]
+    () => flattenSessionsWithBranches(sessions, { preserveOrder: preserveInputOrder }),
+    [preserveInputOrder, sessions]
   )
 
   const orderedIds = useMemo(() => displayEntries.map(entry => entry.session.id), [displayEntries])
@@ -287,45 +313,103 @@ export function SidebarSessionsSection({
     [activeSessionId, orderedIds, sectionKey]
   )
 
-  const renderRow = (session: SessionInfo, draggable: boolean, branchStem?: string) => {
-    const checked = selectedIdSet?.has(session.id) ?? false
+  const renderRow = useCallback(
+    (session: SessionInfo, draggable: boolean, branchStem?: string) => {
+      const checked = selectedIdSet?.has(session.id) ?? false
 
-    const rowProps = {
-      bulkSelectedSessionIds: checked && selection.ids.length > 1 ? selection.ids : undefined,
-      branchStem,
-      checked,
-      isPinned: pinned,
-      isSelected: session.id === activeSessionId,
-      isWorking: workingSessionIdSet.has(session.id),
-      dragging: session.id === draggingSessionId,
-      onArchive: () => onArchiveSession(session.id),
-      onArchiveSelectedSessions: onArchiveSessions,
-      onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
-      onDelete: () => onDeleteSession(session.id),
-      onDeleteSelectedSessions: onDeleteSessions,
-      onHaltSelectedSessions: onHaltSessions,
-      onPin: () => onTogglePin(sessionPinId(session)),
-      onPromptSelectedSessions: onPromptSessions,
-      onResume: () => onResumeSession(session.id),
-      onSteerSelectedSessions: onSteerSessions,
-      onToggleSelect: sectionKey ? (mode: 'range' | 'single') => handleToggleSelect(session.id, mode) : undefined,
-      reorderable: draggable && !branchStem,
-      session,
+      const rowProps = {
+        bulkSelectedSessionIds: checked && selection.ids.length > 1 ? selection.ids : undefined,
+        branchStem,
+        checked,
+        isPinned: pinned,
+        isSelected: session.id === activeSessionId,
+        isWorking: workingSessionIdSet.has(session.id),
+        dragging: session.id === draggingSessionId,
+        onArchive: () => onArchiveSession(session.id),
+        onArchiveSelectedSessions: onArchiveSessions,
+        onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
+        onDelete: () => onDeleteSession(session.id),
+        onDeleteSelectedSessions: onDeleteSessions,
+        onHaltSelectedSessions: onHaltSessions,
+        onPin: () => onTogglePin(sessionPinId(session)),
+        onPromptSelectedSessions: onPromptSessions,
+        onResume: () => onResumeSession(session.id),
+        onSteerSelectedSessions: onSteerSessions,
+        onToggleSelect: sectionKey ? (mode: 'range' | 'single') => handleToggleSelect(session.id, mode) : undefined,
+        reorderable: draggable && !branchStem,
+        session,
+        selectable,
+        selectionActive,
+        showProfile: showProfileTags
+      }
+
+      return draggable && !branchStem ? (
+        <SortableSidebarSessionRow key={session.id} previewOwnsLayout={Boolean(sharedSessionDnd)} {...rowProps} />
+      ) : (
+        <SidebarSessionRow key={session.id} {...rowProps} />
+      )
+    },
+    [
+      activeSessionId,
+      draggingSessionId,
+      handleToggleSelect,
+      onArchiveSession,
+      onArchiveSessions,
+      onBranchSession,
+      onDeleteSession,
+      onDeleteSessions,
+      onHaltSessions,
+      onPromptSessions,
+      onResumeSession,
+      onSteerSessions,
+      onTogglePin,
+      pinned,
+      sectionKey,
       selectable,
+      selectedIdSet,
+      selection.ids,
       selectionActive,
-      showProfile: showProfileTags
-    }
+      sharedSessionDnd,
+      showProfileTags,
+      workingSessionIdSet
+    ]
+  )
 
-    return draggable && !branchStem ? (
-      <SortableSidebarSessionRow key={session.id} previewOwnsLayout={Boolean(sharedSessionDnd)} {...rowProps} />
-    ) : (
-      <SidebarSessionRow key={session.id} {...rowProps} />
-    )
-  }
+  // A single flat/virtual/lane list row — either a date divider or a session.
+  const renderListRow = useCallback(
+    (row: SidebarListRow, draggable: boolean) =>
+      row.kind === 'divider' ? (
+        <SidebarDateDivider key={row.key} label={sessionBucketLabel(row.bucket, dividerLabels)} />
+      ) : (
+        renderRow(row.entry.session, draggable, row.entry.branchStem)
+      ),
+    [dividerLabels, renderRow]
+  )
 
   // Sessions inside repos/worktrees are date-ordered and static.
-  const renderRows = (items: SessionInfo[]) =>
-    flattenSessionsWithBranches(items).map(({ branchStem, session }) => renderRow(session, false, branchStem))
+  const renderRows = useCallback(
+    (items: SessionInfo[]) =>
+      flattenSessionsWithBranches(items).map(({ branchStem, session }) => renderRow(session, false, branchStem)),
+    [renderRow]
+  )
+
+  // Same as `renderRows`, but with date dividers folded in — used for
+  // entered-project lanes so a lane spanning multiple days reads
+  // chronologically, matching the flat recents list.
+  const renderRowsDated = useCallback(
+    (items: SessionInfo[]) => {
+      const entries = flattenSessionsWithBranches(items)
+
+      return (dateGrouped ? groupEntriesByRecency(entries) : toSessionRows(entries)).map(row => renderListRow(row, false))
+    },
+    [dateGrouped, renderListRow]
+  )
+
+  // Flat recents as list rows: grouped by recency when enabled, plain otherwise.
+  const flatRows: SidebarListRow[] = useMemo(
+    () => (dateGrouped ? groupEntriesByRecency(displayEntries) : toSessionRows(displayEntries)),
+    [dateGrouped, displayEntries]
+  )
 
   const flatVirtualized =
     !disableVirtualization &&
@@ -359,7 +443,7 @@ export function SidebarSessionsSection({
             onNewSession={onNewSessionInWorkspace}
             project={projectContent}
             removedSessionIds={removedSessionIds}
-            renderRows={renderRows}
+            renderRows={renderRowsDated}
             repoWorktrees={projectRepoWorktrees}
           />
         ) : (
@@ -370,36 +454,45 @@ export function SidebarSessionsSection({
   } else if (showEmptyState) {
     inner = emptyState
   } else if (projectOverview?.length) {
-    // The model is already ordered (default sort groups explicit-before-auto;
-    // a manual drag-order, when present, wins). Render in that order and make
-    // rows drag-to-reorder when a handler is wired.
-    const projectsDraggable = projectOverview.length > 1 && !!onReorderProjects
+    // The model is already ordered (Home leads; then the default sort groups
+    // explicit-before-auto, with a manual drag-order winning when present).
+    // Render in that order and make rows drag-to-reorder when a handler is
+    // wired — Home stays outside the sortable list, it's a fixture.
+    const home = projectOverview[0]?.isNoProject ? projectOverview[0] : undefined
+    const sortableProjects = home ? projectOverview.slice(1) : projectOverview
+    const projectsDraggable = sortableProjects.length > 1 && !!onReorderProjects
     const Row = projectsDraggable ? SortableProjectOverviewRow : ProjectOverviewRow
 
-    const rows = projectOverview.map(project => (
-      <Row
+    const projectRow = (project: SidebarProjectTree, Component: typeof ProjectOverviewRow) => (
+      <Component
         activeProjectId={activeProjectId}
         key={project.id}
         onEnter={onEnterProject}
         onNewSession={onNewSessionInWorkspace}
-        previewSessions={project.path ? projectOverviewPreviews?.[project.path] : undefined}
+        previewSessions={projectOverviewPreviews?.[project.id]}
         project={project}
         renderRows={renderRows}
       />
-    ))
+    )
 
-    inner =
-      projectsDraggable && onReorderProjects ? (
-        <ReorderableList
-          ids={projectOverview.map(project => project.id)}
-          onReorder={onReorderProjects}
-          sensors={dndSensors}
-        >
-          {rows}
-        </ReorderableList>
-      ) : (
-        rows
-      )
+    const rows = sortableProjects.map(project => projectRow(project, Row))
+
+    inner = (
+      <>
+        {home && projectRow(home, ProjectOverviewRow)}
+        {projectsDraggable && onReorderProjects ? (
+          <ReorderableList
+            ids={sortableProjects.map(project => project.id)}
+            onReorder={onReorderProjects}
+            sensors={dndSensors}
+          >
+            {rows}
+          </ReorderableList>
+        ) : (
+          rows
+        )}
+      </>
+    )
   } else if (groups?.length) {
     // Profile/source groups never reorder; render them flat with static rows.
     inner = groups.map(group => (
@@ -415,7 +508,6 @@ export function SidebarSessionsSection({
       <VirtualSessionList
         activeSessionId={activeSessionId}
         className={contentClassName}
-        entries={displayEntries}
         onArchiveSession={onArchiveSession}
         onArchiveSessions={onArchiveSessions}
         onBranchSession={onBranchSession}
@@ -430,6 +522,7 @@ export function SidebarSessionsSection({
         onTogglePin={onTogglePin}
         onToggleSelect={sectionKey ? handleToggleSelect : undefined}
         pinned={pinned}
+        rows={flatRows}
         showProfileTags={showProfileTags}
         sectionKey={sectionKey}
         selectable={selectable}
@@ -456,17 +549,17 @@ export function SidebarSessionsSection({
   } else if (sharedSessionDnd && sessionsDraggable) {
     inner = (
       <SortableContext items={sessions.map(s => s.id)} strategy={verticalListSortingStrategy}>
-        {displayEntries.map(({ branchStem, session }) => renderRow(session, true, branchStem))}
+        {flatRows.map(row => renderListRow(row, true))}
       </SortableContext>
     )
   } else if (sessionsDraggable && onReorderSessions) {
     inner = (
       <ReorderableList ids={sessions.map(s => s.id)} onReorder={onReorderSessions} sensors={dndSensors}>
-        {displayEntries.map(({ branchStem, session }) => renderRow(session, true, branchStem))}
+        {flatRows.map(row => renderListRow(row, true))}
       </ReorderableList>
     )
   } else {
-    inner = displayEntries.map(({ branchStem, session }) => renderRow(session, false, branchStem))
+    inner = flatRows.map(row => renderListRow(row, false))
   }
 
   // The virtualizer owns its own scroller, so suppress the wrapper's overflow

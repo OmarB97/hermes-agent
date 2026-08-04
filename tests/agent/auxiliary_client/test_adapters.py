@@ -8,7 +8,9 @@ from unittest.mock import patch, MagicMock, AsyncMock
 import pytest
 
 from agent.auxiliary_client import (
+    call_llm,
     async_call_llm,
+    CodexAuxiliaryClient,
     _build_call_kwargs,
     _CodexCompletionsAdapter,
 )
@@ -470,7 +472,7 @@ class TestCodexAdapterPromptCacheKey:
     """
 
     @staticmethod
-    def _build_adapter(base_url="https://chatgpt.com/backend-api/codex"):
+    def _build_adapter(base_url="https://chatgpt.com/backend-api/codex", model="gpt-5.5"):
         from agent.auxiliary_client import _CodexCompletionsAdapter
         from types import SimpleNamespace
 
@@ -503,7 +505,7 @@ class TestCodexAdapterPromptCacheKey:
         real_client = MagicMock()
         real_client.base_url = base_url
         real_client.responses.create = _create
-        adapter = _CodexCompletionsAdapter(real_client, "gpt-5.5")
+        adapter = _CodexCompletionsAdapter(real_client, model)
         return adapter, captured_kwargs
 
     def test_cache_key_set_and_prefixed(self):
@@ -555,6 +557,58 @@ class TestCodexAdapterPromptCacheKey:
             {"role": "user", "content": "hi"},
         ])
         assert "prompt_cache_key" not in captured
+
+    @pytest.mark.parametrize("model", [
+        "gpt-4.1",
+        "gpt-5.1-codex-max",
+        "openai.gpt-5.5-pro",
+    ])
+    def test_extended_cache_models_set_prompt_cache_retention(self, model):
+        adapter, captured = self._build_adapter(
+            base_url="https://bedrock-mantle.us-west-2.api.aws/v1",
+            model=model,
+        )
+        adapter.create(messages=[
+            {"role": "system", "content": "SYS"},
+            {"role": "user", "content": "hi"},
+        ])
+        assert captured["prompt_cache_retention"] == "24h"
+
+    def test_prompt_cache_retention_skipped_for_codex_backend(self):
+        adapter, captured = self._build_adapter()
+        adapter.create(messages=[
+            {"role": "system", "content": "SYS"},
+            {"role": "user", "content": "hi"},
+        ])
+        assert "prompt_cache_retention" not in captured
+
+    @pytest.mark.parametrize("base_url", [
+        "https://api.openai.com/v1",
+        "https://example.services.ai.azure.com/openai/v1",
+        "https://responses.example.com/v1",
+    ])
+    def test_prompt_cache_retention_skipped_for_other_compatible_endpoints(self, base_url):
+        adapter, captured = self._build_adapter(base_url=base_url)
+        adapter.create(messages=[
+            {"role": "system", "content": "SYS"},
+            {"role": "user", "content": "hi"},
+        ])
+        assert "prompt_cache_retention" not in captured
+
+    def test_prompt_cache_retention_skipped_for_xai_and_github_hosts(self):
+        adapter, captured = self._build_adapter(base_url="https://api.x.ai/v1")
+        adapter.create(messages=[
+            {"role": "system", "content": "SYS"},
+            {"role": "user", "content": "hi"},
+        ])
+        assert "prompt_cache_retention" not in captured
+
+        adapter, captured = self._build_adapter(base_url="https://api.githubcopilot.com")
+        adapter.create(messages=[
+            {"role": "system", "content": "SYS"},
+            {"role": "user", "content": "hi"},
+        ])
+        assert "prompt_cache_retention" not in captured
 
 
 class TestCodexAdapterGithubResponsesMessageIdDrop:
@@ -912,3 +966,81 @@ class TestCodexAuxiliaryAdapterNullOutputRecovery:
             assert response.choices[0].finish_reason == "stop"
         finally:
             codex_runtime._consume_codex_event_stream = original_consume
+
+
+class TestCodexAuxiliaryAdapterCompletedResponse:
+    def test_accepts_completed_response_when_stream_was_requested(self):
+        completed = SimpleNamespace(
+            status="completed",
+            id="resp_completed",
+            output=[SimpleNamespace(
+                type="message",
+                content=[SimpleNamespace(
+                    type="output_text",
+                    text="completed response",
+                )],
+            )],
+            usage=SimpleNamespace(
+                input_tokens=11,
+                output_tokens=3,
+                total_tokens=14,
+            ),
+        )
+
+        class FakeResponses:
+            def create(self, **kwargs):
+                assert kwargs["stream"] is True
+                return completed
+
+        fake_client = SimpleNamespace(responses=FakeResponses())
+        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.6-terra")
+
+        response = adapter.create(
+            messages=[{"role": "user", "content": "review this"}],
+        )
+
+        assert response.choices[0].message.content == "completed response"
+        assert response.usage.prompt_tokens == 11
+        assert response.usage.completion_tokens == 3
+        assert response.usage.total_tokens == 14
+
+
+class TestMoaAggregatorStreamingBypass:
+    def test_moa_aggregator_stream_bypasses_relay_for_codex_auxiliary_client(self, monkeypatch):
+        """The MoA facade owns the streaming contract. For Codex Responses-shim
+        clients (openai-codex, xai-oauth), call_llm must return the provider's
+        direct create() result instead of routing through Relay's managed
+        stream, which cannot iterate a completed SimpleNamespace (#74903).
+        """
+
+        completed = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+        )
+
+        real_client = SimpleNamespace(
+            api_key="test-key",
+            base_url="https://chatgpt.com/backend-api/codex/",
+            close=lambda: None,
+        )
+        client = CodexAuxiliaryClient(real_client, "gpt-5.6-sol")
+        direct_create = MagicMock(return_value=completed)
+        monkeypatch.setattr(client.chat.completions, "create", direct_create)
+
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_cached_client",
+            lambda *args, **kwargs: (client, "gpt-5.6-sol"),
+        )
+        relay_stream = MagicMock(side_effect=AssertionError("_relay_sync_stream must not be used"))
+        monkeypatch.setattr("agent.auxiliary_client._relay_sync_stream", relay_stream)
+
+        result = call_llm(
+            task="moa_aggregator",
+            provider="openai-codex",
+            model="gpt-5.6-sol",
+            messages=[{"role": "user", "content": "只回答 OK"}],
+            stream=True,
+        )
+
+        assert result is completed
+        direct_create.assert_called_once()
+        relay_stream.assert_not_called()

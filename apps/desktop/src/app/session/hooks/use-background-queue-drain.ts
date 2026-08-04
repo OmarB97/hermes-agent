@@ -5,6 +5,7 @@ import { useI18n } from '@/i18n'
 import { desktopPathProbe, firstMissingAttachmentPath, type PathProbe } from '@/lib/queued-attachment-preflight'
 import { resetBrowseState } from '@/store/composer-input-history'
 import {
+  $parkedQueueSessions,
   $queuedPromptsBySession,
   drainableQueuedPromptCount,
   getQueuedPrompts,
@@ -16,6 +17,7 @@ import {
   shouldAutoDrain
 } from '@/store/composer-queue'
 import { notify } from '@/store/notifications'
+import { $sessions, idsShareLineage } from '@/store/session'
 import { $workingSessionIds } from '@/store/session-states'
 
 import type { SubmitTextOptions } from './use-prompt-actions/utils'
@@ -68,8 +70,10 @@ export function useBackgroundQueueDrain({
   const drainingSessionIdsRef = useRef(new Set<string>())
   const retryTimersRef = useRef<number[]>([])
   const [retryTick, setRetryTick] = useState(0)
+  const parkedQueueSessions = useStore($parkedQueueSessions)
   const workingSessionIds = useStore($workingSessionIds)
 
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     submitTextRef.current = submitText
   }, [submitText])
@@ -200,10 +204,19 @@ export function useBackgroundQueueDrain({
       return
     }
 
-    const working = new Set(workingSessionIds)
+    // Queue keys prefer the lineage root (resolveComposerSessionKey) while
+    // $workingSessionIds / selection may hold the compression tip. Strict
+    // equality then mis-classifies a busy or selected chat as idle/offscreen.
+    const sessions = $sessions.get()
+    const working = [...workingSessionIds]
 
     for (const [sessionKey, entries] of Object.entries(queuedPromptsBySession)) {
-      if (sessionKey === selectedStoredSessionId || drainingSessionIdsRef.current.has(sessionKey)) {
+      const isSelected =
+        Boolean(selectedStoredSessionId) && idsShareLineage(sessionKey, selectedStoredSessionId!, sessions)
+
+      const isBusy = working.some(workingId => idsShareLineage(sessionKey, workingId, sessions))
+
+      if (isSelected || drainingSessionIdsRef.current.has(sessionKey)) {
         continue
       }
 
@@ -212,7 +225,8 @@ export function useBackgroundQueueDrain({
       if (
         !entry ||
         !shouldAutoDrain({
-          isBusy: working.has(sessionKey),
+          isBusy,
+          parked: Boolean(parkedQueueSessions[sessionKey]),
           queueLength: drainableQueuedPromptCount(entries)
         })
       ) {
@@ -221,5 +235,13 @@ export function useBackgroundQueueDrain({
 
       drainSessionQueue(sessionKey, entry)
     }
-  }, [drainSessionQueue, enabled, queuedPromptsBySession, retryTick, selectedStoredSessionId, workingSessionIds])
+  }, [
+    drainSessionQueue,
+    enabled,
+    parkedQueueSessions,
+    queuedPromptsBySession,
+    retryTick,
+    selectedStoredSessionId,
+    workingSessionIds
+  ])
 }
