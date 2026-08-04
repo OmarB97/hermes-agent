@@ -9,6 +9,7 @@ import pytest
 from agent.auxiliary_client import (
     call_llm,
     async_call_llm,
+    _NOUS_MODEL,
     _get_provider_chain,
     _refresh_nous_recommended_model,
     _try_payment_fallback,
@@ -41,7 +42,7 @@ class TestRefreshNousRecommendedModel:
         )
         out = _refresh_nous_recommended_model(
             vision=True, stale_model="openai/gpt-5.4-mini")
-        assert out == "google/gemini-3-flash-preview"
+        assert out == _NOUS_MODEL
 
     def test_falls_back_to_default_when_portal_unavailable(self, monkeypatch):
         def _boom(**kw):
@@ -50,17 +51,17 @@ class TestRefreshNousRecommendedModel:
             "hermes_cli.models.get_nous_recommended_aux_model", _boom)
         out = _refresh_nous_recommended_model(
             vision=False, stale_model="some/dead-model")
-        assert out == "google/gemini-3-flash-preview"
+        assert out == _NOUS_MODEL
 
     def test_returns_none_when_no_distinct_alternative(self, monkeypatch):
         """When the failed model IS the default and the Portal has nothing
         else, there's no usable alternative."""
         monkeypatch.setattr(
             "hermes_cli.models.get_nous_recommended_aux_model",
-            lambda **kw: "google/gemini-3-flash-preview",
+            lambda **kw: _NOUS_MODEL,
         )
         out = _refresh_nous_recommended_model(
-            vision=False, stale_model="google/gemini-3-flash-preview")
+            vision=False, stale_model=_NOUS_MODEL)
         assert out is None
 
 
@@ -202,9 +203,9 @@ class TestCallLlmPaymentFallback:
         primary_client.chat.completions.create.side_effect = server_err
 
         with patch("agent.auxiliary_client._get_cached_client",
-                    return_value=(primary_client, "google/gemini-3-flash-preview")), \
+                    return_value=(primary_client, _NOUS_MODEL)), \
              patch("agent.auxiliary_client._resolve_task_provider_model",
-                    return_value=("auto", "google/gemini-3-flash-preview", None, None, None)):
+                    return_value=("auto", _NOUS_MODEL, None, None, None)):
             with pytest.raises(Exception, match="Internal Server Error"):
                 call_llm(
                     task="compression",
@@ -511,6 +512,10 @@ class TestAuxiliaryFallbackLayering:
             "title_generation",
             "nvidia",
             reason="invalid provider response",
+            # A malformed response is model-specific, so the chain skip is
+            # narrowed to the exact model that failed rather than the whole
+            # provider (see _try_configured_fallback_chain's failed_model).
+            failed_model="minimaxai/minimax-m3",
         )
         mock_main.assert_not_called()
 
@@ -544,6 +549,7 @@ class TestAuxiliaryFallbackLayering:
             "compression",
             "nvidia",
             reason="invalid provider response",
+            failed_model="minimaxai/minimax-m3",
         )
 
     def test_auto_provider_uses_task_then_main_chain_before_builtin_chain(self, monkeypatch):
@@ -572,7 +578,10 @@ class TestAuxiliaryFallbackLayering:
 
         assert main_chain_client.chat.completions.create.called
         mock_task_chain.assert_called_once_with(
-            "title_generation", "auto", reason="payment error")
+            "title_generation", "auto", reason="payment error",
+            # 402 is provider-wide, so the whole provider stays skipped:
+            # failed_model is deliberately None here.
+            failed_model=None)
         mock_main_chain.assert_called_once_with(
             "title_generation", "auto", reason="payment error")
         mock_builtin_chain.assert_not_called()
@@ -992,6 +1001,44 @@ class TestTransientTransportRetry:
         assert result == {"ok": True}
         assert client.chat.completions.create.call_count == 2
 
+    def test_timeout_forwards_failed_model_to_configured_chain(self):
+        """A timeout is model-specific, so call_llm must forward the failed
+        model to the configured chain (failed_model=<model>, not None). This
+        lets a same-provider sibling in the chain be tried instead of the
+        whole provider being skipped — the exact NVIDIA NIM bug's trigger.
+        """
+        class _Timeout(Exception):
+            pass
+        _Timeout.__name__ = "APITimeoutError"
+
+        primary = MagicMock()
+        primary.base_url = "https://integrate.api.nvidia.com/v1"
+        primary.chat.completions.create.side_effect = _Timeout("Request timed out.")
+
+        fb_client = MagicMock()
+        fb_client.base_url = "https://integrate.api.nvidia.com/v1"
+        fb_client.chat.completions.create.return_value = {"fallback": True}
+
+        p1, p2, p3 = self._patches(primary)
+        with (
+            p1, p2, p3,
+            patch(
+                "agent.auxiliary_client._try_configured_fallback_chain",
+                return_value=(fb_client, "sibling-model", "fallback_chain[0](openrouter)"),
+            ) as mock_chain,
+            patch(
+                "agent.auxiliary_client._try_main_agent_model_fallback",
+                return_value=(None, None, ""),
+            ),
+        ):
+            result = call_llm(task="compression", messages=[{"role": "user", "content": "hi"}])
+        assert result == {"fallback": True}
+        _, kwargs = mock_chain.call_args
+        assert kwargs.get("failed_model") == "some-model", (
+            "A timeout is model-specific — the failed model must be forwarded "
+            "so a same-provider sibling can be tried, not skipped wholesale."
+        )
+
 
 class TestAuxClientNoSdkRetries:
     """Auxiliary OpenAI clients are constructed with SDK-internal retries
@@ -1273,3 +1320,184 @@ class TestCompressionFallbackContextFilter:
         # Empty / unknown tasks have no minimum
         assert _task_minimum_context_length("") is None
         assert _task_minimum_context_length(None) is None
+
+    def test_same_provider_same_model_still_skipped(self, monkeypatch):
+        """The exact (provider, model) pair that just failed is still
+        skipped — failed_model narrows the skip, it doesn't disable it."""
+        from agent.auxiliary_client import _try_configured_fallback_chain
+
+        entries = [
+            self._make_chain_entry("nvidia", "deepseek-ai/deepseek-v4-pro"),
+        ]
+
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda task: {"fallback_chain": entries} if task == "compression" else {},
+        )
+
+        with patch("agent.auxiliary_client._resolve_fallback_entry",
+                   side_effect=AssertionError("must not be resolved")):
+            client, model, label = _try_configured_fallback_chain(
+                task="compression",
+                failed_provider="nvidia",
+                failed_model="deepseek-ai/deepseek-v4-pro",
+            )
+
+        assert client is None
+        assert model is None
+        assert label == ""
+
+
+class TestSynchronousFallbackCachePlans:
+    @staticmethod
+    def _run_configured_fallback(monkeypatch, entry):
+        from agent.auxiliary_client import (
+            _call_fallback_candidate_sync,
+            _try_configured_fallback_chain,
+        )
+
+        client = MagicMock()
+        client.base_url = entry["base_url"]
+        client.chat.completions.create.return_value = _DummyResponse()
+        resolved_calls = []
+
+        def resolve(provider, model=None, **kwargs):
+            resolved_calls.append((provider, model, kwargs))
+            return client, model
+
+        monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", resolve)
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda task: {"fallback_chain": [entry]},
+        )
+        fallback_client, fallback_model, label = _try_configured_fallback_chain(
+            task="moa_aggregator",
+            failed_provider="primary",
+        )
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }]
+        _call_fallback_candidate_sync(
+            fallback_client,
+            fallback_model,
+            label,
+            task="moa_aggregator",
+            messages=[
+                {"role": "system", "content": "stable prefix"},
+                {"role": "user", "content": "lookup"},
+            ],
+            temperature=None,
+            max_tokens=None,
+            tools=tools,
+            effective_timeout=30.0,
+            effective_extra_body={},
+            reasoning_config=None,
+        )
+        return client, resolved_calls, tools
+
+    def test_direct_anthropic_fallback_uses_entry_destination_for_tool_marker(self, monkeypatch):
+        client, resolved_calls, tools = self._run_configured_fallback(monkeypatch, {
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+            "base_url": "https://api.anthropic.com",
+            "api_mode": "anthropic_messages",
+        })
+
+        assert resolved_calls == [(
+            "anthropic",
+            "claude-sonnet-4-6",
+            {
+                "explicit_base_url": "https://api.anthropic.com",
+                "explicit_api_key": None,
+                "api_mode": "anthropic_messages",
+            },
+        )]
+        wire_tools = client.chat.completions.create.call_args.kwargs["tools"]
+        assert "cache_control" in wire_tools[-1]
+        assert "cache_control" not in tools[-1]
+
+    def test_third_party_anthropic_fallback_keeps_message_markers_without_tool_marker(self, monkeypatch):
+        client, resolved_calls, tools = self._run_configured_fallback(monkeypatch, {
+            "provider": "custom",
+            "model": "claude-sonnet-4-6",
+            "base_url": "https://api.minimax.io/anthropic",
+            "api_mode": "anthropic_messages",
+        })
+
+        assert resolved_calls[0][2]["explicit_base_url"] == "https://api.minimax.io/anthropic"
+        assert resolved_calls[0][2]["api_mode"] == "anthropic_messages"
+        wire_request = client.chat.completions.create.call_args.kwargs
+        assert "cache_control" not in wire_request["tools"][-1]
+        assert "cache_control" not in tools[-1]
+        assert any(
+            isinstance(part, dict) and "cache_control" in part
+            for message in wire_request["messages"]
+            for part in (message.get("content") if isinstance(message.get("content"), list) else [])
+        )
+
+
+class TestAsynchronousFallbackCachePlans:
+    @pytest.mark.asyncio
+    async def test_async_fallback_replans_cache_sections_like_sync(self, monkeypatch):
+        """Async mirror parity: per-destination cache replan, not verbatim pass-through."""
+        from agent.auxiliary_client import (
+            _call_fallback_candidate_async,
+            _try_configured_fallback_chain,
+        )
+
+        entry = {
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+            "base_url": "https://api.anthropic.com",
+            "api_mode": "anthropic_messages",
+        }
+        client = MagicMock()
+        client.base_url = entry["base_url"]
+
+        async def _create(**kwargs):
+            return _DummyResponse()
+
+        client.chat.completions.create = MagicMock(side_effect=_create)
+        monkeypatch.setattr(
+            "agent.auxiliary_client.resolve_provider_client",
+            lambda provider, model=None, **kwargs: (client, model),
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda task: {"fallback_chain": [entry]},
+        )
+        fallback_client, fallback_model, label = _try_configured_fallback_chain(
+            task="moa_aggregator",
+            failed_provider="primary",
+        )
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }]
+        await _call_fallback_candidate_async(
+            fallback_client,
+            fallback_model,
+            label,
+            task="moa_aggregator",
+            messages=[
+                {"role": "system", "content": "stable prefix"},
+                {"role": "user", "content": "lookup"},
+            ],
+            temperature=None,
+            max_tokens=None,
+            tools=tools,
+            effective_timeout=30.0,
+            effective_extra_body={},
+            reasoning_config=None,
+        )
+
+        wire_tools = client.chat.completions.create.call_args.kwargs["tools"]
+        assert "cache_control" in wire_tools[-1]
+        assert "cache_control" not in tools[-1]

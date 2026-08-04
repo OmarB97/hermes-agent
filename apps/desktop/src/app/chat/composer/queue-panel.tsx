@@ -4,7 +4,7 @@ import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { Tip } from '@/components/ui/tooltip'
 import { type Translations, useI18n } from '@/i18n'
-import { ArrowUp, iconSize, Pencil, RefreshCw, Trash2 } from '@/lib/icons'
+import { CornerDownLeft, iconSize, Pencil, RefreshCw, Trash2 } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { isQueuedPromptStuck, type QueuedPromptEntry } from '@/store/composer-queue'
 
@@ -14,12 +14,17 @@ interface QueuePanelProps {
   entries: QueuedPromptEntry[]
   onDelete: (id: string) => void
   onEdit: (entry: QueuedPromptEntry) => void
+  /** Lift a park (explicit Stop/Esc halt) and let the queue flow again. */
+  onResume: () => void
+  /** Give a dead-lettered entry a fresh auto-drain budget. */
   onRetry: (id: string) => void
   onSendNow: (id: string) => void
+  /** True after an explicit halt: entries wait until resumed / sent / edited. */
+  parked: boolean
 }
 
 const entryPreview = (entry: QueuedPromptEntry, c: Translations['composer']) =>
-  entry.text.trim() || (entry.attachments.length > 0 ? c.attachmentOnly : c.emptyTurn)
+  (entry.displayText ?? entry.text).trim() || (entry.attachments.length > 0 ? c.attachmentOnly : c.emptyTurn)
 
 /** Why this entry stopped trying, in the user's words. The stored `lastError`
  *  (a full attachment path, or the gateway's own message) is appended verbatim
@@ -31,7 +36,17 @@ const stuckDetail = (entry: QueuedPromptEntry, c: Translations['composer']): str
   return entry.lastError ? `${headline} — ${entry.lastError}` : headline
 }
 
-export function QueuePanel({ busy, editingId, entries, onDelete, onEdit, onRetry, onSendNow }: QueuePanelProps) {
+export function QueuePanel({
+  busy,
+  editingId,
+  entries,
+  onDelete,
+  onEdit,
+  onResume,
+  onRetry,
+  onSendNow,
+  parked
+}: QueuePanelProps) {
   const { t } = useI18n()
   const c = t.composer
 
@@ -45,10 +60,32 @@ export function QueuePanel({ busy, editingId, entries, onDelete, onEdit, onRetry
   const hasStuck = entries.some(isQueuedPromptStuck)
 
   return (
+    // Keyed on the park flag AND on whether anything is dead-lettered:
+    // StatusSection owns its collapse state from defaultCollapsed, so it has to
+    // remount when either flips. A Stop must EXPAND the panel — the halted
+    // prompts' only presence is here, and leaving them behind a collapsed
+    // "N queued" pill is how they read as vanished. Same for a stuck entry: it
+    // is a failure the user has to act on, not something to hide behind a pill.
     <StatusSection
-      defaultCollapsed={!hasStuck}
-      icon={<Codicon className="text-muted-foreground/70" name="layers" size="0.8rem" />}
-      label={c.queued(entries.length)}
+      accessory={
+        parked ? (
+          <Tip label={c.queueResumeTip}>
+            <Button
+              className="text-muted-foreground/75 hover:text-foreground/90"
+              onClick={onResume}
+              size="micro"
+              type="button"
+              variant="text"
+            >
+              {c.queueResume}
+            </Button>
+          </Tip>
+        ) : undefined
+      }
+      defaultCollapsed={!parked && !hasStuck}
+      icon={<Codicon className="text-muted-foreground/70" name={parked ? 'debug-pause' : 'layers'} size="0.8rem" />}
+      key={`${parked ? 'parked' : 'flowing'}-${hasStuck ? 'stuck' : 'ok'}`}
+      label={parked ? c.queuedPaused(entries.length) : c.queued(entries.length)}
     >
       {entries.map(entry => {
         const isEditing = editingId === entry.id
@@ -107,7 +144,7 @@ export function QueuePanel({ busy, editingId, entries, onDelete, onEdit, onRetry
                       type="button"
                       variant="ghost"
                     >
-                      <ArrowUp className={iconSize.xs} />
+                      <CornerDownLeft className={iconSize.xs} />
                     </Button>
                   </Tip>
                 )}

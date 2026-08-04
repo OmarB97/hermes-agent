@@ -80,6 +80,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.skill_utils import is_excluded_skill_path
+from hermes_cli._subprocess_compat import noninteractive_git_env
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +221,34 @@ def _dedupe_owned_paths(paths: List[str]) -> List[str]:
             continue
         result.append(rel)
     return sorted(result)
+
+
+def _payload_owned_paths(staged: Path, manifest: "DistributionManifest") -> List[str]:
+    """Return the paths this install treats as distribution-owned.
+
+    An explicit ``distribution_owned:`` list is authoritative.  When the
+    manifest omits it the legacy contract applies: every staged top-level entry
+    outside ``USER_OWNED_EXCLUDE`` is distribution-owned.  Narrowing an omitted
+    list to ``DEFAULT_DIST_OWNED`` here is what upstream had to revert — it
+    silently dropped undeclared payload that existing distributions legitimately
+    ship (extra top-level files and dirs).  ``.git`` and Hermes' own transaction
+    bookkeeping (receipts, locks, backups) are never payload.
+    """
+    if manifest.distribution_owned:
+        return [_normalize_owned_path(path) for path in manifest.distribution_owned]
+
+    owned: List[str] = []
+    for entry in sorted(staged.iterdir(), key=lambda item: item.name):
+        name = entry.name
+        if name == ".git" or name in USER_OWNED_EXCLUDE:
+            continue
+        try:
+            owned.append(_normalize_owned_path(name))
+        except DistributionError:
+            # Reserved/unsafe names (transaction bookkeeping, platform-hostile
+            # segments) are not payload — skip rather than fail the install.
+            continue
+    return owned
 
 
 # ---------------------------------------------------------------------------
@@ -522,6 +551,8 @@ def _git_clone(url: str, dest: Path) -> None:
             ["git", "clone", "--depth", "1", url, str(dest)],
             check=True,
             capture_output=True,
+            stdin=subprocess.DEVNULL,
+            env=noninteractive_git_env(),
         )
     except FileNotFoundError as exc:
         raise DistributionError("git is required for git-URL installs") from exc
@@ -699,11 +730,16 @@ def _copy_dist_payload(
     ``.env.template`` is renamed to ``.env.EXAMPLE`` in the target to avoid
     shadowing a real ``.env``.  Returns ``(source_paths, installed_paths)`` for
     the transaction receipt and integrity digest.
+
+    The owned set comes from :func:`_payload_owned_paths`: an explicit
+    ``distribution_owned`` list is path-aware (nested entries such as
+    ``skills/research`` or ``cron/digest.json`` are honoured), and an omitted
+    list keeps the legacy copy-everything contract.
     """
     target.mkdir(parents=True, exist_ok=True)
 
     specs: List[Tuple[str, str]] = []
-    for source_rel in manifest.owned_paths():
+    for source_rel in _payload_owned_paths(staged, manifest):
         target_rel = (
             ENV_EXAMPLE_FILENAME
             if source_rel == ENV_TEMPLATE_FILENAME

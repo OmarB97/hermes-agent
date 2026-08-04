@@ -31,8 +31,10 @@ function renderPanel(entries: QueuedPromptEntry[], handlers: Partial<Parameters<
     entries,
     onDelete: vi.fn(),
     onEdit: vi.fn(),
+    onResume: vi.fn(),
     onRetry: vi.fn(),
     onSendNow: vi.fn(),
+    parked: false,
     ...handlers
   }
 
@@ -63,6 +65,8 @@ describe('QueuePanel dead-letter row', () => {
         busy={false}
         editingId={null}
         entries={[entry()]}
+        onResume={vi.fn()}
+        parked={false}
         onDelete={vi.fn()}
         onEdit={vi.fn()}
         onRetry={vi.fn()}

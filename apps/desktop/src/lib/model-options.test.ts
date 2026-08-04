@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { apiRequestProfile, getGlobalModelOptions } from '@/hermes'
 
-import { manualPickRemoved, requestModelOptions } from './model-options'
+import { manualPickRemoved, modelOptionsQueryKey, requestModelOptions } from './model-options'
 
 const globalOptions = { model: 'hermes-4', provider: 'nous', providers: [] }
 
@@ -79,6 +79,18 @@ describe('requestModelOptions', () => {
     await requestModelOptions({ refresh: true })
 
     expect(getGlobalModelOptions).toHaveBeenCalledWith({ explicitOnly: true, refresh: true })
+  })
+})
+
+describe('modelOptionsQueryKey', () => {
+  it('isolates new-chat catalogs by active gateway profile', () => {
+    expect(modelOptionsQueryKey('default')).toEqual(['model-options', 'default', 'global'])
+    expect(modelOptionsQueryKey('compass')).toEqual(['model-options', 'compass', 'global'])
+    expect(modelOptionsQueryKey('default')).not.toEqual(modelOptionsQueryKey('compass'))
+  })
+
+  it('keeps session catalogs inside the owning profile namespace', () => {
+    expect(modelOptionsQueryKey(' compass ', 'session-1')).toEqual(['model-options', 'compass', 'session-1'])
   })
 })
 

@@ -364,7 +364,7 @@ def _run_one_file_once(
         cwd=repo_root,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         env=os.environ,
         # POSIX: place the child at the head of its own process group so
         # _kill_tree can SIGKILL the group atomically.
@@ -602,7 +602,7 @@ def _load_durations(repo_root: Path) -> dict[str, float]:
     if not path.is_file():
         return {}
     try:
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as e:
         print("[ERROR] Failed to load json durations file! {e}")
         return {}
@@ -624,7 +624,7 @@ def _save_durations(
         key = _format_file(f, repo_root)
         data[key] = round(t, 3)
     path = repo_root / _DURATIONS_FILE
-    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def _compute_lpt_slices(
@@ -714,7 +714,33 @@ def _slice_files(
     return target
 
 
+def _make_stdio_glyph_safe() -> None:
+    """Keep status glyphs from killing the runner on narrow console encodings.
+
+    On native Windows, piped or legacy-console stdio defaults to a locale
+    codec (usually cp1252) that cannot encode the ✓/✗ progress glyphs — the
+    first per-file status line then dies with UnicodeEncodeError before a
+    single test result is reported. Declare the runner's own output UTF-8
+    (what CI and every modern terminal already are), with errors="replace"
+    as the can't-crash backstop; where the encoding can't be changed, fall
+    back to errors="replace" alone so glyphs degrade to "?" instead of
+    killing the run. On already-UTF-8 stdio this is a no-op.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            try:
+                reconfigure(errors="replace")
+            except Exception:
+                pass
+
+
 def main() -> int:
+    _make_stdio_glyph_safe()
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -876,6 +902,7 @@ def main() -> int:
         i += 1
 
     args = parser.parse_args(our_args)
+
     # Bare flags run before any explicit ``--`` passthrough so ordering is
     # intuitive (``run_tests.sh tests/foo.py -q -- --tb=long`` → ``-q --tb=long``).
     pytest_passthrough = bare_passthrough + explicit_passthrough
@@ -1067,10 +1094,16 @@ def main() -> int:
     fail_count = 0
     tests_passed = 0
     tests_failed = 0
+    # Every collected outcome, not just pass/fail: a legitimately all-skipped
+    # (platform-gated) file reports "2 skipped" and must NOT trip the
+    # nothing-ran guard, whereas a file that died before collection reports
+    # nothing at all and must.
+    tests_collected = 0
     lock = threading.Lock()
 
-    def _on_done(file: Path, started_at: float, fut: "Future[Tuple[Path, int, str, dict[str, int], float]]") -> None:
+    def _on_done(file: Path, started_at: float, fut: "Future[Tuple[Path, int, str, Dict[str, int], float]]") -> None:
         nonlocal files_done, tests_done, pass_count, fail_count, tests_passed, tests_failed
+        nonlocal tests_collected
         n_tests = test_counts.get(file, 0)
         try:
             fpath, rc, output, summary, subproc_wall = fut.result()
@@ -1094,6 +1127,10 @@ def main() -> int:
             # Accumulate test-level counts from parsed summary.
             tests_passed += summary.get("passed", 0)
             tests_failed += summary.get("failed", 0)
+            tests_collected += sum(
+                summary.get(k, 0)
+                for k in ("passed", "failed", "skipped", "errors", "xfailed", "xpassed")
+            )
             file_times.append((fpath, subproc_wall))
             if rc == 0:
                 pass_count += 1
@@ -1134,6 +1171,27 @@ def main() -> int:
     print()
     pct = min(100, (tests_done / approx_total_tests * 100)) if approx_total_tests else 0
     print(f"=== Summary: {len(files)} files, {tests_passed} tests passed, {tests_failed} failed ({pct:.0f}% complete) in {elapsed:.1f}s ({args.jobs} workers) ===")
+
+    # Zero tests collected across the WHOLE run is NOT a pass. Per-file rc=5
+    # is deliberately tolerated above (platform-gated files), but if NOTHING
+    # ran anywhere the invocation itself was broken — a venv without pytest, a
+    # -k/-m filter that matched nothing, or collection erroring everywhere.
+    # The summary line above reads green at a glance ("0 failed ... 100%
+    # complete"), which has been misread as a successful verification, so say
+    # it plainly AND fail the exit code.
+    no_tests_ran_at_all = bool(files) and tests_collected == 0
+    if no_tests_ran_at_all:
+        print()
+        print(
+            "=== ✗ NO TESTS RAN — 0 collected across "
+            f"{len(files)} file{'s' if len(files) != 1 else ''}. "
+            "This is NOT a pass. ==="
+        )
+        print(
+            "  Common causes: the selected venv has no pytest; a -k/-m filter "
+            "matched nothing; or collection errored in every file."
+        )
+        print("  Check the per-file output above for the real error.")
 
     # Flaky files: failed once, passed on the automatic retry. Green, but
     # loudly reported so they get fixed instead of silently re-flaking.

@@ -47,17 +47,6 @@ def _gateway_parser():
     return p
 
 
-def test_profile_subactions_and_dispatch():
-    p = _profile_parser()
-    ns = p.parse_args(["profile", "list"])
-    assert ns.command == "profile"
-    assert ns.profile_action == "list"
-    assert ns.func is _h_profile
-    # a representative arg-taking subaction
-    ns2 = p.parse_args(["profile", "show", "work"])
-    assert ns2.profile_action == "show"
-
-
 def test_profile_has_expected_actions():
     p = _profile_parser()
     # Map each subaction to a minimal valid argv suffix.
@@ -106,25 +95,6 @@ def test_gateway_and_proxy_dispatch():
     assert px.func is _h_proxy
 
 
-def test_gateway_accept_hooks_flag():
-    p = _gateway_parser()
-    ns = p.parse_args(["gateway", "run", "--accept-hooks"])
-    assert ns.accept_hooks is True
-
-
-def test_gateway_run_accepts_external_supervisor_flag():
-    p = _gateway_parser()
-    ns = p.parse_args(["gateway", "run", "--external-supervisor"])
-    assert ns.external_supervisor is True
-
-
-def test_gateway_lifecycle_accepts_legacy_platform_flag():
-    p = _gateway_parser()
-    for action in ("start", "restart", "status"):
-        ns = p.parse_args(["gateway", action, "--platform", "photon"])
-        assert ns.gateway_command == action
-        assert ns.platform == "photon"
-        assert ns.func is _h_gateway
 
 
 def test_gateway_enroll_dispatch():

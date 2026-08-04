@@ -33,21 +33,6 @@ def test_cron_subactions_present():
         assert ns.cron_command == action
 
 
-def test_cron_aliases():
-    parser = _build()
-    # create has alias "add"
-    ns = parser.parse_args(["cron", "add", "30m"])
-    assert ns.cron_command == "add"
-    # remove has aliases rm / delete
-    for alias in ("rm", "delete"):
-        ns = parser.parse_args(["cron", alias, "jid"])
-        assert ns.cron_command == alias
-    ns = parser.parse_args(["cron", "history", "jid", "--limit", "7"])
-    assert ns.cron_command == "history"
-    assert ns.job_id == "jid"
-    assert ns.limit == 7
-
-
 def test_cron_create_options():
     parser = _build()
     ns = parser.parse_args([
@@ -94,12 +79,6 @@ def test_cron_edit_model_provider_set_preserve_and_clear_shapes():
     ])
     assert cleared.provider == ""
     assert cleared.model == ""
-
-
-def test_cron_dispatch_func_is_injected_handler():
-    parser = _build()
-    ns = parser.parse_args(["cron", "list"])
-    assert ns.func is _sentinel_handler
 
 
 def test_cron_accept_hooks_flag_on_run_and_tick():

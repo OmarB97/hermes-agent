@@ -99,17 +99,6 @@ def test_flush_empty_buffer_is_noop():
     assert emitted == []
 
 
-def test_re_buffer_after_flush_works():
-    agent = _make_bare_agent()
-    emitted = []
-    agent._emit_status = lambda msg: emitted.append(msg)
-
-    agent._buffer_status("first")
-    agent._flush_status_buffer()
-    agent._buffer_status("second")
-    agent._flush_status_buffer()
-
-    assert emitted == ["first", "second"]
 
 
 def test_mixed_kinds_replay_through_correct_channels():

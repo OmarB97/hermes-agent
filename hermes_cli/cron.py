@@ -49,12 +49,12 @@ def _cron_api(**kwargs):
 
 
 def _cron_inference_args(args, existing_job=None):
-    """Return CLI provider/model values with model-tool resolution parity.
+    """Return CLI provider/model values with shared pin resolution.
 
-    The model-callable cron surface pins the active config provider when a
-    model is supplied without ``provider``. Keep the standalone CLI on the
-    same config-backed path so a model-only pin cannot silently follow later
-    interactive provider switches. Explicit empty strings still mean clear.
+    A model supplied without ``provider`` pins the active config provider, via
+    the same ``_resolve_model_override`` the other user-owned pin surfaces use,
+    so a model-only pin cannot silently follow later interactive provider
+    switches. Explicit empty strings still mean clear.
     """
     provider = getattr(args, "provider", None)
     model = getattr(args, "model", None)
@@ -289,6 +289,7 @@ def cron_status():
         # (#32612, #32895).
         from cron.jobs import (
             get_ticker_heartbeat_age,
+            get_ticker_last_error,
             get_ticker_success_age,
             TICKER_INTERVAL_SECONDS,
         )
@@ -318,6 +319,20 @@ def cron_status():
                 Colors.YELLOW,
             ))
             print(f"  PID: {', '.join(map(str, pids))}")
+            last_error = get_ticker_last_error()
+            if last_error:
+                # Show WHY ticks fail — e.g. a root-rewritten jobs.json
+                # (PermissionError) that silently locked out the ticker's
+                # uid for ~14h in the field (#68483).
+                print(color(f"  Last tick error: {last_error}", Colors.RED))
+                if "Permission denied" in last_error:
+                    print(color(
+                        "  Hint: jobs.json may be owned by another user "
+                        "(e.g. rewritten by a root `docker exec hermes "
+                        "hermes cron ...`). Fix ownership to match the "
+                        "gateway user, and prefer `docker exec -u <uid>:<gid>`.",
+                        Colors.YELLOW,
+                    ))
             print("  Check the gateway log for 'Cron tick error'.")
         else:
             print(color("✓ Gateway is running — cron jobs will fire automatically", Colors.GREEN))
